@@ -10,8 +10,8 @@ namespace LAWS.Voices.OpenVino.Processors
 {
     public class BirdNetAnalysisResult
     {
-        public List<string> TimelineMarkers { get; set; } = [];
-        public Dictionary<string, float> GlobalSpeciesDistribution { get; set; } = [];
+        public List<string> TimelineMarkers { get; set; } = new List<string>();
+        public Dictionary<string, float> GlobalSpeciesDistribution { get; set; } = new Dictionary<string, float>();
     }
 
     public static class BirdNetProcessor
@@ -19,6 +19,7 @@ namespace LAWS.Voices.OpenVino.Processors
         private const int TargetSampleRate = 48000;
         private const int ChunkDurationSeconds = 3;
         private const int SamplesPerChunk = TargetSampleRate * ChunkDurationSeconds; // Exactly 144,000 Samples
+        private const int ChunkLogInterval = 25; // log every N chunks to reduce verbosity
 
         public class BirdMatch
         {
@@ -38,6 +39,19 @@ namespace LAWS.Voices.OpenVino.Processors
             string baseDirectory,
             float[] pcmChunk,
             int sourceSampleRate)
+        {
+            // Delegate to overload with progress = null for backward compatibility
+            return AnalyzeAudioChunk(vino, modelInfo, quant, baseDirectory, pcmChunk, sourceSampleRate, null);
+        }
+
+        public static BirdNetAnalysisResult AnalyzeAudioChunk(
+            OpenVinoService vino,
+            OpenVinoModelInfo modelInfo,
+            OpenVinoModelQuantization quant,
+            string baseDirectory,
+            float[] pcmChunk,
+            int sourceSampleRate,
+            IProgress<(int current, int total)>? progress = null)
         {
             var result = new BirdNetAnalysisResult();
             if (pcmChunk == null || pcmChunk.Length == 0) return result;
@@ -60,33 +74,75 @@ namespace LAWS.Voices.OpenVino.Processors
 
                 StaticLogger.Log("[BirdNET Architecture] Resolving multi-input execution tensor layout ports...");
 
-                Tensor inputTensor0 = inferRequest.get_input_tensor(0);
-                Tensor inputTensor1 = inferRequest.get_input_tensor(1);
+                // Enumerate available input tensors for diagnostic purposes
+                for (int di = 0; di < 8; di++)
+                {
+                    try
+                    {
+                        var dt = inferRequest.get_input_tensor((ulong)di);
+                        StaticLogger.Log($"[DEBUG] input tensor[{di}] size={dt?.size}");
+                    }
+                    catch (Exception ex)
+                    {
+                        StaticLogger.Log($"[DEBUG] input tensor[{di}] not available: {ex.Message}");
+                        // stop probing on first missing index to avoid noisy exceptions
+                        break;
+                    }
+                }
+
+                Tensor? inputTensor0 = null;
+                Tensor? inputTensor1 = null;
+                try { inputTensor0 = inferRequest.get_input_tensor(0); } catch (Exception ex) { StaticLogger.Log($"[BirdNET] get_input_tensor(0) failed: {ex.Message}"); }
+                try { inputTensor1 = inferRequest.get_input_tensor(1); } catch (Exception ex) { StaticLogger.Log($"[BirdNET] get_input_tensor(1) failed or absent: {ex.Message}"); }
+
+                if (inputTensor0 == null)
+                {
+                    throw new InvalidOperationException("Model does not expose an input tensor at index 0. Cannot execute BirdNET processor.");
+                }
 
                 Tensor audioTensor = inputTensor0;
-                Tensor metaTensor = inputTensor1;
+                Tensor? metaTensor = inputTensor1; // may be null for single-input models
 
                 // Dynamically swap pointers if Port 0 is allocated for metadata sizing thresholds
-                if (inputTensor0.size == 3)
+                try
                 {
-                    metaTensor = inputTensor0;
-                    audioTensor = inputTensor1;
-                    StaticLogger.Log("[BirdNET Layout] Routed Port 0 as Metadata and Port 1 as Audio Payload.");
+                    if (inputTensor0.size == 3 && inputTensor1 != null)
+                    {
+                        metaTensor = inputTensor0;
+                        audioTensor = inputTensor1;
+                        StaticLogger.Log("[BirdNET Layout] Routed Port 0 as Metadata and Port 1 as Audio Payload.");
+                    }
+                    else
+                    {
+                        StaticLogger.Log(inputTensor1 == null
+                            ? "[BirdNET Layout] Single-input model detected; Metadata port absent."
+                            : "[BirdNET Layout] Routed Port 0 as Audio Payload and Port 1 as Metadata.");
+                    }
                 }
-                else
-                {
-                    StaticLogger.Log("[BirdNET Layout] Routed Port 0 as Audio Payload and Port 1 as Metadata.");
-                }
+                catch { /* ignore size probe errors */ }
 
                 // Initialize metadata parameters once (-1.0f commands BirdNET to skip location-specific filtering metrics)
-                float[] dummyMeta = [-1.0f, -1.0f, -1.0f];
-                metaTensor.set_data(dummyMeta);
+                float[] dummyMeta = new float[] { -1.0f, -1.0f, -1.0f };
+                if (metaTensor != null)
+                {
+                    try
+                    {
+                        metaTensor.set_data(dummyMeta);
+                    }
+                    catch (Exception ex)
+                    {
+                        StaticLogger.Log($"[BirdNET] Failed to set metadata tensor: {ex.Message}");
+                        throw;
+                    }
+                }
 
                 // Split audio into sequential 3-second blocks
                 int totalChunks = (int) Math.Ceiling((double) audio48k.Length / SamplesPerChunk);
                 StaticLogger.Log($"[BirdNET] Commencing timeline evaluation loops across {totalChunks} windows...");
+                progress?.Report((0, totalChunks));
 
                 var globalHitsAccumulator = new Dictionary<string, List<float>>();
+                bool loggedFirstSizeMismatch = false;
 
                 for (int c = 0; c < totalChunks; c++)
                 {
@@ -104,10 +160,192 @@ namespace LAWS.Voices.OpenVino.Processors
                     }
 
                     // Feed raw PCM sample values straight into the locked memory block address
-                    audioTensor.set_data(chunkBuffer);
+                    try
+                    {
+                        // Determine whether native tensor.size is reported as bytes or element count.
+                        ulong rawTensorSize = 0UL;
+                        try { rawTensorSize = audioTensor?.size ?? 0UL; } catch { }
+                        const int FloatBytes = 4;
+                        int expectedElements;
+                        if (rawTensorSize == 0UL)
+                        {
+                            expectedElements = chunkBuffer.Length;
+                        }
+                        else if (rawTensorSize == (ulong)chunkBuffer.Length)
+                        {
+                            // size appears to be element count
+                            expectedElements = (int)rawTensorSize;
+                        }
+                        else if (rawTensorSize == (ulong)chunkBuffer.Length * (ulong)FloatBytes)
+                        {
+                            // size appears to be bytes for float32 input
+                            expectedElements = chunkBuffer.Length;
+                        }
+                        else if (rawTensorSize % (ulong)FloatBytes == 0UL && rawTensorSize / (ulong)FloatBytes <= (ulong)int.MaxValue)
+                        {
+                            // infer bytes and convert to float element count
+                            expectedElements = (int)(rawTensorSize / (ulong)FloatBytes);
+                        }
+                        else
+                        {
+                            // fallback: treat value as element count
+                            expectedElements = (int)Math.Min((ulong)int.MaxValue, rawTensorSize);
+                        }
 
-                    // Execute hardware-accelerated sync graph inference
-                    inferRequest.infer();
+                        // Emit chunk diagnostics every N chunks, on final chunk, or first mismatch
+                        bool shouldLogChunk = (c % ChunkLogInterval) == 0 || c == totalChunks - 1;
+                        bool sizeMismatch = expectedElements > 0 && expectedElements != chunkBuffer.Length;
+
+                        // defer logging to the consolidated ChunkDiag below (will trigger for interval, last, or first mismatch)
+
+                        // If sizes mismatch, log and zero-pad/trim as defensive measure
+                        if (sizeMismatch)
+                        {
+                            if (!loggedFirstSizeMismatch)
+                            {
+                                StaticLogger.Log($"[BirdNET] Warning: audio tensor expects {expectedElements} elements but provided {chunkBuffer.Length}. Padding/trim will be applied.");
+                                loggedFirstSizeMismatch = true;
+                            }
+
+                            if (expectedElements > chunkBuffer.Length)
+                            {
+                                var tmp = new float[expectedElements];
+                                Array.Copy(chunkBuffer, 0, tmp, 0, chunkBuffer.Length);
+                                chunkBuffer = tmp;
+                            }
+                            else
+                            {
+                                var tmp = new float[expectedElements];
+                                Array.Copy(chunkBuffer, 0, tmp, 0, tmp.Length);
+                                chunkBuffer = tmp;
+                            }
+                        }
+
+                        // Log a single concise diagnostic line before set_data, but only periodically to reduce noise
+                        try
+                        {
+                            if (shouldLogChunk || (sizeMismatch && !loggedFirstSizeMismatch))
+                            {
+                                try
+                                {
+                                    string typeName = audioTensor?.GetType()?.FullName ?? "<null>";
+                                    string shapeDesc = "?";
+                                    try
+                                    {
+                                        var shapeProp = audioTensor?.GetType().GetProperty("shape");
+                                        if (shapeProp != null)
+                                        {
+                                            var rawShape = shapeProp.GetValue(audioTensor);
+                                            if (rawShape is System.Collections.IEnumerable enumShape)
+                                            {
+                                                var shp = new List<string>();
+                                                foreach (var it in enumShape) { try { shp.Add(it?.ToString() ?? "null"); } catch { shp.Add("?"); } }
+                                                shapeDesc = "[" + string.Join(',', shp) + "]";
+                                            }
+                                            else
+                                            {
+                                                shapeDesc = rawShape?.ToString() ?? "null";
+                                            }
+                                        }
+                                    }
+                                    catch { }
+
+                                    var mismatchFlag = sizeMismatch ? " MISMATCH" : string.Empty;
+                                    StaticLogger.Log($"[BirdNET] ChunkDiag: idx={c+1}/{totalChunks} rawTensorSize={rawTensorSize} expectedElements={expectedElements} finalBuf={chunkBuffer.Length} tensorSize={audioTensor?.size} type={typeName} shape={shapeDesc}{mismatchFlag}");
+                                    if (sizeMismatch && !loggedFirstSizeMismatch) loggedFirstSizeMismatch = true;
+                                }
+                                catch { }
+                            }
+                        }
+                        catch { }
+
+                        try
+                        {
+                            // Prefer using OpenVinoModelRunner.SetTensorSafely via reflection when available.
+                            var setMethod = runnerType.GetMethod("SetTensorSafely", BindingFlags.NonPublic | BindingFlags.Static);
+                            if (setMethod != null)
+                            {
+                                // Try to derive a native shape from the tensor if present, fallback to flat length.
+                                long[] shape = new long[] { chunkBuffer.Length };
+                                try
+                                {
+                                    var shapeProp = audioTensor?.GetType().GetProperty("shape");
+                                    if (shapeProp != null)
+                                    {
+                                        var rawShape = shapeProp.GetValue(audioTensor);
+                                        if (rawShape is System.Collections.IEnumerable enumShape)
+                                        {
+                                            var list = new List<long>();
+                                            foreach (var it in enumShape)
+                                            {
+                                                try { list.Add(Convert.ToInt64(it)); } catch { }
+                                            }
+                                            if (list.Count > 0) shape = list.ToArray();
+                                        }
+                                    }
+                                }
+                                catch { }
+
+                                try
+                                {
+                                    // Invoke the helper which will resize/pad/trim as needed for native tensor capacity.
+                                    setMethod.Invoke(null, new object[] { audioTensor, chunkBuffer, shape });
+                                }
+                                catch (TargetInvocationException tie)
+                                {
+                                    // Unwrap native invocation exceptions so caller can handle appropriately.
+                                    throw tie.InnerException ?? tie;
+                                }
+                            }
+                            else
+                            {
+                                // Fallback to direct set_data if helper not available.
+                                audioTensor?.set_data(chunkBuffer);
+                            }
+                        }
+                        catch (ArgumentException ex)
+                        {
+                            // Handle native "Input data is too large" by trimming and retrying
+                            StaticLogger.Log($"[BirdNET] set_data failed: {ex.Message}. Attempting fallback trim/retry.");
+                            try
+                            {
+                                int fallbackLen = chunkBuffer.Length;
+                                if (expectedElements > 0) fallbackLen = Math.Min(fallbackLen, expectedElements);
+                                // ensure positive
+                                fallbackLen = Math.Max(0, fallbackLen);
+                                var tmp = new float[fallbackLen];
+                                Array.Copy(chunkBuffer, 0, tmp, 0, tmp.Length);
+                                audioTensor?.set_data(tmp);
+                                StaticLogger.Log($"[BirdNET] set_data fallback succeeded with length={tmp.Length}.");
+                                chunkBuffer = tmp; // update for downstream consistency
+                            }
+                            catch (Exception ex2)
+                            {
+                                StaticLogger.Log($"[BirdNET] set_data fallback failed: {ex2.Message}");
+                                throw;
+                            }
+                        }
+
+                        // Execute hardware-accelerated sync graph inference
+                        progress?.Report((c, totalChunks));
+                        inferRequest.infer();
+                        progress?.Report((c + 1, totalChunks));
+                    }
+                    catch (Exception ex)
+                    {
+                        // Try to gather more diagnostics from tensors
+                        try
+                        {
+                            ulong in0 = 0UL; ulong in1 = 0UL; ulong out0 = 0UL;
+                            try { in0 = inputTensor0?.size ?? 0UL; } catch { }
+                            try { in1 = inputTensor1?.size ?? 0UL; } catch { }
+                            try { out0 = inferRequest.get_output_tensor(0)?.size ?? 0UL; } catch { }
+                            StaticLogger.Log($"[BirdNET] infer() failed: {ex.Message}. tensor sizes: in0={in0}, in1={in1}, out0={out0}");
+                        }
+                        catch { }
+                        StaticLogger.Log("[BirdNET] Rethrowing after infer failure.");
+                        throw;
+                    }
 
                     // Retrieve output tensor safely from index 0 or index 1 backup ports
                     Tensor? outputTensor = null;

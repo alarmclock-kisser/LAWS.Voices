@@ -8,6 +8,7 @@ using System.Data;
 using System.Drawing;
 using System.Drawing.Imaging;
 using System.Globalization;
+using System.Numerics;
 using System.Runtime.Versioning;
 using System.Text;
 
@@ -22,7 +23,10 @@ namespace LAWS.Voices.Multimodal.Audio
         public string Name { get; set; } = string.Empty;
 
 
-        public float[] Data { get; set; } = Array.Empty<float>();
+        public float[] Data { get; set; } = [];
+        public Complex[]? ComplexData { get; set; } = null;
+        public int ChunkSize { get; set; } = 0;
+        public float Overlap { get; set; } = 0f;
         public int Length => this.Data.Length;
         public int SampleRate { get; set; } = 0;
         public int Channels { get; set; } = 0;
@@ -61,7 +65,7 @@ namespace LAWS.Voices.Multimodal.Audio
         public void Dispose()
         {
             // Clear all data and reset fields
-            this.Data = Array.Empty<float>();
+            this.Data = [];
             this.FilePath = string.Empty;
             this.Name = string.Empty;
             this.SampleRate = 0;
@@ -257,6 +261,22 @@ namespace LAWS.Voices.Multimodal.Audio
             }
         }
 
+
+        public AudioObj Clone()
+        {
+            return new AudioObj
+            {
+                FilePath = this.FilePath,
+                Name = this.Name,
+                Data = (float[]) this.Data.Clone(),
+                ComplexData = this.ComplexData != null ? (Complex[]) this.ComplexData.Clone() : null,
+                ChunkSize = this.ChunkSize,
+                Overlap = this.Overlap,
+                SampleRate = this.SampleRate,
+                Channels = this.Channels,
+                BitDepth = this.BitDepth
+            };
+        }
 
 
         public string? ExportWav(string? outputDirectory = null, string? fileName = null, int bits = 16)
@@ -499,6 +519,352 @@ namespace LAWS.Voices.Multimodal.Audio
             StaticLogger.Log("[SUCCESS] Waveform bitmap processing completed successfully.");
             return bitmap;
         }
+
+        [SupportedOSPlatform("windows")]
+        public async Task<Bitmap> DrawSpectrogramAsync(int width = 800, int height = 600, int? maxWorkers = null)
+        {
+            maxWorkers = Math.Clamp(maxWorkers ?? Environment.ProcessorCount, 1, Environment.ProcessorCount);
+
+            if (this.ComplexData == null || this.ComplexData.Length == 0)
+            {
+                return new Bitmap(width, height, PixelFormat.Format32bppArgb);
+            }
+
+            return await Task.Run(() =>
+            {
+                int chunkSize = this.ChunkSize > 0 ? this.ChunkSize : 8192;
+                // ensure power of two
+                chunkSize = (int)Math.Pow(2, Math.Ceiling(Math.Log2(chunkSize)));
+                float overlap = this.Overlap >= 0f && this.Overlap < 1f ? this.Overlap : 0f;
+
+                int hop = Math.Max(1, (int)Math.Round(chunkSize * (1.0 - overlap)));
+                var data = this.ComplexData!;
+                int len = data.Length;
+
+                var frames = new List<Complex[]>();
+                for (int s = 0; s < len; s += hop)
+                {
+                    var frame = new Complex[chunkSize];
+                    int toCopy = Math.Min(chunkSize, Math.Max(0, len - s));
+                    if (toCopy > 0)
+                    {
+                        Array.Copy(data, s, frame, 0, toCopy);
+                    }
+                    frames.Add(frame);
+                }
+
+                if (frames.Count == 0)
+                {
+                    return new Bitmap(width, height, PixelFormat.Format32bppArgb);
+                }
+
+                int bins = chunkSize / 2; // positive frequencies
+
+                var mags = new float[frames.Count][];
+                var parallelOptions = new ParallelOptions { MaxDegreeOfParallelism = maxWorkers.Value };
+
+                Parallel.For(0, frames.Count, parallelOptions, i =>
+                {
+                    var f = frames[i];
+                    var m = new float[bins];
+                    for (int b = 0; b < bins; b++)
+                    {
+                        double re = f[b].Real;
+                        double im = f[b].Imaginary;
+                        double mag = Math.Sqrt(re * re + im * im);
+                        m[b] = (float)(20.0 * Math.Log10(mag + 1e-10));
+                    }
+                    mags[i] = m;
+                });
+
+                float minv = float.MaxValue;
+                float maxv = float.MinValue;
+                for (int i = 0; i < mags.Length; i++)
+                {
+                    var m = mags[i];
+                    for (int j = 0; j < m.Length; j++)
+                    {
+                        if (m[j] < minv) minv = m[j];
+                        if (m[j] > maxv) maxv = m[j];
+                    }
+                }
+
+                if (minv == float.MaxValue || maxv == float.MinValue)
+                {
+                    return new Bitmap(width, height, PixelFormat.Format32bppArgb);
+                }
+
+                float range = Math.Max(1e-6f, maxv - minv);
+
+                var bmp = new Bitmap(width, height, PixelFormat.Format32bppArgb);
+
+                for (int x = 0; x < width; x++)
+                {
+                    double fx = x * (frames.Count - 1) / (double)Math.Max(1, width - 1);
+                    int fi = (int)Math.Round(fx);
+                    fi = Math.Clamp(fi, 0, frames.Count - 1);
+
+                    var spectrum = mags[fi];
+
+                    for (int y = 0; y < height; y++)
+                    {
+                        double fy = 1.0 - (y / (double)(height - 1));
+                        double binF = fy * (bins - 1);
+                        int bin = (int)Math.Round(binF);
+                        bin = Math.Clamp(bin, 0, bins - 1);
+
+                        float val = (spectrum[bin] - minv) / range; // 0..1
+                        val = Math.Clamp(val, 0f, 1f);
+                        int c = (int)(val * 255);
+                        Color col = Color.FromArgb(255, c, c, c);
+                        bmp.SetPixel(x, y, col);
+                    }
+                }
+
+                return bmp;
+            });
+        }
+
+
+        public async Task<List<float[]>> GetChunksAsync(int chunkSize = 8192, float overlap = 0.5f, int? maxWorkers = null)
+        {
+            maxWorkers = Math.Clamp(maxWorkers ?? Environment.ProcessorCount, 1, Environment.ProcessorCount);
+            // Make chunkSize next 2^n
+            chunkSize = (int) Math.Pow(2, Math.Ceiling(Math.Log2(chunkSize)));
+            overlap = Math.Clamp(overlap, 0f, 0.95f);
+
+            this.ChunkSize = chunkSize;
+            this.Overlap = overlap;
+
+            if (this.Data == null || this.Data.Length == 0)
+            {
+                return [];
+            }
+
+            return await Task.Run(() =>
+            {
+                int len = this.Data.Length;
+                int hop = Math.Max(1, (int) Math.Round(chunkSize * (1.0 - overlap)));
+
+                var starts = new List<int>();
+                for (int s = 0; s < len; s += hop)
+                {
+                    starts.Add(s);
+                }
+
+                if (starts.Count == 0)
+                {
+                    starts.Add(0);
+                }
+
+                var results = new float[starts.Count][];
+                var parallelOptions = new ParallelOptions { MaxDegreeOfParallelism = maxWorkers.Value };
+
+                Parallel.For(0, starts.Count, parallelOptions, i =>
+                {
+                    int start = starts[i];
+                    var chunk = new float[chunkSize];
+                    // explicitly clear to ensure zero-padding for the last partial chunk
+                    Array.Clear(chunk, 0, chunkSize);
+                    int toCopy = Math.Min(chunkSize, Math.Max(0, len - start));
+                    if (toCopy > 0)
+                    {
+                        Array.Copy(this.Data, start, chunk, 0, toCopy);
+                    }
+                    results[i] = chunk;
+                });
+
+                return results.ToList();
+            });
+        }
+
+        public async Task<List<Complex[]>> GetComplexChunksAsync(int chunkSize = 8192, float overlap = 0.5f, int? maxWorkers = null)
+        {
+            maxWorkers = Math.Clamp(maxWorkers ?? Environment.ProcessorCount, 1, Environment.ProcessorCount);
+            // Make chunkSize next 2^n
+            chunkSize = (int) Math.Pow(2, Math.Ceiling(Math.Log2(chunkSize)));
+            overlap = Math.Clamp(overlap, 0f, 0.95f);
+
+            this.ChunkSize = chunkSize;
+            this.Overlap = overlap;
+
+            if (this.ComplexData == null || this.ComplexData.Length == 0)
+            {
+                return [];
+            }
+
+            return await Task.Run(() =>
+            {
+                int len = this.ComplexData.Length;
+                int hop = Math.Max(1, (int) Math.Round(chunkSize * (1.0 - overlap)));
+
+                var starts = new List<int>();
+                for (int s = 0; s < len; s += hop)
+                {
+                    starts.Add(s);
+                }
+
+                if (starts.Count == 0)
+                {
+                    starts.Add(0);
+                }
+
+                var results = new Complex[starts.Count][];
+                var parallelOptions = new ParallelOptions { MaxDegreeOfParallelism = maxWorkers.Value };
+
+                Parallel.For(0, starts.Count, parallelOptions, i =>
+                {
+                    int start = starts[i];
+                    var chunk = new Complex[chunkSize];
+                    // explicitly clear to ensure zero-padding for the last partial chunk
+                    Array.Clear(chunk, 0, chunkSize);
+                    int toCopy = Math.Min(chunkSize, Math.Max(0, len - start));
+                    if (toCopy > 0)
+                    {
+                        Array.Copy(this.ComplexData, start, chunk, 0, toCopy);
+                    }
+                    results[i] = chunk;
+                });
+
+                return results.ToList();
+            });
+        }
+
+
+
+        public async Task AggregateChunksAsync(List<float[]> chunks, bool nullComplexData = false)
+        {
+            if (chunks == null || chunks.Count == 0)
+            {
+                return;
+            }
+
+            await Task.Run(() =>
+            {
+                int chunkSize = this.ChunkSize > 0 ? this.ChunkSize : chunks[0].Length;
+                float overlap = this.Overlap >= 0f && this.Overlap <= 0.99f ? this.Overlap : 0f;
+
+                // fallback if stored values are not set
+                if (chunkSize <= 0)
+                {
+                    chunkSize = chunks[0].Length;
+                }
+
+                int hop = Math.Max(1, (int)Math.Round(chunkSize * (1.0 - overlap)));
+                int outLen = hop * (chunks.Count - 1) + chunkSize;
+
+                var outData = new float[outLen];
+                var counts = new float[outLen];
+
+                for (int i = 0; i < chunks.Count; i++)
+                {
+                    var chunk = chunks[i] ?? new float[chunkSize];
+                    int start = i * hop;
+                    for (int j = 0; j < chunkSize; j++)
+                    {
+                        int pos = start + j;
+                        if (pos >= outLen) break;
+                        outData[pos] += chunk.Length > j ? chunk[j] : 0f;
+                        counts[pos] += 1f;
+                    }
+                }
+
+                for (int i = 0; i < outLen; i++)
+                {
+                    if (counts[i] > 0f)
+                    {
+                        outData[i] /= counts[i];
+                    }
+                }
+
+                this.Data = outData;
+                // If this aggregation follows an IFFT (nullComplexData == true), normalize peak to 1.0
+                if (nullComplexData)
+                {
+                    float maxAbs = 0f;
+                    for (int i = 0; i < outData.Length; i++)
+                    {
+                        float a = Math.Abs(outData[i]);
+                        if (a > maxAbs) maxAbs = a;
+                    }
+
+                    if (maxAbs > 1e-9f)
+                    {
+                        float inv = 1f / maxAbs;
+                        for (int i = 0; i < outData.Length; i++)
+                        {
+                            outData[i] *= inv;
+                        }
+                        // assign normalized data back to Data
+                        this.Data = outData;
+                    }
+                }
+                this.ChunkSize = 0;
+                this.Overlap = 0.0f;
+
+                if (nullComplexData)
+                {
+                    this.ComplexData = null;
+                }
+            });
+        }
+
+        public async Task AggregateComplexChunksAsync(List<Complex[]> complexChunks, bool nullData = false)
+        {
+            if (complexChunks == null || complexChunks.Count == 0)
+            {
+                return;
+            }
+
+            await Task.Run(() =>
+            {
+                int chunkSize = this.ChunkSize > 0 ? this.ChunkSize : complexChunks[0].Length;
+                float overlap = this.Overlap >= 0f && this.Overlap <= 0.99f ? this.Overlap : 0f;
+
+                if (chunkSize <= 0)
+                {
+                    chunkSize = complexChunks[0].Length;
+                }
+
+                int hop = Math.Max(1, (int)Math.Round(chunkSize * (1.0 - overlap)));
+                int outLen = hop * (complexChunks.Count - 1) + chunkSize;
+
+                var outData = new Complex[outLen];
+                var counts = new float[outLen];
+
+                for (int i = 0; i < complexChunks.Count; i++)
+                {
+                    var chunk = complexChunks[i] ?? new Complex[chunkSize];
+                    int start = i * hop;
+                    for (int j = 0; j < chunkSize; j++)
+                    {
+                        int pos = start + j;
+                        if (pos >= outLen) break;
+                        outData[pos] += (j < chunk.Length) ? chunk[j] : Complex.Zero;
+                        counts[pos] += 1f;
+                    }
+                }
+
+                for (int i = 0; i < outLen; i++)
+                {
+                    if (counts[i] > 0f)
+                    {
+                        outData[i] /= counts[i];
+                    }
+                }
+
+                this.ComplexData = outData;
+                this.ChunkSize = 0;
+                this.Overlap = 0.0f;
+
+                if (nullData)
+                {
+                    this.Data = [];
+                }
+            });
+        }
+
+
 
     }
 }

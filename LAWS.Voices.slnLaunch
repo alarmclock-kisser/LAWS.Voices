@@ -10,7 +10,7 @@
     ]
   },
   {
-    "Name": "Forms",
+    "Name": "Forms (GUI)",
     "Projects": [
       {
         "Path": "LAWS.Voices.Forms\\LAWS.Voices.Forms.csproj",

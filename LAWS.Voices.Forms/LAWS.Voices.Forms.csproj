@@ -9,6 +9,7 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <ProjectReference Include="..\LAWS.Voices.Cuda13\LAWS.Voices.Cuda13.csproj" />
     <ProjectReference Include="..\LAWS.Voices.OpenVino\LAWS.Voices.OpenVino.csproj" />
   </ItemGroup>
 

@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Reflection;
 using System.IO;
 using System.Linq;
+using System.Text.RegularExpressions;
 using OpenVinoSharp;
 using System.Diagnostics;
 using LAWS.Voices.Shared;
@@ -85,17 +86,46 @@ namespace LAWS.Voices.OpenVino
         /// </summary>
         private static string ResolveXmlPath(OpenVinoModelInfo modelInfo, OpenVinoModelQuantization quant, string baseDirectory)
         {
+            // Helper: normalize identifiers to be tolerant for hyphens/underscores/spaces and case differences
+            static string Normalize(string? s)
+            {
+                if (string.IsNullOrEmpty(s)) return string.Empty;
+                var chars = s.ToLowerInvariant().Where(char.IsLetterOrDigit).ToArray();
+                return new string(chars);
+            }
+
+            string normalizedId = Normalize(modelInfo.Id);
+
             // Model folders may be organized as <baseDirectory>\<subrepo>\<modelId>\<quant> or directly as <baseDirectory>\<modelId>\<quant>.
-            // Try direct path first, then fallback to searching the baseDirectory tree for a matching model folder name.
+            // Try direct path first, then fallback to searching the baseDirectory tree for a matching model folder name using tolerant matching.
             string modelFolder = Path.Combine(baseDirectory, modelInfo.Id);
             if (!Directory.Exists(modelFolder))
             {
                 try
                 {
+                    // First try exact directory name matches
                     var matches = Directory.GetDirectories(baseDirectory, modelInfo.Id, SearchOption.AllDirectories);
                     if (matches != null && matches.Length > 0)
                     {
                         modelFolder = matches[0];
+                    }
+                    else
+                    {
+                        // Fallback: tolerant match by normalizing directory names
+                        var allDirs = Directory.GetDirectories(baseDirectory, "*", SearchOption.AllDirectories);
+                        foreach (var d in allDirs)
+                        {
+                            try
+                            {
+                                var name = Path.GetFileName(d);
+                                if (Normalize(name) == normalizedId || Normalize(name).Contains(normalizedId) || normalizedId.Contains(Normalize(name)))
+                                {
+                                    modelFolder = d;
+                                    break;
+                                }
+                            }
+                            catch { }
+                        }
                     }
                 }
                 catch { }
@@ -127,7 +157,7 @@ namespace LAWS.Voices.OpenVino
                                          f.EndsWith(".onnx", StringComparison.OrdinalIgnoreCase));
             }
 
-            // If no file found in explicit quant folder, search recursively in modelFolder and its subfolders.
+            // If no file found in explicit quant folder, search recursively in modelFolder and its subfolders with tolerant filename matching.
             if (string.IsNullOrEmpty(modelFile))
             {
                 if (Directory.Exists(modelFolder))
@@ -137,8 +167,18 @@ namespace LAWS.Voices.OpenVino
                         .ToArray();
 
                     // Prefer candidates that live under a quant subfolder (e.g. /FP32/ or /FP16/)
-                    modelFile = allCandidates.FirstOrDefault(f => f.IndexOf(Path.DirectorySeparatorChar + quant.ToString() + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase) >= 0)
-                                ?? allCandidates.FirstOrDefault();
+                    modelFile = allCandidates.FirstOrDefault(f => f.IndexOf(Path.DirectorySeparatorChar + quant.ToString() + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase) >= 0);
+
+                    if (string.IsNullOrEmpty(modelFile) && allCandidates.Length > 0)
+                    {
+                        // Tolerant filename matching: prefer files whose filename (without extension) matches or contains the normalized id
+                        modelFile = allCandidates.FirstOrDefault(f => Normalize(Path.GetFileNameWithoutExtension(f)) == normalizedId)
+                                    ?? allCandidates.FirstOrDefault(f => Normalize(Path.GetFileNameWithoutExtension(f)).Contains(normalizedId))
+                                    ?? allCandidates.FirstOrDefault(f => normalizedId.Contains(Normalize(Path.GetFileNameWithoutExtension(f))));
+
+                        // Fallback to any candidate
+                        modelFile ??= allCandidates.FirstOrDefault();
+                    }
                 }
             }
 
@@ -600,6 +640,25 @@ namespace LAWS.Voices.OpenVino
         {
             this._core = new Core();
             this._deviceName = deviceName;
+
+            // Force all available devices to use 24 inference threads where supported.
+            try
+            {
+                List<string>? devs = null;
+                try { devs = this._core.get_available_devices(); } catch { devs = null; }
+                if (devs != null)
+                {
+                    foreach (var d in devs)
+                    {
+                        try { this._core.set_property(d, new Dictionary<string, string> { { "INFERENCE_NUM_THREADS", "24" } }); } catch { }
+                    }
+                }
+
+                // Also attempt CPU explicitly as a fallback
+                try { this._core.set_property("CPU", new Dictionary<string, string> { { "INFERENCE_NUM_THREADS", "24" } }); } catch { }
+            }
+            catch { }
+
             StaticLogger.Log($"OpenVINO service initialized on device: {this._deviceName}");
         }
 
@@ -689,7 +748,7 @@ namespace LAWS.Voices.OpenVino
                 {
                     if (src == null)
                     {
-                        return Array.Empty<string>();
+                        return [];
                     }
 
                     var st = src.GetType();
@@ -727,7 +786,7 @@ namespace LAWS.Voices.OpenVino
                             catch { }
                         }
                     }
-                    return Array.Empty<string>();
+                    return [];
                 }
 
                 var names = TryGetNamesFrom(infReq);
@@ -865,76 +924,229 @@ namespace LAWS.Voices.OpenVino
                 this.InferRequest = this.CompiledModel.create_infer_request();
             }
 
+            // Suppress overly verbose tensor logging: keep a lightweight counter and only log every N calls
+            private static int s_setTensorCallCounter = 0;
+            private static bool s_setTensorFirstSizeMismatchLogged = false;
+            private static readonly int SetTensorLogInterval = 25; // emit concise one-line summary every N calls
+
             protected static void SetTensorSafely(Tensor tensor, float[] data, long[] shape)
             {
                 try
                 {
+                    s_setTensorCallCounter++;
+                    bool shouldLog = (s_setTensorCallCounter % SetTensorLogInterval) == 1;
+                    int dataLen = data?.Length ?? 0;
+                    string tType = "<null>";
+                    try { tType = tensor?.GetType()?.FullName ?? "<null>"; } catch { }
+
+                    var summary = shouldLog ? new System.Text.StringBuilder() : null;
+                    if (shouldLog)
+                    {
+                        try
+                        {
+                            summary!.Append($"[SetTensorSafely] call={s_setTensorCallCounter} tensorType={tType} dataLen={dataLen} shape=[{string.Join(',', shape ?? Array.Empty<long>())}]");
+                        }
+                        catch { }
+                    }
+
+                    void FlushSummary(string action)
+                    {
+                        if (!shouldLog || summary == null)
+                        {
+                            return;
+                        }
+
+                        try
+                        {
+                            summary.Append($"; {action}");
+                            StaticLogger.Log(summary.ToString());
+                        }
+                        catch { }
+                    }
+
                     long expectedCount = 1;
                     bool unknownDim = false;
-                    foreach (var d in shape)
+                    foreach (var d in shape ?? [])
                     {
                         if (d <= 0) { unknownDim = true; break; }
                         expectedCount *= d;
                     }
 
-                    // Versuche, die native Tensor-Kapazität (property "size") zu ermitteln und
-                    // diese zur Autorität zu machen, falls verfügbar. Manche Modelle liefern
-                    // eine shape, die nicht mit der tatsächlichen internen Puffergröße übereinstimmt.
+                    // Versuche, native "size"-Property zu interpretieren (kann Bytes oder Elementanzahl sein)
                     try
                     {
-                        var sizeProp = tensor.GetType().GetProperty("size");
+                        var sizeProp = tensor?.GetType().GetProperty("size");
                         if (sizeProp != null)
                         {
-                            var native = Convert.ToInt64(sizeProp.GetValue(tensor));
-                            if (native > 0)
+                            var nativeObj = sizeProp.GetValue(tensor);
+                            if (nativeObj != null)
                             {
-                                expectedCount = native;
+                                long native = Convert.ToInt64(nativeObj);
+                                if (shouldLog)
+                                {
+                                    try { summary!.Append($"; nativeSize={native}"); } catch { }
+                                }
+                                const int FloatBytes = 4;
+
+                                if (native > 0)
+                                {
+                                    if (expectedCount > 0 && (native == expectedCount || native == expectedCount * FloatBytes))
+                                    {
+                                        if (shouldLog)
+                                        {
+                                            try { summary!.Append($"; expected={expectedCount}"); } catch { }
+                                        }
+                                    }
+                                    else if (native % FloatBytes == 0 && native / FloatBytes <= int.MaxValue)
+                                    {
+                                        expectedCount = native / FloatBytes;
+                                        if (shouldLog)
+                                        {
+                                            try { summary!.Append($"; expected={expectedCount}"); } catch { }
+                                        }
+                                    }
+                                    else if (native <= int.MaxValue)
+                                    {
+                                        expectedCount = native;
+                                        if (shouldLog)
+                                        {
+                                            try { summary!.Append($"; expected={expectedCount}"); } catch { }
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
-                    catch { }
+                    catch { /* swallow reflection errors */ }
+                    if (shouldLog)
+                    {
+                        try { summary!.Append($"; derivedExpected={expectedCount} unknownDim={unknownDim}"); } catch { }
+                    }
 
                     if (expectedCount <= 0)
                     {
                         try
                         {
-                            tensor.set_data(data);
+                            tensor?.set_data(data ?? []);
+                            FlushSummary("action=direct result=ok");
+                            return;
+                        }
+                        catch (ArgumentException)
+                        {
+                            throw;
+                        }
+                        catch
+                        {
+                            throw new InvalidOperationException($"Cannot determine expected tensor capacity for shape [{string.Join(',', shape ?? [])}].");
+                        }
+                    }
+
+                    if (expectedCount > int.MaxValue)
+                    {
+                        try
+                        {
+                            tensor?.set_data(data);
+                            FlushSummary($"action=direct expectedTooLarge={expectedCount} result=ok");
                             return;
                         }
                         catch
                         {
-                            throw new InvalidOperationException($"Cannot determine expected tensor capacity for shape [{string.Join(',', shape)}].");
+                            throw new InvalidOperationException("Expected tensor size exceeds supported managed array limits.");
                         }
                     }
 
-                    if (expectedCount == data.Length)
+                    int exp = (int)expectedCount;
+                    if (exp != dataLen && !s_setTensorFirstSizeMismatchLogged)
                     {
-                        tensor.set_data(data);
-                        return;
+                        s_setTensorFirstSizeMismatchLogged = true;
+                        StaticLogger.Log($"[SetTensorSafely] size mismatch detected (first occurrence): expected={exp}, dataLen={dataLen}");
                     }
 
-                    if (data.Length > 0)
+                    if (exp == data?.Length)
                     {
-                        var resized = new float[expectedCount];
-                        for (long i = 0; i < expectedCount; i++)
+                        try
                         {
-                            long srcIdx = (long) Math.Floor(i * (double) data.Length / expectedCount);
-                            if (srcIdx < 0)
-                            {
-                                srcIdx = 0;
-                            }
-
-                            if (srcIdx >= data.Length)
-                            {
-                                srcIdx = data.Length - 1;
-                            }
-
-                            resized[i] = data[(int) srcIdx];
+                            tensor?.set_data(data);
+                            FlushSummary($"action=set_data len={exp} result=ok");
+                            return;
                         }
-                        tensor.set_data(resized);
-                        return;
+                        catch (ArgumentException ex)
+                        {
+                            StaticLogger.Log($"[SetTensorSafely] set_data rejected even though lengths matched: {ex.Message}");
+                            try
+                            {
+                                int current = data.Length;
+                                while (current > 1)
+                                {
+                                    current = Math.Max(1, current / 2);
+                                    var trimmedTry = new float[current];
+                                    Array.Copy(data, 0, trimmedTry, 0, trimmedTry.Length);
+                                    try
+                                    {
+                                        tensor?.set_data(trimmedTry);
+                                        FlushSummary($"action=progressiveTrim len={current} result=ok");
+                                        return;
+                                    }
+                                    catch (ArgumentException innerEx)
+                                    {
+                                        StaticLogger.Log($"[SetTensorSafely] progressive trimmed set_data({current}) rejected: {innerEx.Message}");
+                                    }
+                                }
+                                StaticLogger.Log("[SetTensorSafely] progressive trimming fallback exhausted without success");
+                            }
+                            catch (Exception inner)
+                            {
+                                StaticLogger.Log($"[SetTensorSafely] unexpected error during progressive trimming fallback: {inner.Message}");
+                            }
+                        }
+                        catch (Exception ex) { StaticLogger.Log($"[SetTensorSafely] unexpected exception on set_data: {ex.Message}"); throw; }
                     }
-                    throw new InvalidOperationException($"Data length {data.Length} incompatible with expected shape [{string.Join(',', shape)}].");
+
+                    if (exp > data.Length)
+                    {
+                        var padded = new float[exp];
+                        Array.Copy(data, 0, padded, 0, data.Length);
+                        try
+                        {
+                            tensor?.set_data(padded);
+                            FlushSummary($"action=padded from={data.Length} to={padded.Length} result=ok");
+                            return;
+                        }
+                        catch (ArgumentException ex)
+                        {
+                            StaticLogger.Log($"[SetTensorSafely] set_data rejected padded buffer: {ex.Message}. Trying original data as fallback.");
+                            try
+                            {
+                                tensor?.set_data(data);
+                                FlushSummary($"action=originalAfterPadded len={data.Length} result=ok");
+                                return;
+                            }
+                            catch
+                            {
+                                throw;
+                            }
+                        }
+                    }
+
+                    if (exp < data.Length)
+                    {
+                        var trimmed = new float[exp];
+                        Array.Copy(data, 0, trimmed, 0, trimmed.Length);
+                        try
+                        {
+                            tensor?.set_data(trimmed);
+                            FlushSummary($"action=trimmed from={data.Length} to={trimmed.Length} result=ok");
+                            return;
+                        }
+                        catch (ArgumentException ex)
+                        {
+                            StaticLogger.Log($"[SetTensorSafely] set_data rejected trimmed buffer: {ex.Message}");
+                            throw;
+                        }
+                    }
+
+                    tensor?.set_data(data);
+                    FlushSummary("action=set_data(final) result=ok");
                 }
                 catch
                 {
@@ -1043,13 +1255,66 @@ namespace LAWS.Voices.OpenVino
                     var irType = ir.GetType();
                     try
                     {
-                        var miAll = irType.GetMethod("get_input_tensors", BindingFlags.Public | BindingFlags.Instance | BindingFlags.NonPublic);
-                        if (miAll != null)
+                        // Try many reflection-based accessors: methods, properties, fields that expose input tensors/inputs
+                        // 1) Methods returning arrays/enumerables with 'input' in the name
+                        foreach (var mi in irType.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance))
                         {
-                            var arr = miAll.Invoke(ir, null) as System.Array;
-                            if (arr != null && arr.Length > 0)
+                            try
                             {
-                                inputTensor = arr.GetValue(0) as Tensor;
+                                if (mi.GetParameters().Length != 0) continue;
+                                var rtype = mi.ReturnType;
+                                if (!(rtype.IsArray || typeof(System.Collections.IEnumerable).IsAssignableFrom(rtype))) continue;
+                                var lname = mi.Name.ToLowerInvariant();
+                                if (!lname.Contains("input")) continue;
+                                var arr = mi.Invoke(ir, null) as System.Array;
+                                if (arr != null && arr.Length > 0)
+                                {
+                                    inputTensor = arr.GetValue(0) as Tensor;
+                                    if (inputTensor != null) break;
+                                }
+                            }
+                            catch { }
+                        }
+
+                        // 2) Properties exposing input collections
+                        if (inputTensor == null)
+                        {
+                            foreach (var pi in irType.GetProperties(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance))
+                            {
+                                try
+                                {
+                                    if (pi.GetIndexParameters().Length > 0) continue;
+                                    var pname = pi.Name.ToLowerInvariant();
+                                    if (!pname.Contains("input")) continue;
+                                    var val = pi.GetValue(ir);
+                                    var arr = val as System.Array;
+                                    if (arr != null && arr.Length > 0)
+                                    {
+                                        inputTensor = arr.GetValue(0) as Tensor;
+                                        if (inputTensor != null) break;
+                                    }
+                                }
+                                catch { }
+                            }
+                        }
+
+                        // 3) Fields as a last resort
+                        if (inputTensor == null)
+                        {
+                            foreach (var fi in irType.GetFields(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance))
+                            {
+                                try
+                                {
+                                    var fname = fi.Name.ToLowerInvariant();
+                                    if (!fname.Contains("input")) continue;
+                                    var val = fi.GetValue(ir) as System.Array;
+                                    if (val != null && val.Length > 0)
+                                    {
+                                        inputTensor = val.GetValue(0) as Tensor;
+                                        if (inputTensor != null) break;
+                                    }
+                                }
+                                catch { }
                             }
                         }
                     }
@@ -1311,13 +1576,66 @@ namespace LAWS.Voices.OpenVino
                     var irType = ir.GetType();
                     try
                     {
-                        var miAll = irType.GetMethod("get_input_tensors", BindingFlags.Public | BindingFlags.Instance | BindingFlags.NonPublic);
-                        if (miAll != null)
+                        // Try many reflection-based accessors: methods, properties, fields that expose input tensors/inputs
+                        // 1) Methods returning arrays/enumerables with 'input' in the name
+                        foreach (var mi in irType.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance))
                         {
-                            var arr = miAll.Invoke(ir, null) as System.Array;
-                            if (arr != null && arr.Length > 0)
+                            try
                             {
-                                inputTensor = arr.GetValue(0) as Tensor;
+                                if (mi.GetParameters().Length != 0) continue;
+                                var rtype = mi.ReturnType;
+                                if (!(rtype.IsArray || typeof(System.Collections.IEnumerable).IsAssignableFrom(rtype))) continue;
+                                var lname = mi.Name.ToLowerInvariant();
+                                if (!lname.Contains("input")) continue;
+                                var arr = mi.Invoke(ir, null) as System.Array;
+                                if (arr != null && arr.Length > 0)
+                                {
+                                    inputTensor = arr.GetValue(0) as Tensor;
+                                    if (inputTensor != null) break;
+                                }
+                            }
+                            catch { }
+                        }
+
+                        // 2) Properties exposing input collections
+                        if (inputTensor == null)
+                        {
+                            foreach (var pi in irType.GetProperties(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance))
+                            {
+                                try
+                                {
+                                    if (pi.GetIndexParameters().Length > 0) continue;
+                                    var pname = pi.Name.ToLowerInvariant();
+                                    if (!pname.Contains("input")) continue;
+                                    var val = pi.GetValue(ir);
+                                    var arr = val as System.Array;
+                                    if (arr != null && arr.Length > 0)
+                                    {
+                                        inputTensor = arr.GetValue(0) as Tensor;
+                                        if (inputTensor != null) break;
+                                    }
+                                }
+                                catch { }
+                            }
+                        }
+
+                        // 3) Fields as a last resort
+                        if (inputTensor == null)
+                        {
+                            foreach (var fi in irType.GetFields(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance))
+                            {
+                                try
+                                {
+                                    var fname = fi.Name.ToLowerInvariant();
+                                    if (!fname.Contains("input")) continue;
+                                    var val = fi.GetValue(ir) as System.Array;
+                                    if (val != null && val.Length > 0)
+                                    {
+                                        inputTensor = val.GetValue(0) as Tensor;
+                                        if (inputTensor != null) break;
+                                    }
+                                }
+                                catch { }
                             }
                         }
                     }
@@ -1326,7 +1644,7 @@ namespace LAWS.Voices.OpenVino
 
                 if (inputTensor == null)
                 {
-                    throw new InvalidOperationException("Could not resolve standard input tensor port.");
+                    throw new InvalidOperationException("Could not locate a single input tensor for this image topology.");
                 }
 
                 var expectedShape = inputTensor.shape;
@@ -1349,12 +1667,12 @@ namespace LAWS.Voices.OpenVino
                     var getDimsMethod = shapeType.GetMethod("get_dims", Type.EmptyTypes);
                     if (getDimsMethod != null)
                     {
-                        exp = (long[]?) getDimsMethod.Invoke(shapeObj, null) ?? Array.Empty<long>();
+                        exp = (long[]?) getDimsMethod.Invoke(shapeObj, null) ?? [];
                     }
                     else
                     {
                         var toArrayMethod = shapeType.GetMethod("ToArray", Type.EmptyTypes);
-                        exp = toArrayMethod != null ? ((long[]?) toArrayMethod.Invoke(shapeObj, null) ?? Array.Empty<long>()) : Array.Empty<long>();
+                        exp = toArrayMethod != null ? ((long[]?) toArrayMethod.Invoke(shapeObj, null) ?? []) : [];
                     }
                 }
 
@@ -1370,38 +1688,104 @@ namespace LAWS.Voices.OpenVino
 
                 if (rankLen >= 4)
                 {
-                    long expH = exp.Length > 2 ? exp[2] : (long) height;
-                    long expW = exp.Length > 3 ? exp[3] : (long) width;
-
-                    if (expH != (long) height || expW != (long) width)
+                    // Handle rank-4 ([1,C,H,W]) and rank-5 ([1,C,T,H,W]) model inputs.
+                    if (exp.Length == 5)
                     {
-                        inputDataToUse = ResizePlanarNearest(rgbChannelsData, providedChannels, (int) width, (int) height, (int) expW, (int) expH);
-                    }
+                        long expT = exp[2];
+                        long expH = exp[3];
+                        long expW = exp[4];
 
-                    if (expC != (long) providedChannels)
-                    {
-                        int outC = (int) expC;
-                        int outH = (int) expH;
-                        int outW = (int) expW;
-                        int plane = outH * outW;
-                        var expanded = new float[outC * plane];
-                        for (int c = 0; c < outC; c++)
+                        // Resize spatially if needed
+                        if (expH != (long) height || expW != (long) width)
                         {
-                            int destOff = c * plane;
-                            int srcC = c < providedChannels ? c : (providedChannels - 1);
-                            int srcOff = srcC * plane;
-                            if (inputDataToUse.Length >= (srcOff + plane))
+                            inputDataToUse = ResizePlanarNearest(rgbChannelsData, providedChannels, (int) width, (int) height, (int) expW, (int) expH);
+                        }
+
+                        // If channel count differs, expand channels similar to rank-4 case but per-frame
+                        if (expC != (long) providedChannels)
+                        {
+                            int outC = (int) expC;
+                            int outH = (int) expH;
+                            int outW = (int) expW;
+                            int plane = outH * outW;
+                            var expandedChannels = new float[outC * plane];
+                            for (int c = 0; c < outC; c++)
                             {
-                                Array.Copy(inputDataToUse, srcOff, expanded, destOff, plane);
+                                int destOff = c * plane;
+                                int srcC = c < providedChannels ? c : (providedChannels - 1);
+                                int srcOff = srcC * plane;
+                                if (inputDataToUse.Length >= (srcOff + plane))
+                                {
+                                    Array.Copy(inputDataToUse, srcOff, expandedChannels, destOff, plane);
+                                }
+                            }
+                            inputDataToUse = expandedChannels;
+                            expC = outC;
+                        }
+
+                        // Tile single-frame buffer across temporal dimension
+                        int outChannels = (int) expC;
+                        int T = (int) expT;
+                        int outH_i = (int) expH;
+                        int outW_i = (int) expW;
+                        int planeSize = outH_i * outW_i;
+                        var tiled = new float[outChannels * T * planeSize];
+
+                        int srcPlane = (int) ((inputDataToUse.Length / Math.Max(1, outChannels)));
+                        for (int c = 0; c < outChannels; c++)
+                        {
+                            int srcC = c < providedChannels ? c : (providedChannels - 1);
+                            int srcBase = srcC * srcPlane;
+                            for (int t = 0; t < T; t++)
+                            {
+                                int destBase = ((c * T) + t) * planeSize;
+                                int copyLen = Math.Min(srcPlane, planeSize);
+                                if (srcBase + copyLen <= inputDataToUse.Length && destBase + copyLen <= tiled.Length)
+                                {
+                                    Array.Copy(inputDataToUse, srcBase, tiled, destBase, copyLen);
+                                }
                             }
                         }
-                        inputDataToUse = expanded;
-                        expC = outC;
-                    }
 
-                    var targetShape4 = new long[] { 1, expC, exp[2], exp[3] };
-                    inputTensor.shape = new Shape(targetShape4);
-                    SetTensorSafely(inputTensor, inputDataToUse, targetShape4);
+                        var targetShape5 = new long[] { 1, expC, expT, expH, expW };
+                        inputTensor.shape = new Shape(targetShape5);
+                        SetTensorSafely(inputTensor, tiled, targetShape5);
+                    }
+                    else
+                    {
+                        long expH = exp.Length > 2 ? exp[2] : (long) height;
+                        long expW = exp.Length > 3 ? exp[3] : (long) width;
+
+                        if (expH != (long) height || expW != (long) width)
+                        {
+                            inputDataToUse = ResizePlanarNearest(rgbChannelsData, providedChannels, (int) width, (int) height, (int) expW, (int) expH);
+                        }
+
+                        if (expC != (long) providedChannels)
+                        {
+                            int outC = (int) expC;
+                            int outH = (int) expH;
+                            int outW = (int) expW;
+                            int plane = outH * outW;
+                            var expanded = new float[outC * plane];
+                            for (int c = 0; c < outC; c++)
+                            {
+                                int destOff = c * plane;
+                                int srcC = c < providedChannels ? c : (providedChannels - 1);
+                                int srcOff = srcC * plane;
+                                if (inputDataToUse.Length >= (srcOff + plane))
+                                {
+                                    Array.Copy(inputDataToUse, srcOff, expanded, destOff, plane);
+                                }
+                            }
+                            inputDataToUse = expanded;
+                            expC = outC;
+                        }
+
+                        var targetShape4 = new long[] { 1, expC, exp[2], exp[3] };
+                        inputTensor.shape = new Shape(targetShape4);
+                        SetTensorSafely(inputTensor, inputDataToUse, targetShape4);
+                    }
                 }
                 else if (rankLen == 3)
                 {

@@ -7,6 +7,7 @@ using System.Reflection;
 using System.Threading;
 using Microsoft.VisualBasic.FileIO;
 using LAWS.Voices.OpenVino.Processors;
+using LAWS.Voices.Cuda13;
 
 namespace LAWS.Voices.Forms
 {
@@ -31,7 +32,7 @@ namespace LAWS.Voices.Forms
         private Point panStartMouse = Point.Empty;
         private Point panStartScroll = Point.Empty;
         // Track current selected resource so we can regenerate audio waveform on resize
-        private object? currentPreviewResource = null;
+        public static object? currentPreviewResource = null;
         // Prevent async-generation races: incremented on each preview change
         private long previewGenerationId = 0;
         private bool suppressSizeChangedRegen = false;
@@ -80,371 +81,14 @@ namespace LAWS.Voices.Forms
 
         }
 
+        private static float Clamp(float v, float lo, float hi) => v < lo ? lo : (v > hi ? hi : v);
+
         // Handler for 'Extract Results' button - uses lastInferenceTensors if available or falls back to lastInferenceTensorRaw
         /// <summary>
         /// Extracts and formats inference results based on the active model context.
         /// Reconstructs Wav2Vec2 time-series song-clusters with millisecond precision if applicable.
         /// </summary>
-        private void button_extractResults_Click(object sender, EventArgs e)
-        {
-            // Step 1: Resolve the currently targeted model and active audio resource context
-            var model = this.comboBox_model.SelectedItem as OpenVinoModelInfo;
 
-            var orderedResources = this.Images.ImagesBindingList.Cast<object>()
-                .Concat(this.Audios.Audios.Cast<object>())
-                .OrderBy(r => r is ImageObj i ? i.CreatedAt : ((AudioObj) r).CreatedAt)
-                .ToArray();
-
-            int resourceIdx = (int) this.numericUpDown_resourceId.Value - 1;
-            AudioObj? aud = null;
-
-            if (resourceIdx >= 0 && resourceIdx < orderedResources.Length && orderedResources[resourceIdx] is AudioObj standardAudio)
-            {
-                aud = standardAudio;
-            }
-            else
-            {
-                aud = this.currentPreviewResource as AudioObj;
-            }
-
-            // Step 2: Check if the current context contains an active Wav2Vec2 bioacoustic analysis signature
-            bool isWav2VecContext = this.textBox_result.Text.Contains("Wav2Vec2") ||
-                                    (model != null && !string.IsNullOrEmpty(model.Id) && model.Id.Contains("wav2vec2", StringComparison.OrdinalIgnoreCase));
-
-            if (isWav2VecContext)
-            {
-                if (this.lastInferenceTensorRaw == null || this.lastInferenceTensorRaw.Length == 0)
-                {
-                    MessageBox.Show("No raw logit tensor matrix data available to cluster. Run inference first.", "Extraction Warning", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                    return;
-                }
-
-                if (aud == null)
-                {
-                    MessageBox.Show("Unable to resolve active Audio object context for duration tracking.", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
-                    return;
-                }
-
-                try
-                {
-                    int vocabSize = 32;
-                    int framesPerChunk = 204;
-                    int elementsPerChunk = framesPerChunk * vocabSize;
-
-                    // Reconstruct sequential multi-chunk segmentation arrays from flat memory block
-                    var sequentialChunks = new List<float[]>();
-                    for (int i = 0; i < this.lastInferenceTensorRaw.Length; i += elementsPerChunk)
-                    {
-                        int remaining = this.lastInferenceTensorRaw.Length - i;
-                        int copyLength = Math.Min(elementsPerChunk, remaining);
-
-                        float[] chunk = new float[elementsPerChunk];
-                        Array.Copy(this.lastInferenceTensorRaw, i, chunk, 0, copyLength);
-                        sequentialChunks.Add(chunk);
-                    }
-
-                    // Extract the micro-frame triggers using baseline inverse padding calculation
-                    var activityEvents = Wav2Vec2Visualizer.ExtractActivityTimeline(sequentialChunks, sensitivityThreshold: 0.15);
-
-                    // Execute the macro-clustering algorithm (1.5 seconds maximum syllable gap boundary threshold)
-                    var songBlocks = Wav2Vec2Processor.ClusterEventsIntoSongs(activityEvents, maxPauseSeconds: 1.5);
-
-                    var report = new System.Text.StringBuilder();
-                    report.AppendLine($"=========================================================");
-                    report.AppendLine($"         STUDIO BIOACOUSTIC TIMELINE SUMMARY REPORT      ");
-                    report.AppendLine($"=========================================================");
-                    report.AppendLine($"Total Signal Duration: {aud.Duration:mm\\:ss\\.fff}"); // Millisecond accuracy for duration
-                    report.AppendLine($"Total Raw Frame Activations:  {activityEvents.Count}");
-                    report.AppendLine($"Detected Song Sequences: {songBlocks.Count}");
-                    report.AppendLine($"---------------------------------------------------------");
-                    report.AppendLine();
-
-                    foreach (var song in songBlocks)
-                    {
-                        // Fix: Upgraded timestamp presentation format to precise millisecond boundaries (fff)
-                        report.AppendLine($"🎵 [{song.StartTime:mm\\:ss\\.fff} -> {song.EndTime:mm\\:ss\\.fff}] ({song.Duration.TotalMilliseconds:F0} ms)");
-                        report.AppendLine($"   ├─ Signal Energy: Peak: {song.PeakIntensity:P0} | Avg: {song.AverageIntensity:P0}");
-                        report.AppendLine($"   ├─ Density:       {song.TotalFrameTriggers} active frames detected.");
-                        report.AppendLine($"   └─ Syllable Motif Signature: '{song.SyllableSequence}'");
-                        report.AppendLine();
-                    }
-
-                    string finalizedReportText = report.ToString();
-
-                    // Update the primary result view text area safely within interface threads
-                    this.BeginInvoke(new Action(() => this.textBox_result.Text = finalizedReportText));
-
-                    // Show detailed extraction dialog with copy and ZIP-export options
-                    try
-                    {
-                        var dlg = new Wav2VecExtractionForm(finalizedReportText, aud, songBlocks);
-                        dlg.ShowDialog(this);
-                    }
-                    catch (Exception ex)
-                    {
-                        StaticLogger.Log("Failed to show extraction dialog: " + ex.Message);
-                        // fallback: ask to copy
-                        var copyConfirmation = MessageBox.Show("Macro-clustering timeline analysis regenerated successfully!" + Environment.NewLine + Environment.NewLine + "Copy report to clipboard?", "Wav2Vec2 Extraction", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
-                        if (copyConfirmation == DialogResult.Yes)
-                        {
-                            Clipboard.SetText(finalizedReportText);
-                        }
-                    }
-                    return; // Gracefully exit method; processing for speech/audio matrix complete
-                }
-                catch (Exception ex)
-                {
-                    StaticLogger.Log($"[ERROR] Failed to compile macro-clustered timeline report: {ex.Message}");
-                    MessageBox.Show($"Failed to aggregate timeline tokens: {ex.Message}", "Extraction Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
-                    return;
-                }
-            }
-
-            // Step 3: Standard multi-modal fallback track execution path (Age, Gender, Objects)
-            try
-            {
-                ExtractionResult? er = null;
-                if (this.lastInferenceTensors != null && this.lastInferenceTensors.Length > 0)
-                {
-                    er = ResultExtractor.ExtractResults(this.lastInferenceTensors, this.lastInferenceOutputNames);
-                }
-                else if (this.lastInferenceTensorRaw != null)
-                {
-                    try
-                    {
-                        er = new ExtractionResult();
-                        er.RawSummaries["raw"] = new { size = this.lastInferenceTensorRaw.Length };
-                    }
-                    catch
-                    {
-                        er = new ExtractionResult();
-                        er.RawSummaries["raw"] = new { size = this.lastInferenceTensorRaw.Length };
-                    }
-                }
-                else
-                {
-                    MessageBox.Show("No inference results available to extract.", "Data Abort", MessageBoxButtons.OK, MessageBoxIcon.Information);
-                    return;
-                }
-
-                // Build a concise summary string for multi-modal indicators
-                var sb = new System.Text.StringBuilder();
-                // If extractor didn't produce age/gender but we have raw flat output, try heuristics
-                try
-                {
-                    if ((er.Age == null && er.GenderIndex == null && er.MaleProbability == null && er.FemaleProbability == null) && this.lastInferenceTensorRaw != null && this.lastInferenceTensorRaw.Length > 0)
-                    {
-                        var raw = this.lastInferenceTensorRaw;
-                        int N = raw.Length;
-                        // Heuristic 1: scan for 2-element probability pairs (male,female) whose sum is ~1
-                        for (int i = N - 2; i >= 0; i--)
-                        {
-                            float a = raw[i];
-                            float b = raw[i + 1];
-                            if (a >= 0 && b >= 0)
-                            {
-                                float s = a + b;
-                                if (s > 0.5f && s < 1.5f)
-                                {
-                                    double male = Math.Round(a / s, 4);
-                                    double female = Math.Round(b / s, 4);
-                                    er.MaleProbability = male;
-                                    er.FemaleProbability = female;
-                                    er.GenderIndex = male > female ? 0 : 1;
-                                    er.GenderConfidence = Math.Round(Math.Max(male, female), 4);
-                                    StaticLogger.Log($"[Extract] Heuristic gender prob found at offset {i}: male={male}, female={female}");
-                                    break;
-                                }
-                            }
-                        }
-
-                        // Heuristic 2: scan for age-distribution-like windows (length between 50..150) summing ~1
-                        if (er.Age == null)
-                        {
-                            for (int w = 150; w >= 50; w--)
-                            {
-                                if (w > N) continue;
-                                for (int i = N - w; i >= 0; i--)
-                                {
-                                    double s = 0;
-                                    bool anyNeg = false;
-                                    for (int k = 0; k < w; k++)
-                                    {
-                                        float v = raw[i + k];
-                                        if (v < 0) { anyNeg = true; break; }
-                                        s += v;
-                                    }
-                                    if (anyNeg) continue;
-                                    if (s > 0.5 && s < 1.5)
-                                    {
-                                        // compute expectation
-                                        double sumIdx = 0; double probSum = 0; double peak = 0;
-                                        for (int k = 0; k < w; k++)
-                                        {
-                                            double p = raw[i + k];
-                                            sumIdx += k * p;
-                                            probSum += p;
-                                            if (p > peak) peak = p;
-                                        }
-                                        if (probSum > 0)
-                                        {
-                                            double expectation = Math.Round(sumIdx / probSum, 2);
-                                            er.Age = expectation;
-                                            er.AgeConfidence = Math.Round(peak, 4);
-                                            StaticLogger.Log($"[Extract] Heuristic age distribution found at offset {i} length {w} -> age={expectation} confidence={er.AgeConfidence}");
-                                            break;
-                                        }
-                                    }
-                                }
-                                if (er.Age != null) break;
-                            }
-                        }
-                    }
-                }
-                catch (Exception ex)
-                {
-                    StaticLogger.Log("[Extract] Heuristic fallback failed: " + ex.Message);
-                }
-                // If extractor didn't produce age/gender but we have raw flat output, try heuristics
-                try
-                {
-                    if ((er.Age == null && er.GenderIndex == null && er.MaleProbability == null && er.FemaleProbability == null) && this.lastInferenceTensorRaw != null && this.lastInferenceTensorRaw.Length > 0)
-                    {
-                        var raw = this.lastInferenceTensorRaw;
-                        int N = raw.Length;
-                        // Heuristic 1: scan for 2-element probability pairs (male,female) whose sum is ~1
-                        for (int i = N - 2; i >= 0; i--)
-                        {
-                            float a = raw[i];
-                            float b = raw[i + 1];
-                            if (a >= 0 && b >= 0)
-                            {
-                                float s = a + b;
-                                if (s > 0.5f && s < 1.5f)
-                                {
-                                    double male = Math.Round(a / s, 4);
-                                    double female = Math.Round(b / s, 4);
-                                    er.MaleProbability = male;
-                                    er.FemaleProbability = female;
-                                    er.GenderIndex = male > female ? 0 : 1;
-                                    er.GenderConfidence = Math.Round(Math.Max(male, female), 4);
-                                    StaticLogger.Log($"[Extract] Heuristic gender prob found at offset {i}: male={male}, female={female}");
-                                    break;
-                                }
-                            }
-                        }
-
-                        // Heuristic 2: scan for age-distribution-like windows (length between 50..150) summing ~1
-                        if (er.Age == null)
-                        {
-                            for (int w = 150; w >= 50; w--)
-                            {
-                                if (w > N) continue;
-                                for (int i = N - w; i >= 0; i--)
-                                {
-                                    double s = 0;
-                                    bool anyNeg = false;
-                                    for (int k = 0; k < w; k++)
-                                    {
-                                        float v = raw[i + k];
-                                        if (v < 0) { anyNeg = true; break; }
-                                        s += v;
-                                    }
-                                    if (anyNeg) continue;
-                                    if (s > 0.5 && s < 1.5)
-                                    {
-                                        // compute expectation
-                                        double sumIdx = 0; double probSum = 0; double peak = 0;
-                                        for (int k = 0; k < w; k++)
-                                        {
-                                            double p = raw[i + k];
-                                            sumIdx += k * p;
-                                            probSum += p;
-                                            if (p > peak) peak = p;
-                                        }
-                                        if (probSum > 0)
-                                        {
-                                            double expectation = Math.Round(sumIdx / probSum, 2);
-                                            er.Age = expectation;
-                                            er.AgeConfidence = Math.Round(peak, 4);
-                                            StaticLogger.Log($"[Extract] Heuristic age distribution found at offset {i} length {w} -> age={expectation} confidence={er.AgeConfidence}");
-                                            break;
-                                        }
-                                    }
-                                }
-                                if (er.Age != null) break;
-                            }
-                        }
-                    }
-                }
-                catch (Exception ex)
-                {
-                    StaticLogger.Log("[Extract] Heuristic fallback failed: " + ex.Message);
-                }
-                if (er.Age.HasValue)
-                {
-                    sb.AppendLine($"Age estimate: {er.Age.Value} years (confidence peak: {er.AgeConfidence?.ToString("F3") ?? "-"})");
-                }
-                if (er.MaleProbability.HasValue || er.FemaleProbability.HasValue)
-                {
-                    var maleStr = er.MaleProbability.HasValue ? (er.MaleProbability.Value.ToString("P1")) : "-";
-                    var femaleStr = er.FemaleProbability.HasValue ? (er.FemaleProbability.Value.ToString("P1")) : "-";
-                    sb.AppendLine($"Gender probabilities -> Male: {maleStr} | Female: {femaleStr} (inferred certainty: {er.GenderConfidence?.ToString("P1") ?? "-"})");
-                }
-                else if (er.GenderIndex.HasValue)
-                {
-                    sb.AppendLine($"Gender: {(er.GenderIndex.Value == 0 ? "male" : "female")} (confidence: {er.GenderConfidence?.ToString("F3") ?? "-"})");
-                }
-                if (er.Classifications.Count > 0)
-                {
-                    sb.AppendLine("Classifications:");
-                    foreach (var c in er.Classifications.Take(5))
-                    {
-                        sb.AppendLine($" - #{c.Index}: {c.Confidence}");
-                    }
-                }
-                if (er.Detections.Count > 0)
-                {
-                    sb.AppendLine("Detections:");
-                    foreach (var d in er.Detections.Take(5))
-                    {
-                        sb.AppendLine($" - [{d.X1},{d.Y1},{d.X2},{d.Y2}] score={d.Score} class={d.ClassId}");
-                    }
-                }
-                if (er.RawSummaries.Count > 0 && sb.Length == 0)
-                {
-                    sb.AppendLine("Raw summary:");
-                    foreach (var kv in er.RawSummaries)
-                    {
-                        sb.AppendLine($" - {kv.Key}: {System.Text.Json.JsonSerializer.Serialize(kv.Value)}");
-                    }
-                }
-
-                var text = sb.ToString();
-                if (string.IsNullOrWhiteSpace(text))
-                {
-                    text = "<no concise fields extracted>";
-                }
-
-                var dr = MessageBox.Show(text + Environment.NewLine + Environment.NewLine + "Copy to clipboard?", "Extracted Results", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
-                if (dr == DialogResult.Yes)
-                {
-                    try
-                    {
-                        Clipboard.SetText(text);
-                    }
-                    catch (Exception ex)
-                    {
-                        StaticLogger.Log("Failed to copy extracted results to clipboard: " + ex.Message);
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                StaticLogger.Log("Error extracting results: " + ex.Message);
-                MessageBox.Show("Extraction failed: " + ex.Message, "Pipeline Crash", MessageBoxButtons.OK, MessageBoxIcon.Error);
-            }
-        }
 
         // Formats inference output into a readable array/matrix representation when possible.
         private string FormatInferenceOutput(float[] output, string title)
@@ -582,7 +226,7 @@ namespace LAWS.Voices.Forms
                 this.audioWheelDebounceTimer = null;
             }
 
-            if (!(this.currentPreviewResource is AudioObj aud))
+            if (!(WindowMain.currentPreviewResource is AudioObj aud))
             {
                 return;
             }
@@ -596,7 +240,7 @@ namespace LAWS.Voices.Forms
                 var genId = Interlocked.Increment(ref this.previewGenerationId);
                 var bmp = await aud.DrawWaveformAsync(targetW, targetH);
                 // ensure preview still relevant
-                if (!object.ReferenceEquals(this.currentPreviewResource, aud))
+                if (!object.ReferenceEquals(WindowMain.currentPreviewResource, aud))
                 {
                     bmp.Dispose();
                     return;
@@ -643,16 +287,16 @@ namespace LAWS.Voices.Forms
                 return;
             }
             // If current preview is an AudioObj, regenerate waveform at new size
-            if (this.currentPreviewResource is AudioObj aud)
+            if (WindowMain.currentPreviewResource is AudioObj aud)
             {
                 try
                 {
                     int targetW = Math.Max(200, Math.Min(8000, this.pictureBox_view.Width > 0 ? this.pictureBox_view.Width : 2000));
                     int targetH = Math.Max(40, Math.Min(2000, this.pictureBox_view.Height > 0 ? this.pictureBox_view.Height : 100));
-                    var captured = this.currentPreviewResource;
+                    var captured = WindowMain.currentPreviewResource;
                     var genId = Interlocked.Read(ref this.previewGenerationId);
                     var bmp = await aud.DrawWaveformAsync(targetW, targetH);
-                    if (genId != Interlocked.Read(ref this.previewGenerationId) || !object.ReferenceEquals(this.currentPreviewResource, captured))
+                    if (genId != Interlocked.Read(ref this.previewGenerationId) || !object.ReferenceEquals(WindowMain.currentPreviewResource, captured))
                     {
                         bmp.Dispose();
                         return;
@@ -695,8 +339,7 @@ namespace LAWS.Voices.Forms
 
         public void WindowMain_Load(object? sender, EventArgs e)
         {
-            // Fix: Disconnect direct data source binding to prevent multi-threaded concurrent modifications 
-            // from corrupting the UI control handle and automatically resetting TopIndex back to 0.
+            // Disconnect direct data source binding to prevent multi-threaded concurrent modifications
             this.listBox_log.DataSource = null;
 
             // Safely populate any initial log entries recorded during application initialization phase
@@ -742,10 +385,13 @@ namespace LAWS.Voices.Forms
                                 }
                             }
 
-                            // Determine if the user is currently positioned at the bottom threshold *before* appending.
-                            // If they scrolled up manually to inspect previous logs, we respect their position and skip auto-scrolling.
+                            // FIX: Prüfen, ob das Log aktuell eingeklappt ist
+                            bool isCollapsed = this.toggleCollapseExpandLogToolStripMenuItem.Checked;
+
                             int scrollThreshold = 3;
-                            bool isUserAtBottom = (this.listBox_log.TopIndex + visibleItems + scrollThreshold) >= itemCount || itemCount <= visibleItems;
+
+                            // FIX: Wenn eingeklappt, erzwingen wir "isUserAtBottom = true", damit es als Live-Ticker läuft
+                            bool isUserAtBottom = isCollapsed || (this.listBox_log.TopIndex + visibleItems + scrollThreshold) >= itemCount || itemCount <= visibleItems;
 
                             // Safely append the new log token string item to the collection on the UI thread
                             this.listBox_log.Items.Add(log);
@@ -753,7 +399,16 @@ namespace LAWS.Voices.Forms
                             // If the viewport was sticky-pinned to the bottom edge, shift view downward to reveal the new line item
                             if (isUserAtBottom)
                             {
-                                this.listBox_log.TopIndex = Math.Max(0, this.listBox_log.Items.Count - visibleItems + 1);
+                                if (isCollapsed)
+                                {
+                                    // FIX für Einklapp-Modus: TopIndex direkt auf das absolut letzte Element zwingen
+                                    this.listBox_log.TopIndex = this.listBox_log.Items.Count - 1;
+                                }
+                                else
+                                {
+                                    // Standard-Modus: Normal ans Ende scrollen unter Berücksichtigung der Schrifthöhe
+                                    this.listBox_log.TopIndex = Math.Max(0, this.listBox_log.Items.Count - visibleItems + 1);
+                                }
                             }
                         }
                         catch
@@ -777,7 +432,6 @@ namespace LAWS.Voices.Forms
                     Func<(int exitCode, string stdout, string stderr)> run = () =>
                     {
                         using var pf = new ProgressForm();
-                        // store active window for ownership in AppDomain so service can pass owner
                         AppDomain.CurrentDomain.SetData("ActiveWindow", this);
                         var win = owner as System.Windows.Forms.IWin32Window ?? this;
                         var res = pf.RunProcessModal(psi, win);
@@ -805,7 +459,6 @@ namespace LAWS.Voices.Forms
             this.FillDevicesAndModels();
 
             // Register conversion confirmation callback so OpenVinoService can ask the UI
-            // Marshal the MessageBox call to the UI thread to avoid cross-thread access when invoked from background threads.
             OpenVinoService.ConfirmConversionCallback = (msg) =>
             {
                 try
@@ -998,16 +651,58 @@ namespace LAWS.Voices.Forms
                     {
                         try
                         {
-                            if (t.total > 0)
+                            // Ensure UI updates happen on the UI thread
+                            if (this.progressBar_inferenceSteps.InvokeRequired)
                             {
-                                this.progressBar_inferenceSteps.Minimum = 0;
-                                this.progressBar_inferenceSteps.Maximum = t.total;
+                                this.progressBar_inferenceSteps.BeginInvoke(new Action(() =>
+                                {
+                                    if (t.total > 0)
+                                    {
+                                        this.progressBar_inferenceSteps.Minimum = 0;
+                                        this.progressBar_inferenceSteps.Maximum = t.total;
+                                    }
+                                    this.progressBar_inferenceSteps.Visible = true;
+                                    this.progressBar_inferenceSteps.Value = Math.Clamp(t.current, this.progressBar_inferenceSteps.Minimum, this.progressBar_inferenceSteps.Maximum);
+                                }));
                             }
-                            this.progressBar_inferenceSteps.Visible = true;
-                            this.progressBar_inferenceSteps.Value = Math.Clamp(t.current, this.progressBar_inferenceSteps.Minimum, this.progressBar_inferenceSteps.Maximum);
+                            else
+                            {
+                                if (t.total > 0)
+                                {
+                                    this.progressBar_inferenceSteps.Minimum = 0;
+                                    this.progressBar_inferenceSteps.Maximum = t.total;
+                                }
+                                this.progressBar_inferenceSteps.Visible = true;
+                                this.progressBar_inferenceSteps.Value = Math.Clamp(t.current, this.progressBar_inferenceSteps.Minimum, this.progressBar_inferenceSteps.Maximum);
+                            }
                         }
                         catch { }
                     });
+
+                    // Prepare the progress bar visual state on the UI thread before long-running work starts
+                    try
+                    {
+                        if (this.progressBar_inferenceSteps.InvokeRequired)
+                        {
+                            this.progressBar_inferenceSteps.BeginInvoke(new Action(() =>
+                            {
+                                this.progressBar_inferenceSteps.Style = ProgressBarStyle.Continuous;
+                                this.progressBar_inferenceSteps.Minimum = 0;
+                                this.progressBar_inferenceSteps.Maximum = 1;
+                                this.progressBar_inferenceSteps.Value = 0;
+                                this.progressBar_inferenceSteps.Visible = true;
+                            }));
+                        }
+                        else
+                        {
+                            this.progressBar_inferenceSteps.Style = ProgressBarStyle.Continuous;
+                            this.progressBar_inferenceSteps.Minimum = 0;
+                            this.progressBar_inferenceSteps.Maximum = 1;
+                            this.progressBar_inferenceSteps.Value = 0;
+                            this.progressBar_inferenceSteps.Visible = true;
+                        }
+                    }
+                    catch { }
 
                     if (this.Vino == null)
                     {
@@ -1051,13 +746,6 @@ namespace LAWS.Voices.Forms
                             }
                             catch { }
 
-                            // 1. DYNAMIC ASSEMBLY EXPLORATION: Search for matching custom processors (e.g., AclNetProcessor, BirdNetProcessor)
-                            // Normalize model id: ignore common suffixes like '-base', '-large' so wav2vec2-base matches Wav2Vec2Processor
-                            string normalizedModelId = (model?.Id ?? string.Empty).Trim();
-                            string baseModelId = normalizedModelId.Split(new char[] { '-', '_', ' ' }, StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() ?? normalizedModelId;
-
-                            // Simple matching rule: compare first 7 characters (lowercase invariant) of the model id
-                            // to the first 7 characters of candidate processor types (type name without the trailing 'Processor').
                             string normalized = (model?.Id ?? string.Empty).Trim().ToLowerInvariant();
                             string first7 = normalized.Length >= 7 ? normalized.Substring(0, 7) : normalized;
 
@@ -1076,25 +764,55 @@ namespace LAWS.Voices.Forms
                             MethodInfo? executeMethod = null;
                             if (processorType != null)
                             {
-                                // Probing signature independently of the method name: look for the standard 6-parameter custom block
                                 executeMethod = processorType.GetMethods(BindingFlags.Public | BindingFlags.Static)
-                                    .FirstOrDefault(m => {
+                                    .FirstOrDefault(m =>
+                                    {
                                         var ps = m.GetParameters();
-                                        return ps.Length == 6 &&
+                                        return ps.Length == 7 &&
                                                ps[0].ParameterType == typeof(OpenVinoService) &&
                                                ps[1].ParameterType == typeof(OpenVinoModelInfo) &&
                                                ps[2].ParameterType == typeof(OpenVinoModelQuantization) &&
                                                ps[3].ParameterType == typeof(string) &&
                                                ps[4].ParameterType == typeof(float[]) &&
-                                               ps[5].ParameterType == typeof(int);
+                                               ps[5].ParameterType == typeof(int) &&
+                                               ps[6].ParameterType == typeof(IProgress<(int current, int total)>);
                                     });
+
+                                if (executeMethod == null)
+                                {
+                                    executeMethod = processorType.GetMethods(BindingFlags.Public | BindingFlags.Static)
+                                        .FirstOrDefault(m =>
+                                        {
+                                            var ps = m.GetParameters();
+                                            return ps.Length == 6 &&
+                                                   ps[0].ParameterType == typeof(OpenVinoService) &&
+                                                   ps[1].ParameterType == typeof(OpenVinoModelInfo) &&
+                                                   ps[2].ParameterType == typeof(OpenVinoModelQuantization) &&
+                                                   ps[3].ParameterType == typeof(string) &&
+                                                   ps[4].ParameterType == typeof(float[]) &&
+                                                   ps[5].ParameterType == typeof(int);
+                                        });
+                                }
                             }
 
                             if (processorType != null && executeMethod != null)
                             {
                                 StaticLogger.Log($"[Reflection Engine] Architecture Match Found! Executing specialized processor: {processorType.FullName}");
 
-                                object? resultObj = executeMethod.Invoke(null, new object[] { this.Vino, model, quantEnum, this.appsettings.ModelsDirectory, pcmToUse, sampleRate });
+                                object? resultObj = null;
+                                var ps = executeMethod.GetParameters();
+                                if (ps.Length == 6)
+                                {
+                                    resultObj = executeMethod.Invoke(null, new object[] { this.Vino, model, quantEnum, this.appsettings.ModelsDirectory, pcmToUse, sampleRate });
+                                }
+                                else if (ps.Length == 7 && ps[6].ParameterType == typeof(IProgress<(int current, int total)>))
+                                {
+                                    resultObj = executeMethod.Invoke(null, new object[] { this.Vino, model, quantEnum, this.appsettings.ModelsDirectory, pcmToUse, sampleRate, progressReporter });
+                                }
+                                else
+                                {
+                                    resultObj = executeMethod.Invoke(null, new object[] { this.Vino, model, quantEnum, this.appsettings.ModelsDirectory, pcmToUse, sampleRate });
+                                }
 
                                 if (resultObj == null)
                                 {
@@ -1102,7 +820,57 @@ namespace LAWS.Voices.Forms
                                     return;
                                 }
 
-                                // Build generalized visualization layout using dynamic reflection duck-typing
+                                // FIX: Serialisiere das Rückgabeobjekt sofort komplett zu JSON, um Exporte und Kopiervorgänge abzusichern
+                                try { this.lastInferenceRawJson = System.Text.Json.JsonSerializer.Serialize(resultObj, new System.Text.Json.JsonSerializerOptions { WriteIndented = true }); } catch { }
+
+                                try
+                                {
+                                    var resType = resultObj.GetType();
+                                    var propNames = string.Join(",", resType.GetProperties().Select(p => p.Name));
+                                    StaticLogger.Log($"[Dispatcher] processor returned type: {resType.FullName}; properties: {propNames}");
+
+                                    foreach (var p in resType.GetProperties())
+                                    {
+                                        try
+                                        {
+                                            if (p.PropertyType == typeof(float[]))
+                                            {
+                                                var val = p.GetValue(resultObj) as float[];
+                                                if (val != null && val.Length > 0)
+                                                {
+                                                    this.lastInferenceTensorRaw = val;
+                                                    StaticLogger.Log($"[Dispatcher] Captured raw float[] from property '{p.Name}' (len={val.Length}).");
+                                                    break;
+                                                }
+                                            }
+                                            else if (typeof(System.Collections.IEnumerable).IsAssignableFrom(p.PropertyType) && p.PropertyType != typeof(string))
+                                            {
+                                                var valObj = p.GetValue(resultObj);
+                                                if (valObj is System.Collections.IEnumerable enumVal)
+                                                {
+                                                    var floatList = new List<float>();
+                                                    foreach (var it in enumVal)
+                                                    {
+                                                        if (it is float f) floatList.Add(f);
+                                                        else break;
+                                                    }
+                                                    if (floatList.Count > 0)
+                                                    {
+                                                        this.lastInferenceTensorRaw = floatList.ToArray();
+                                                        StaticLogger.Log($"[Dispatcher] Captured raw float sequence from property '{p.Name}' (len={this.lastInferenceTensorRaw.Length}).");
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        catch { }
+                                    }
+                                }
+                                catch (Exception ex)
+                                {
+                                    StaticLogger.Log("[Dispatcher] Failed introspecting processor result: " + ex.Message);
+                                }
+
                                 var sbReport = new System.Text.StringBuilder();
                                 sbReport.AppendLine($"=========================================================");
                                 sbReport.AppendLine($"   AUTOMATED REFLECTION DISPATCHER ANALYSIS REPORT        ");
@@ -1113,7 +881,6 @@ namespace LAWS.Voices.Forms
                                 sbReport.AppendLine($"---------------------------------------------------------");
                                 sbReport.AppendLine();
 
-                                // Extract Segment A: Temporal Timeline Event Markers List
                                 var timelineProp = resultObj.GetType().GetProperty("TimelineMarkers");
                                 if (timelineProp != null && timelineProp.GetValue(resultObj) is System.Collections.IEnumerable timelineMarkers)
                                 {
@@ -1126,8 +893,47 @@ namespace LAWS.Voices.Forms
                                     if (!hasMarkers) sbReport.AppendLine("No significant phonetic signatures or signals rose above the noise floor metrics.");
                                     sbReport.AppendLine();
                                 }
+                                else
+                                {
+                                    if (this.lastInferenceTensorRaw != null && this.lastInferenceTensorRaw.Length > 0)
+                                    {
+                                        try
+                                        {
+                                            sbReport.AppendLine("=== ⏱️ Synthesized TIMELINE HIGHLIGHTS (from captured logits) ===");
+                                            int vocabSize = 32; int framesPerChunk = 204;
+                                            int elems = framesPerChunk * vocabSize;
+                                            var sequentialChunks = new List<float[]>();
+                                            for (int i = 0; i < this.lastInferenceTensorRaw.Length; i += elems)
+                                            {
+                                                int remaining = this.lastInferenceTensorRaw.Length - i;
+                                                int copyLen = Math.Min(elems, remaining);
+                                                float[] chunk = new float[elems];
+                                                Array.Copy(this.lastInferenceTensorRaw, i, chunk, 0, copyLen);
+                                                sequentialChunks.Add(chunk);
+                                            }
 
-                                // Extract Segment B: Normalized Global Class Distribution Lists (e.g., ACLNet arrays)
+                                            var activityEvents = Wav2Vec2Visualizer.ExtractActivityTimeline(sequentialChunks, sensitivityThreshold: 0.15);
+                                            var songBlocks = Wav2Vec2Processor.ClusterEventsIntoSongs(activityEvents, maxPauseSeconds: 1.5);
+                                            if (songBlocks.Count == 0)
+                                            {
+                                                sbReport.AppendLine("No significant phonetic signatures or signals rose above the noise floor metrics.");
+                                            }
+                                            else
+                                            {
+                                                foreach (var song in songBlocks)
+                                                {
+                                                    sbReport.AppendLine($"🎵 [{song.StartTime:mm\\:ss\\.fff} -> {song.EndTime:mm\\:ss\\.fff}] ({song.Duration.TotalMilliseconds:F0} ms) Peak:{song.PeakIntensity:P0} Frames:{song.TotalFrameTriggers}");
+                                                }
+                                            }
+                                            sbReport.AppendLine();
+                                        }
+                                        catch (Exception ex)
+                                        {
+                                            StaticLogger.Log("[Dispatcher] Failed to synthesize timeline markers: " + ex.Message);
+                                        }
+                                    }
+                                }
+
                                 var globalResultsProp = resultObj.GetType().GetProperty("GlobalResults");
                                 if (globalResultsProp != null && globalResultsProp.GetValue(resultObj) is System.Collections.IEnumerable globalResults)
                                 {
@@ -1143,7 +949,6 @@ namespace LAWS.Voices.Forms
                                     sbReport.AppendLine();
                                 }
 
-                                // Extract Segment C: Global Species Distribution Dictionary (e.g., BirdNET collections)
                                 var distributionProp = resultObj.GetType().GetProperty("GlobalSpeciesDistribution");
                                 if (distributionProp != null && distributionProp.GetValue(resultObj) is System.Collections.IDictionary distribution)
                                 {
@@ -1159,17 +964,33 @@ namespace LAWS.Voices.Forms
                                     }
                                 }
 
+                                // FIX: Dynamische Reflection-Schleife für Custom Audio-Metriken (Wav2Vec2 Text-Syllables & Komplexität)
+                                sbReport.AppendLine("=== 📋 CUSTOM ANALYSIS METRICS ===");
+                                bool hasCustomMetrics = false;
+                                foreach (var prop in resultObj.GetType().GetProperties())
+                                {
+                                    string pName = prop.Name;
+                                    if (pName == "TimelineMarkers" || pName == "GlobalResults" || pName == "GlobalSpeciesDistribution") continue;
+                                    try
+                                    {
+                                        var pVal = prop.GetValue(resultObj);
+                                        if (pVal != null)
+                                        {
+                                            sbReport.AppendLine($" ├─ {pName}: {pVal}");
+                                            hasCustomMetrics = true;
+                                        }
+                                    }
+                                    catch { }
+                                }
+                                if (!hasCustomMetrics) sbReport.AppendLine(" No custom metadata parameters exposed.");
+
                                 this.BeginInvoke(new Action(() => this.textBox_result.Text = sbReport.ToString()));
                             }
                             else
                             {
-                                // 2. GENERIC FALLBACK RUNNER: Used when no specialized parameter wrapper class matches the configuration
-                                StaticLogger.Log($"[Reflection Engine] No dedicated processor module matches '{model.Id}Processor'. Dropping back to standard AudioModelRunner.");
+                                StaticLogger.Log($"[Reflection Engine] No dedicated processor module matches '{model?.Id}Processor'. Dropping back to standard AudioModelRunner.");
 
-                                bool isWav2Vec = !string.IsNullOrEmpty(model.Id) && model.Id.IndexOf("wav2vec2", StringComparison.OrdinalIgnoreCase) >= 0;
-
-                                // FIX: Wav2Vec2 input expect standard 2D batch metrics shape format [1, Samples] 
-                                // instead of mapping output token topologies [1, 204, 32] down onto audio buffers.
+                                bool isWav2Vec = !string.IsNullOrEmpty(model?.Id) && model.Id.IndexOf("wav2vec2", StringComparison.OrdinalIgnoreCase) >= 0;
                                 ulong[] shape = new ulong[] { 1, (ulong) pcmToUse.Length };
 
                                 using var runner = this.Vino.CreateAudioRunner(model, quantEnum, this.appsettings.ModelsDirectory);
@@ -1214,8 +1035,9 @@ namespace LAWS.Voices.Forms
                                     var bmp = Wav2Vec2Visualizer.RenderAcousticMatrix(output, frames: totalFrames, vocabSize: vocabSize, scaleX: 2, scaleY: 12);
                                     var songBlocks = Wav2Vec2Processor.ClusterEventsIntoSongs(activityEvents);
 
-                                    this.BeginInvoke(new Action(() => {
-                                        AudioObj? sourceAudio = this.currentPreviewResource as AudioObj ?? this.Audios.Audios.Cast<AudioObj?>().FirstOrDefault(a => a != null && a.FilePath == aud.FilePath);
+                                    this.BeginInvoke(new Action(() =>
+                                    {
+                                        AudioObj? sourceAudio = WindowMain.currentPreviewResource as AudioObj ?? this.Audios.Audios.Cast<AudioObj?>().FirstOrDefault(a => a != null && a.FilePath == aud.FilePath);
                                         var form = new Wav2VecVisualizerForm(bmp, sourceAudio, songBlocks);
                                         form.Show(this);
                                     }));
@@ -1237,7 +1059,8 @@ namespace LAWS.Voices.Forms
                     try { await this.currentInferenceTask; }
                     finally
                     {
-                        this.Invoke(new Action(() => {
+                        this.Invoke(new Action(() =>
+                        {
                             this.button_run.BackColor = SystemColors.Info;
                             this.button_run.Text = "Run Inference";
                             this.progressBar_inferenceSteps.Visible = false;
@@ -1247,7 +1070,7 @@ namespace LAWS.Voices.Forms
                 }
 
                 // =================================================================
-                // PATH B: VISION RESOURCE PROCESSING (FIXED HIGH-SPEED ARGB LOCKS)
+                // PATH B: VISION RESOURCE PROCESSING (WITH CONDITIONAL UI POPUP)
                 // =================================================================
                 else if (resource is ImageObj img)
                 {
@@ -1270,7 +1093,6 @@ namespace LAWS.Voices.Forms
                     {
                         try
                         {
-                            // On-the-fly fast planar image extraction fix
                             StaticLogger.Log($"[Vision Engine] Mapping bitmap memory matrices ({img.Width}x{img.Height}) into flat planar RGB arrays...");
                             float[] planarRgbData = ImageObj.ConvertBitmapToPlanarRGB(img.Img);
 
@@ -1289,20 +1111,196 @@ namespace LAWS.Voices.Forms
                             this.lastInferenceTensorRaw = output;
                             try { this.lastInferenceRawJson = System.Text.Json.JsonSerializer.Serialize(output); } catch { }
 
-                            var formatted = this.FormatInferenceOutput(output, "Vision inference topology mapping");
-                            this.BeginInvoke(new Action(() => this.textBox_result.Text = formatted));
+                            ExtractionResult? extracted = null;
+                            bool hasVisualElements = false; // Controls ResultVisualizerForm opening
+
+                            try
+                            {
+                                try
+                                {
+                                    var outTensors = typeof(OpenVinoService.OpenVinoModelRunner).GetMethod("FetchOutputTensors", BindingFlags.NonPublic | BindingFlags.Instance)!.Invoke(runner, null) as Tensor[];
+                                    if (outTensors != null && outTensors.Length > 0)
+                                    {
+                                        this.lastInferenceTensors = outTensors;
+                                        try { this.lastInferenceOutputNames = typeof(OpenVinoService.OpenVinoModelRunner).GetMethod("FetchOutputNames", BindingFlags.NonPublic | BindingFlags.Instance)?.Invoke(runner, null) as string[]; } catch { }
+
+                                        extracted = ResultExtractor.ExtractResults(model.Id, outTensors, this.lastInferenceOutputNames);
+                                    }
+                                }
+                                catch { }
+
+                                // Native inline fallback mapping track if high-level tensor parsing was skipped
+                                if (extracted == null && this.lastInferenceTensorRaw != null && this.lastInferenceTensorRaw.Length > 0)
+                                {
+                                    try
+                                    {
+                                        extracted = new ExtractionResult { ModelIdentity = model.Id };
+                                        int N = this.lastInferenceTensorRaw.Length;
+
+                                        for (int i = N - 2; i >= 0; i--)
+                                        {
+                                            float a = this.lastInferenceTensorRaw[i];
+                                            float b = this.lastInferenceTensorRaw[i + 1];
+                                            if (a >= 0 && b >= 0 && (a + b > 0.5f && a + b < 1.5f))
+                                            {
+                                                double male = Math.Round(a / (a + b), 4);
+                                                double female = Math.Round(b / (a + b), 4);
+                                                extracted.MaleProbability = male;
+                                                extracted.FemaleProbability = female;
+                                                extracted.GenderIndex = male > female ? 0 : 1;
+                                                extracted.GenderConfidence = Math.Max(male, female);
+
+                                                // Age assignment from the float node placed directly prior to gender indices
+                                                if (i > 0 && model.Id.Contains("age-gender", StringComparison.OrdinalIgnoreCase))
+                                                {
+                                                    float ageRaw = this.lastInferenceTensorRaw[i - 1];
+                                                    extracted.Age = ageRaw <= 1.2f ? Math.Round(ageRaw * 100.0, 1) : Math.Round(ageRaw, 1);
+                                                    extracted.AgeConfidence = 1.0;
+                                                }
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    catch { }
+                                }
+
+                                if (extracted != null)
+                                {
+                                    var sb = new System.Text.StringBuilder();
+                                    sb.AppendLine("=== Vision Model Result Summary ===");
+                                    sb.AppendLine($"Model: {model.Id}");
+                                    sb.AppendLine();
+
+                                    if (extracted.Age.HasValue)
+                                    {
+                                        sb.AppendLine($"Age estimate: {extracted.Age.Value:F1} years (confidence peak: {extracted.AgeConfidence?.ToString("F3") ?? "-"})");
+                                    }
+                                    if (extracted.MaleProbability.HasValue || extracted.FemaleProbability.HasValue)
+                                    {
+                                        var male = extracted.MaleProbability.HasValue ? extracted.MaleProbability.Value : 0.0;
+                                        var female = extracted.FemaleProbability.HasValue ? extracted.FemaleProbability.Value : 0.0;
+                                        sb.AppendLine($"Gender probabilities -> Male: {male:P1} | Female: {female:P1} (inferred certainty: {(extracted.GenderConfidence?.ToString("P1") ?? "-")})");
+                                    }
+
+                                    if (extracted.Classifications != null && extracted.Classifications.Count > 0)
+                                    {
+                                        sb.AppendLine("Top classifications:");
+                                        foreach (var c in extracted.Classifications.Take(6)) sb.AppendLine($" - #{c.Index}: {c.Name ?? "(label)"} -> {c.Confidence:F6}");
+                                    }
+
+                                    if (extracted.Detections != null && extracted.Detections.Count > 0)
+                                    {
+                                        hasVisualElements = true; // Bounding boxes found -> enable visual overlay
+                                        sb.AppendLine("Detections:");
+                                        int di = 0;
+                                        foreach (var d in extracted.Detections)
+                                        {
+                                            di++;
+                                            sb.AppendLine($" {di:00}) Score: {d.Score:F3} Class: {d.ClassId?.ToString() ?? "-"} Box: [{d.X1:F3},{d.Y1:F3} -> {d.X2:F3},{d.Y2:F3}]");
+                                        }
+                                    }
+
+                                    Bitmap? bmp = null;
+                                    try
+                                    {
+                                        if (img.Img != null)
+                                        {
+                                            bmp = new Bitmap(img.Img);
+                                            using var g = Graphics.FromImage(bmp);
+                                            g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+                                            var pen = new Pen(Color.Lime, Math.Max(1f, bmp.Width / 400f));
+                                            var font = new Font("Segoe UI", Math.Max(8f, bmp.Width / 100f), FontStyle.Bold);
+                                            var brush = new SolidBrush(Color.FromArgb(200, Color.Black));
+                                            var textBrush = new SolidBrush(Color.FromArgb(230, Color.White));
+
+                                            foreach (var d in extracted.Detections ?? [])
+                                            {
+                                                try
+                                                {
+                                                    float x1 = Clamp(d.X1, 0f, 1f) * bmp.Width;
+                                                    float y1 = Clamp(d.Y1, 0f, 1f) * bmp.Height;
+                                                    float x2 = Clamp(d.X2, 0f, 1f) * bmp.Width;
+                                                    float y2 = Clamp(d.Y2, 0f, 1f) * bmp.Height;
+                                                    var r = RectangleF.FromLTRB(x1, y1, x2, y2);
+                                                    g.DrawRectangle(pen, Rectangle.Round(r));
+                                                }
+                                                catch { }
+                                            }
+
+                                            // Landmark / Keypoint lookup routine
+                                            float[]? kpData = null;
+                                            if (this.lastInferenceTensors != null && this.lastInferenceTensors.Length > 0)
+                                            {
+                                                for (int ti = 0; ti < this.lastInferenceTensors.Length; ti++)
+                                                {
+                                                    var tensor = this.lastInferenceTensors[ti];
+                                                    var size = (int) tensor.size;
+                                                    if (size >= 10 && size <= 5000 && size % 2 == 0)
+                                                    {
+                                                        try { kpData = tensor.get_data<float>(size); break; } catch { }
+                                                    }
+                                                }
+                                            }
+
+                                            if (kpData != null && kpData.Length >= 6)
+                                            {
+                                                hasVisualElements = true; // Keypoints found -> enable visual overlay
+                                                int pts = kpData.Length / 2;
+                                                double maxv = kpData.Max(dv => Math.Abs(dv));
+                                                bool normalized = maxv <= 1.5;
+                                                var kpBrush = new SolidBrush(Color.FromArgb(220, Color.Orange));
+
+                                                for (int k = 0; k < pts; k++)
+                                                {
+                                                    float px = normalized ? kpData[k * 2 + 0] * bmp.Width : kpData[k * 2 + 0];
+                                                    float py = normalized ? kpData[k * 2 + 1] * bmp.Height : kpData[k * 2 + 1];
+                                                    g.FillEllipse(kpBrush, px - 2, py - 2, 4, 4);
+                                                }
+                                                kpBrush.Dispose();
+                                            }
+
+                                            pen.Dispose(); font.Dispose(); brush.Dispose(); textBrush.Dispose();
+                                        }
+                                    }
+                                    catch { try { bmp?.Dispose(); } catch { } bmp = null; }
+
+                                    var reportText = sb.ToString();
+                                    this.BeginInvoke(new Action(() =>
+                                    {
+                                        this.textBox_result.Text = reportText;
+
+                                        // Opens ResultVisualizerForm ONLY if visual bounding boxes or keypoints are present
+                                        if (hasVisualElements && bmp != null)
+                                        {
+                                            try
+                                            {
+                                                var viz = new ResultVisualizerForm(bmp, reportText);
+                                                viz.Show(this);
+                                            }
+                                            catch (Exception ex) { StaticLogger.Log("Failed to show visualizer: " + ex.Message); }
+                                        }
+                                        else
+                                        {
+                                            // Safely dispose the unused image handle immediately to preserve memory allocations
+                                            bmp?.Dispose();
+                                        }
+                                    }));
+                                }
+                            }
+                            catch (Exception ex) { StaticLogger.Log("Vision extraction error: " + ex.Message); }
                         }
                         catch (Exception ex)
                         {
                             StaticLogger.Log(ex);
-                            this.BeginInvoke(new Action(() => MessageBox.Show(ex.ToString(), "Error during vision engine graph inference execution")));
+                            this.BeginInvoke(new Action(() => MessageBox.Show(ex.ToString(), "Error during vision engine execution")));
                         }
                     });
 
                     try { await this.currentInferenceTask; }
                     finally
                     {
-                        this.Invoke(new Action(() => {
+                        this.Invoke(new Action(() =>
+                        {
                             this.button_run.BackColor = SystemColors.Info;
                             this.button_run.Text = "Run Inference";
                         }));
@@ -1317,10 +1315,282 @@ namespace LAWS.Voices.Forms
             }
             finally
             {
-                this.Invoke(new Action(() => {
+                this.Invoke(new Action(() =>
+                {
                     this.label_inferenceElapsed.Text = "Elapsed: " + (this.InferenceStarted.HasValue ? (DateTime.Now - this.InferenceStarted.Value).ToString("mm\\:ss\\.fff") : "-:--.---");
                 }));
                 this.InferenceStarted = null;
+            }
+        }
+
+        private void button_extractResults_Click(object sender, EventArgs e)
+        {
+            // Step 1: Resolve the currently targeted model and active audio resource context
+            var model = this.comboBox_model.SelectedItem as OpenVinoModelInfo;
+
+            var orderedResources = this.Images.ImagesBindingList.Cast<object>()
+                .Concat(this.Audios.Audios.Cast<object>())
+                .OrderBy(r => r is ImageObj i ? i.CreatedAt : ((AudioObj) r).CreatedAt)
+                .ToArray();
+
+            int resourceIdx = (int) this.numericUpDown_resourceId.Value - 1;
+            AudioObj? aud = null;
+
+            if (resourceIdx >= 0 && resourceIdx < orderedResources.Length && orderedResources[resourceIdx] is AudioObj standardAudio)
+            {
+                aud = standardAudio;
+            }
+            else
+            {
+                aud = WindowMain.currentPreviewResource as AudioObj;
+            }
+
+            // Step 2: Check if the current context contains an active Wav2Vec2 bioacoustic analysis signature
+            bool isWav2VecContext = this.textBox_result.Text.Contains("Wav2Vec2") ||
+                                    (model != null && !string.IsNullOrEmpty(model.Id) && model.Id.Contains("wav2vec2", StringComparison.OrdinalIgnoreCase));
+
+            if (isWav2VecContext)
+            {
+                if (this.lastInferenceTensorRaw == null || this.lastInferenceTensorRaw.Length == 0)
+                {
+                    MessageBox.Show("No raw logit tensor matrix data available to cluster. Run inference first.", "Extraction Warning", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return;
+                }
+
+                if (aud == null)
+                {
+                    MessageBox.Show("Unable to resolve active Audio object context for duration tracking.", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    return;
+                }
+
+                try
+                {
+                    int vocabSize = 32;
+                    int framesPerChunk = 204;
+                    int elementsPerChunk = framesPerChunk * vocabSize;
+
+                    // Reconstruct sequential multi-chunk segmentation arrays from flat memory block
+                    var sequentialChunks = new List<float[]>();
+                    for (int i = 0; i < this.lastInferenceTensorRaw.Length; i += elementsPerChunk)
+                    {
+                        int remaining = this.lastInferenceTensorRaw.Length - i;
+                        int copyLength = Math.Min(elementsPerChunk, remaining);
+
+                        float[] chunk = new float[elementsPerChunk];
+                        Array.Copy(this.lastInferenceTensorRaw, i, chunk, 0, copyLength);
+                        sequentialChunks.Add(chunk);
+                    }
+
+                    // Extract the micro-frame triggers using baseline inverse padding calculation
+                    var activityEvents = Wav2Vec2Visualizer.ExtractActivityTimeline(sequentialChunks, sensitivityThreshold: 0.15);
+
+                    // Execute the macro-clustering algorithm (1.5 seconds maximum syllable gap boundary threshold)
+                    var songBlocks = Wav2Vec2Processor.ClusterEventsIntoSongs(activityEvents, maxPauseSeconds: 1.5);
+
+                    var report = new System.Text.StringBuilder();
+                    report.AppendLine($"=========================================================");
+                    report.AppendLine($"         STUDIO BIOACOUSTIC TIMELINE SUMMARY REPORT      ");
+                    report.AppendLine($"=========================================================");
+                    report.AppendLine($"Total Signal Duration: {aud.Duration:mm\\:ss\\.fff}"); // Millisecond accuracy for duration
+                    report.AppendLine($"Total Raw Frame Activations:  {activityEvents.Count}");
+                    report.AppendLine($"Detected Song Sequences: {songBlocks.Count}");
+                    report.AppendLine($"---------------------------------------------------------");
+                    report.AppendLine();
+
+                    foreach (var song in songBlocks)
+                    {
+                        report.AppendLine($"🎵 [{song.StartTime:mm\\:ss\\.fff} -> {song.EndTime:mm\\:ss\\.fff}] ({song.Duration.TotalMilliseconds:F0} ms)");
+                        report.AppendLine($"   ├─ Signal Energy: Peak: {song.PeakIntensity:P0} | Avg: {song.AverageIntensity:P0}");
+                        report.AppendLine($"   ├─ Density:       {song.TotalFrameTriggers} active frames detected.");
+                        report.AppendLine($"   └─ Syllable Motif Signature: '{song.SyllableSequence}'");
+                        report.AppendLine();
+                    }
+
+                    string finalizedReportText = report.ToString();
+
+                    this.BeginInvoke(new Action(() => this.textBox_result.Text = finalizedReportText));
+
+                    try
+                    {
+                        var dlg = new Wav2VecExtractionForm(finalizedReportText, aud, songBlocks);
+                        dlg.ShowDialog(this);
+                    }
+                    catch (Exception ex)
+                    {
+                        StaticLogger.Log("Failed to show extraction dialog: " + ex.Message);
+                        var copyConfirmation = MessageBox.Show("Macro-clustering timeline analysis regenerated successfully!" + Environment.NewLine + Environment.NewLine + "Copy report to clipboard?", "Wav2Vec2 Extraction", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+                        if (copyConfirmation == DialogResult.Yes)
+                        {
+                            Clipboard.SetText(finalizedReportText);
+                        }
+                    }
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    StaticLogger.Log($"[ERROR] Failed to compile macro-clustered timeline report: {ex.Message}");
+                    MessageBox.Show($"Failed to aggregate timeline tokens: {ex.Message}", "Extraction Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    return;
+                }
+            }
+
+            // Step 3: Standard multi-modal fallback track execution path (Age, Gender, Objects)
+            try
+            {
+                ExtractionResult? er = null;
+                if (this.lastInferenceTensors != null && this.lastInferenceTensors.Length > 0)
+                {
+                    // FIX: Modell-ID als ersten Parameter übergeben
+                    er = ResultExtractor.ExtractResults(model?.Id ?? "Unknown", this.lastInferenceTensors, this.lastInferenceOutputNames);
+                }
+                else if (this.lastInferenceTensorRaw != null)
+                {
+                    er = new ExtractionResult { ModelIdentity = model?.Id ?? "Unknown" };
+                    er.RawSummaries["raw"] = new { size = this.lastInferenceTensorRaw.Length };
+                }
+                else
+                {
+                    MessageBox.Show("No inference results available to extract.", "Data Abort", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    return;
+                }
+
+                var sb = new System.Text.StringBuilder();
+                try
+                {
+                    if ((er.Age == null && er.GenderIndex == null && er.MaleProbability == null && er.FemaleProbability == null) && this.lastInferenceTensorRaw != null && this.lastInferenceTensorRaw.Length > 0)
+                    {
+                        var raw = this.lastInferenceTensorRaw;
+                        int N = raw.Length;
+
+                        // Heuristic 1: Scan for 2-element probability pairs (male, female) whose sum is ~1
+                        for (int i = N - 2; i >= 0; i--)
+                        {
+                            float a = raw[i];
+                            float b = raw[i + 1];
+                            if (a >= 0 && b >= 0)
+                            {
+                                float s = a + b;
+                                if (s > 0.5f && s < 1.5f)
+                                {
+                                    double male = Math.Round(a / s, 4);
+                                    double female = Math.Round(b / s, 4);
+                                    er.MaleProbability = male;
+                                    er.FemaleProbability = female;
+                                    er.GenderIndex = male > female ? 0 : 1;
+                                    er.GenderConfidence = Math.Round(Math.Max(male, female), 4);
+                                    StaticLogger.Log($"[Extract] Heuristic gender prob found at offset {i}: male={male}, female={female}");
+
+                                    // FIX: Wenn es ein Age-Gender Modell ist, steht der Alters-Regressionswert direkt vor dem Gender-Offset!
+                                    if (i > 0 && (model?.Id ?? "").Contains("age-gender", StringComparison.OrdinalIgnoreCase))
+                                    {
+                                        float ageRaw = raw[i - 1];
+                                        if (ageRaw > 0 && ageRaw <= 1.2f) // Falls zwischen 0.0 und 1.2 normalisiert
+                                        {
+                                            er.Age = Math.Round(ageRaw * 100.0, 1);
+                                        }
+                                        else if (ageRaw > 1.2f && ageRaw < 120f) // Falls bereits echte Jahresanzahl
+                                        {
+                                            er.Age = Math.Round(ageRaw, 1);
+                                        }
+                                        er.AgeConfidence = 1.0;
+                                        StaticLogger.Log($"[Extract] Heuristic age value extracted right before gender at offset {i - 1}: {er.Age}");
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+
+                        // Heuristic 2: Fallback für Verteilungs-basierte Altersmodelle (Länge 50-150)
+                        if (er.Age == null)
+                        {
+                            for (int w = 150; w >= 50; w--)
+                            {
+                                if (w > N) continue;
+                                for (int i = N - w; i >= 0; i--)
+                                {
+                                    double s = 0;
+                                    bool anyNeg = false;
+                                    for (int k = 0; k < w; k++)
+                                    {
+                                        float v = raw[i + k];
+                                        if (v < 0) { anyNeg = true; break; }
+                                        s += v;
+                                    }
+                                    if (anyNeg) continue;
+                                    if (s > 0.5 && s < 1.5)
+                                    {
+                                        double sumIdx = 0; double probSum = 0; double peak = 0;
+                                        for (int k = 0; k < w; k++)
+                                        {
+                                            double p = raw[i + k];
+                                            sumIdx += k * p;
+                                            probSum += p;
+                                            if (p > peak) peak = p;
+                                        }
+                                        if (probSum > 0)
+                                        {
+                                            double expectation = Math.Round(sumIdx / probSum, 2);
+                                            er.Age = expectation;
+                                            er.AgeConfidence = Math.Round(peak, 4);
+                                            break;
+                                        }
+                                    }
+                                }
+                                if (er.Age != null) break;
+                            }
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    StaticLogger.Log("[Extract] Heuristic fallback failed: " + ex.Message);
+                }
+
+                if (er.Age.HasValue)
+                {
+                    sb.AppendLine($"Age estimate: {er.Age.Value} years (confidence peak: {er.AgeConfidence?.ToString("F3") ?? "-"})");
+                }
+                if (er.MaleProbability.HasValue || er.FemaleProbability.HasValue)
+                {
+                    var maleStr = er.MaleProbability.HasValue ? (er.MaleProbability.Value.ToString("P1")) : "-";
+                    var femaleStr = er.FemaleProbability.HasValue ? (er.FemaleProbability.Value.ToString("P1")) : "-";
+                    sb.AppendLine($"Gender probabilities -> Male: {maleStr} | Female: {femaleStr} (inferred certainty: {er.GenderConfidence?.ToString("P1") ?? "-"})");
+                }
+                else if (er.GenderIndex.HasValue)
+                {
+                    sb.AppendLine($"Gender: {(er.GenderIndex.Value == 0 ? "male" : "female")} (confidence: {er.GenderConfidence?.ToString("F3") ?? "-"})");
+                }
+                if (er.Classifications.Count > 0)
+                {
+                    sb.AppendLine("Classifications:");
+                    foreach (var c in er.Classifications.Take(5)) sb.AppendLine($" - #{c.Index}: {c.Confidence}");
+                }
+                if (er.Detections.Count > 0)
+                {
+                    sb.AppendLine("Detections:");
+                    foreach (var d in er.Detections.Take(5)) sb.AppendLine($" - [{d.X1},{d.Y1},{d.X2},{d.Y2}] score={d.Score} class={d.ClassId}");
+                }
+                if (er.RawSummaries.Count > 0 && sb.Length == 0)
+                {
+                    sb.AppendLine("Raw summary:");
+                    foreach (var kv in er.RawSummaries) sb.AppendLine($" - {kv.Key}: {System.Text.Json.JsonSerializer.Serialize(kv.Value)}");
+                }
+
+                var text = sb.ToString();
+                if (string.IsNullOrWhiteSpace(text)) text = "<no concise fields extracted>";
+
+                this.BeginInvoke(new Action(() => this.textBox_result.Text = text));
+
+                var dr = MessageBox.Show(text + Environment.NewLine + Environment.NewLine + "Copy to clipboard?", "Extracted Results", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+                if (dr == DialogResult.Yes)
+                {
+                    try { Clipboard.SetText(text); } catch (Exception ex) { StaticLogger.Log("Failed to copy extracted results: " + ex.Message); }
+                }
+            }
+            catch (Exception ex)
+            {
+                StaticLogger.Log("Error extracting results: " + ex.Message);
+                MessageBox.Show("Extraction failed: " + ex.Message, "Pipeline Crash", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
         }
 
@@ -1346,7 +1616,7 @@ namespace LAWS.Voices.Forms
 
                         // mark new preview generation id to cancel any pending waveform writes
                         var imgGenId = Interlocked.Increment(ref this.previewGenerationId);
-                        this.currentPreviewResource = img;
+                        WindowMain.currentPreviewResource = img;
                         // Clone the bitmap to avoid external disposal affecting our preview
                         if (this.InvokeRequired)
                         {
@@ -1401,10 +1671,10 @@ namespace LAWS.Voices.Forms
                         int targetH = Math.Max(40, Math.Min(1000, this.pictureBox_view.Height > 0 ? this.pictureBox_view.Height : 100));
                         // capture resource and generation id to avoid races
                         var genId = Interlocked.Increment(ref this.previewGenerationId);
-                        this.currentPreviewResource = aud;
+                        WindowMain.currentPreviewResource = aud;
                         var bmp = await aud.DrawWaveformAsync(targetW, targetH);
                         // if resource changed while generating, discard
-                        if (genId != this.previewGenerationId || !object.ReferenceEquals(this.currentPreviewResource, aud))
+                        if (genId != this.previewGenerationId || !object.ReferenceEquals(WindowMain.currentPreviewResource, aud))
                         {
                             bmp.Dispose();
                         }
@@ -1435,7 +1705,7 @@ namespace LAWS.Voices.Forms
             this.viewZoom = 1f;
             this.pictureBox_view.Image = img;
             this.pictureBox_view.SizeMode = PictureBoxSizeMode.Normal;
-            if (this.currentPreviewResource is ImageObj)
+            if (WindowMain.currentPreviewResource is ImageObj)
             {
                 // show image at original pixel size inside the scrollable panel
                 this.originalImageSize = new Size(img.Width, img.Height);
@@ -1538,7 +1808,7 @@ namespace LAWS.Voices.Forms
                         this.previewImage = rotated;
                         this.pictureBox_view.Image = this.previewImage;
                         // update size and originalImageSize if underlying resource is ImageObj
-                        if (this.currentPreviewResource is ImageObj imgObj)
+                        if (WindowMain.currentPreviewResource is ImageObj imgObj)
                         {
                             this.originalImageSize = rotated.Size;
                             // update underlying ImageObj safely
@@ -1565,7 +1835,7 @@ namespace LAWS.Voices.Forms
                     this.previewImage?.Dispose();
                     this.previewImage = rotated;
                     this.pictureBox_view.Image = this.previewImage;
-                    if (this.currentPreviewResource is ImageObj imgObj)
+                    if (WindowMain.currentPreviewResource is ImageObj imgObj)
                     {
                         this.originalImageSize = rotated.Size;
                         try
@@ -1607,7 +1877,7 @@ namespace LAWS.Voices.Forms
             var clientPos = e.Location;
 
             // If current resource is ImageObj: change imageZoom and scale image via PictureBox.Size
-            if (this.currentPreviewResource is ImageObj)
+            if (WindowMain.currentPreviewResource is ImageObj)
             {
                 // compute zoom factor
                 float factor = (float) Math.Pow(1.12f, e.Delta / 120f);
@@ -1677,22 +1947,22 @@ namespace LAWS.Voices.Forms
 
         private void button_deleteRessource_Click(object sender, EventArgs e)
         {
-            if (this.currentPreviewResource == null || this.numericUpDown_resourceId.Value <= 0)
+            if (WindowMain.currentPreviewResource == null || this.numericUpDown_resourceId.Value <= 0)
             {
                 MessageBox.Show("No resource selected to delete.");
                 return;
             }
 
-            if (this.currentPreviewResource is ImageObj img)
+            if (WindowMain.currentPreviewResource is ImageObj img)
             {
                 this.Images.RemoveImage(img.Id);
             }
-            else if (this.currentPreviewResource is AudioObj aud)
+            else if (WindowMain.currentPreviewResource is AudioObj aud)
             {
                 this.Audios.RemoveAudio(aud);
             }
 
-            this.currentPreviewResource = null;
+            WindowMain.currentPreviewResource = null;
             this.numericUpDown_resourceId_SetMaximum();
             // Clamp to the control minimum to avoid assigning a value below Minimum
             this.numericUpDown_resourceId.Value = Math.Max(this.numericUpDown_resourceId.Value - 1, this.numericUpDown_resourceId.Minimum);
@@ -1842,7 +2112,6 @@ namespace LAWS.Voices.Forms
 
         private void loadResultFromJSONToolStripMenuItem_Click(object sender, EventArgs e)
         {
-            // OFD at MyDocuments with filter for JSON files
             using (OpenFileDialog openFileDialog = new OpenFileDialog())
             {
                 openFileDialog.Filter = "JSON files (*.json)|*.json|All files (*.*)|*.*";
@@ -1856,7 +2125,9 @@ namespace LAWS.Voices.Forms
                         string formatted = System.Text.Json.JsonSerializer.Serialize(deserialized, new System.Text.Json.JsonSerializerOptions { WriteIndented = true });
                         this.textBox_result.Text = formatted;
                         this.lastInferenceRawJson = jsonContent;
-                        this.lastInferenceTensorRaw = ResultExtractor.GetTensorFromJson(jsonContent);
+
+                        // FIX: Nutzt jetzt native Deserialisierung anstelle von GetTensorFromJson
+                        this.lastInferenceTensorRaw = System.Text.Json.JsonSerializer.Deserialize<float[]>(jsonContent);
                     }
                     catch (Exception ex)
                     {
@@ -1886,6 +2157,77 @@ namespace LAWS.Voices.Forms
                     {
                         MessageBox.Show("Failed to load text file: " + ex.Message);
                     }
+                }
+            }
+        }
+
+        private void button_openCuda_Click(object sender, EventArgs e)
+        {
+            // Open CudaActionsForm as a dialog
+            using (var cudaForm = new CudaActionsForm())
+            {
+                cudaForm.ShowDialog(this);
+            }
+        }
+
+        private void toggleCollapseExpandLogToolStripMenuItem_Click(object sender, EventArgs e)
+        {
+            bool collapsed = this.toggleCollapseExpandLogToolStripMenuItem.Checked;
+
+            int originalLogHeight = 147;
+            int originalWindowHeight = 620;
+            int windowWidth = 720;
+
+            // Ein klein wenig mehr Padding für Klicks im kollabierten Zustand
+            int collapsedLogHeight = this.listBox_log.Font.Height + 10;
+            int heightDelta = originalLogHeight - collapsedLogHeight;
+
+            this.SuspendLayout();
+            this.listBox_log.SuspendLayout();
+
+            if (collapsed)
+            {
+                // ERSTKLASSIGER FIX: Deaktiviere den horizontalen Scrollbalken.
+                // Er nimmt sonst 17px ein und schluckt im collapsed State JEDEN Maus- und Rechtsklick!
+                this.listBox_log.HorizontalScrollbar = false;
+
+                this.listBox_log.Height = collapsedLogHeight;
+                this.listBox_log.BringToFront();
+
+                this.MaximumSize = Size.Empty;
+                this.MinimumSize = new Size(windowWidth, originalWindowHeight - heightDelta);
+                this.Size = new Size(windowWidth, originalWindowHeight - heightDelta);
+                this.MaximumSize = this.MinimumSize;
+
+                if (this.listBox_log.Items.Count > 0)
+                {
+                    this.listBox_log.TopIndex = this.listBox_log.Items.Count - 1;
+                }
+            }
+            else
+            {
+                // Reaktivieren, wenn das Log wieder voll entfaltet wird
+                this.listBox_log.HorizontalScrollbar = true;
+                this.listBox_log.Height = originalLogHeight;
+
+                this.MaximumSize = Size.Empty;
+                this.MinimumSize = new Size(windowWidth, originalWindowHeight);
+                this.Size = new Size(windowWidth, originalWindowHeight);
+                this.MaximumSize = this.MinimumSize;
+            }
+
+            this.listBox_log.ResumeLayout(true);
+            this.ResumeLayout(true);
+        }
+
+        private void listBox_log_MouseDown(object sender, MouseEventArgs e)
+        {
+            if (e.Button == MouseButtons.Right)
+            {
+                // FIX: Nutze direkt die vom Designer generierte Variable anstelle von GetCurrentParent()
+                if (this.contextMenuStrip_log != null)
+                {
+                    this.contextMenuStrip_log.Show(Cursor.Position);
                 }
             }
         }

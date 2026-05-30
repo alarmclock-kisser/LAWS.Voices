@@ -1,4 +1,5 @@
 <Solution>
+  <Project Path="LAWS.Voices.Cuda13/LAWS.Voices.Cuda13.csproj" Id="fe3be126-0057-4cb7-98da-53c814fb9c0c" />
   <Project Path="LAWS.Voices.Downloader/LAWS.Voices.Downloader.csproj" />
   <Project Path="LAWS.Voices.Forms/LAWS.Voices.Forms.csproj" Id="f8b386c7-e36f-4258-883b-d0d683b5a306" />
   <Project Path="LAWS.Voices.Multimodal/LAWS.Voices.Multimodal.csproj" Id="b074026a-4687-430c-9678-f8202e9cf292" />

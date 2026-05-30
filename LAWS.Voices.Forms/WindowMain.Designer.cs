@@ -40,10 +40,12 @@
             this.textBox_result = new TextBox();
             this.contextMenuStrip_result = new ContextMenuStrip(this.components);
             this.selectCopyAllTextToolStripMenuItem = new ToolStripMenuItem();
+            this.loadResultFromTXTToolStripMenuItem = new ToolStripMenuItem();
             this.loadResultFromJSONToolStripMenuItem = new ToolStripMenuItem();
             this.listBox_log = new ListBox();
             this.contextMenuStrip_log = new ContextMenuStrip(this.components);
             this.copyAllLinesToolStripMenuItem = new ToolStripMenuItem();
+            this.toggleCollapseExpandLogToolStripMenuItem = new ToolStripMenuItem();
             this.label_ressourceInfo = new Label();
             this.numericUpDown_resourceId = new NumericUpDown();
             this.button_deleteRessource = new Button();
@@ -53,7 +55,7 @@
             this.progressBar_inferenceSteps = new ProgressBar();
             this.button_saveJson = new Button();
             this.button_saveTxt = new Button();
-            this.loadResultFromTXTToolStripMenuItem = new ToolStripMenuItem();
+            this.button_openCuda = new Button();
             this.panel_view.SuspendLayout();
             ((System.ComponentModel.ISupportInitialize) this.pictureBox_view).BeginInit();
             this.contextMenuStrip_result.SuspendLayout();
@@ -160,7 +162,7 @@
             // 
             this.contextMenuStrip_result.Items.AddRange(new ToolStripItem[] { this.selectCopyAllTextToolStripMenuItem, this.loadResultFromTXTToolStripMenuItem, this.loadResultFromJSONToolStripMenuItem });
             this.contextMenuStrip_result.Name = "contextMenuStrip_result";
-            this.contextMenuStrip_result.Size = new Size(196, 92);
+            this.contextMenuStrip_result.Size = new Size(196, 70);
             this.contextMenuStrip_result.Text = "Result";
             // 
             // selectCopyAllTextToolStripMenuItem
@@ -169,6 +171,13 @@
             this.selectCopyAllTextToolStripMenuItem.Size = new Size(195, 22);
             this.selectCopyAllTextToolStripMenuItem.Text = "Select + Copy All Text";
             this.selectCopyAllTextToolStripMenuItem.Click += this.selectCopyAllTextToolStripMenuItem_Click;
+            // 
+            // loadResultFromTXTToolStripMenuItem
+            // 
+            this.loadResultFromTXTToolStripMenuItem.Name = "loadResultFromTXTToolStripMenuItem";
+            this.loadResultFromTXTToolStripMenuItem.Size = new Size(195, 22);
+            this.loadResultFromTXTToolStripMenuItem.Text = "Load Result from TXT";
+            this.loadResultFromTXTToolStripMenuItem.Click += this.loadResultFromTXTToolStripMenuItem_Click;
             // 
             // loadResultFromJSONToolStripMenuItem
             // 
@@ -187,20 +196,29 @@
             this.listBox_log.Name = "listBox_log";
             this.listBox_log.Size = new Size(680, 147);
             this.listBox_log.TabIndex = 9;
+            this.listBox_log.MouseDown += this.listBox_log_MouseDown;
             // 
             // contextMenuStrip_log
             // 
-            this.contextMenuStrip_log.Items.AddRange(new ToolStripItem[] { this.copyAllLinesToolStripMenuItem });
+            this.contextMenuStrip_log.Items.AddRange(new ToolStripItem[] { this.copyAllLinesToolStripMenuItem, this.toggleCollapseExpandLogToolStripMenuItem });
             this.contextMenuStrip_log.Name = "contextMenuStrip_log";
-            this.contextMenuStrip_log.Size = new Size(150, 26);
+            this.contextMenuStrip_log.Size = new Size(231, 48);
             this.contextMenuStrip_log.Text = "Copy Log to Clipboard";
             // 
             // copyAllLinesToolStripMenuItem
             // 
             this.copyAllLinesToolStripMenuItem.Name = "copyAllLinesToolStripMenuItem";
-            this.copyAllLinesToolStripMenuItem.Size = new Size(149, 22);
+            this.copyAllLinesToolStripMenuItem.Size = new Size(230, 22);
             this.copyAllLinesToolStripMenuItem.Text = "Copy All Lines";
             this.copyAllLinesToolStripMenuItem.Click += this.copyAllLinesToolStripMenuItem_Click;
+            // 
+            // toggleCollapseExpandLogToolStripMenuItem
+            // 
+            this.toggleCollapseExpandLogToolStripMenuItem.CheckOnClick = true;
+            this.toggleCollapseExpandLogToolStripMenuItem.Name = "toggleCollapseExpandLogToolStripMenuItem";
+            this.toggleCollapseExpandLogToolStripMenuItem.Size = new Size(230, 22);
+            this.toggleCollapseExpandLogToolStripMenuItem.Text = "Toggle Collapse / Expand Log";
+            this.toggleCollapseExpandLogToolStripMenuItem.Click += this.toggleCollapseExpandLogToolStripMenuItem_Click;
             // 
             // label_ressourceInfo
             // 
@@ -289,18 +307,23 @@
             this.button_saveTxt.UseVisualStyleBackColor = true;
             this.button_saveTxt.Click += this.button_saveTxt_Click;
             // 
-            // loadResultFromTXTToolStripMenuItem
+            // button_openCuda
             // 
-            this.loadResultFromTXTToolStripMenuItem.Name = "loadResultFromTXTToolStripMenuItem";
-            this.loadResultFromTXTToolStripMenuItem.Size = new Size(195, 22);
-            this.loadResultFromTXTToolStripMenuItem.Text = "Load Result from TXT";
-            this.loadResultFromTXTToolStripMenuItem.Click += this.loadResultFromTXTToolStripMenuItem_Click;
+            this.button_openCuda.BackColor = Color.FromArgb(  192,   255,   192);
+            this.button_openCuda.Location = new Point(570, 41);
+            this.button_openCuda.Name = "button_openCuda";
+            this.button_openCuda.Size = new Size(122, 23);
+            this.button_openCuda.TabIndex = 19;
+            this.button_openCuda.Text = "Open CUDA Actions";
+            this.button_openCuda.UseVisualStyleBackColor = false;
+            this.button_openCuda.Click += this.button_openCuda_Click;
             // 
             // WindowMain
             // 
             this.AutoScaleDimensions = new SizeF(7F, 15F);
             this.AutoScaleMode = AutoScaleMode.Font;
             this.ClientSize = new Size(704, 581);
+            this.Controls.Add(this.button_openCuda);
             this.Controls.Add(this.button_saveTxt);
             this.Controls.Add(this.button_saveJson);
             this.Controls.Add(this.progressBar_inferenceSteps);
@@ -360,5 +383,7 @@
         private Button button_saveTxt;
         private ToolStripMenuItem loadResultFromJSONToolStripMenuItem;
         private ToolStripMenuItem loadResultFromTXTToolStripMenuItem;
+        private Button button_openCuda;
+        private ToolStripMenuItem toggleCollapseExpandLogToolStripMenuItem;
     }
 }

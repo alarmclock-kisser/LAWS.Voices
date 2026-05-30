@@ -379,5 +379,32 @@ namespace LAWS.Voices.Multimodal.Image
                 // Swallow logging errors to avoid cascade failures
             }
         }
+
+        [SupportedOSPlatform ("windows")]
+        public ImageObj Clone()
+        {
+            try
+            {
+                if (this.Img == null)
+                {
+                    return new ImageObj(0, 0);
+                }
+                Bitmap? clonedImg = null;
+                lock (this.Img)
+                {
+                    clonedImg = new Bitmap(this.Img);
+                }
+                var clone = new ImageObj(clonedImg!)
+                {
+                    Pointer = IntPtr.Zero
+                };
+                return clone;
+            }
+            catch (Exception ex)
+            {
+                LogException(ex, "Failed to clone image.");
+                return new ImageObj(0, 0);
+            }
+        }
     }
 }

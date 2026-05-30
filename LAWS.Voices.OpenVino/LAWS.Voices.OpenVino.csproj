@@ -7,7 +7,9 @@
 	</PropertyGroup>
 
 	<ItemGroup>
+		<PackageReference Include="ElBruno.LocalEmbeddings.Npu.Intel" Version="1.5.0" />
 		<PackageReference Include="JYPPX.OpenVINO.CSharp.API" Version="3.2.2" />
+		<PackageReference Include="JYPPX.TensorRT.CSharp.API.runtime.win-x64.cuda12" Version="0.0.5" NoWarn="NU1701" />
 		<PackageReference Include="OpenVINO.runtime.win" Version="2026.1.0" NoWarn="NU1701" />
 	</ItemGroup>
 
