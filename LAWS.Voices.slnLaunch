@@ -1,0 +1,22 @@
+[
+  {
+    "Name": "Downloader (CLI)",
+    "Projects": [
+      {
+        "Path": "LAWS.Voices.Downloader\\LAWS.Voices.Downloader.csproj",
+        "Action": "Start",
+        "DebugTarget": "LAWS.Voices.Downloader"
+      }
+    ]
+  },
+  {
+    "Name": "Forms",
+    "Projects": [
+      {
+        "Path": "LAWS.Voices.Forms\\LAWS.Voices.Forms.csproj",
+        "Action": "Start",
+        "DebugTarget": "LAWS.Voices.Forms"
+      }
+    ]
+  }
+]

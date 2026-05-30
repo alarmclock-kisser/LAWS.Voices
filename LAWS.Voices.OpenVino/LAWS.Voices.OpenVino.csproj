@@ -1,0 +1,20 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+	<PropertyGroup>
+		<TargetFramework>net10.0</TargetFramework>
+		<ImplicitUsings>enable</ImplicitUsings>
+		<Nullable>enable</Nullable>
+	</PropertyGroup>
+
+	<ItemGroup>
+		<PackageReference Include="JYPPX.OpenVINO.CSharp.API" Version="3.2.2" />
+		<PackageReference Include="OpenVINO.runtime.win" Version="2026.1.0" NoWarn="NU1701" />
+	</ItemGroup>
+
+	<ItemGroup>
+	  <ProjectReference Include="..\LAWS.Voices.Downloader\LAWS.Voices.Downloader.csproj" />
+	  <ProjectReference Include="..\LAWS.Voices.Multimodal\LAWS.Voices.Multimodal.csproj" />
+	  <ProjectReference Include="..\LAWS.Voices.Shared\LAWS.Voices.Shared.csproj" />
+	</ItemGroup>
+
+</Project>

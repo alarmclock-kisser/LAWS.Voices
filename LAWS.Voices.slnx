@@ -1,0 +1,7 @@
+<Solution>
+  <Project Path="LAWS.Voices.Downloader/LAWS.Voices.Downloader.csproj" />
+  <Project Path="LAWS.Voices.Forms/LAWS.Voices.Forms.csproj" Id="f8b386c7-e36f-4258-883b-d0d683b5a306" />
+  <Project Path="LAWS.Voices.Multimodal/LAWS.Voices.Multimodal.csproj" Id="b074026a-4687-430c-9678-f8202e9cf292" />
+  <Project Path="LAWS.Voices.OpenVino/LAWS.Voices.OpenVino.csproj" Id="63558cea-0635-47ac-bb91-37762416e66e" />
+  <Project Path="LAWS.Voices.Shared/LAWS.Voices.Shared.csproj" Id="9edd47cb-363b-4b38-b51c-700e270eece6" />
+</Solution>

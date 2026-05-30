@@ -1,0 +1,1543 @@
+﻿using System;
+using System.Collections.Generic;
+using System.Reflection;
+using System.IO;
+using System.Linq;
+using OpenVinoSharp;
+using System.Diagnostics;
+using LAWS.Voices.Shared;
+using LAWS.Voices.Downloader;
+
+namespace LAWS.Voices.OpenVino
+{
+    public class OpenVinoService : IDisposable
+    {
+        // Optional UI-provided confirmation callback. If set, it will be invoked with a message and
+        // should return true to approve automated conversion, false to decline.
+        public static Func<string, bool>? ConfirmConversionCallback;
+        // Optional conversion runner that the UI can provide to run converter with a progress dialog.
+        // If set, it will be invoked with the ProcessStartInfo and should return (exitCode, stdout, stderr).
+        public static Func<ProcessStartInfo, object, (int exitCode, string stdout, string stderr)>? ConversionRunner;
+
+        private readonly Core _core;
+        private readonly string _deviceName;
+        private bool _isDisposed;
+
+        /// <summary>
+        /// Retrieves all currently available OpenVINO devices on this system (e.g., "CPU", "GPU.0", "AUTO").
+        /// </summary>
+        /// <returns>A collection of available hardware device IDs.</returns>
+        public static IEnumerable<string> GetDevices()
+        {
+            try
+            {
+                // Temporary Core instance used for hardware querying, disposed immediately
+                using var tempCore = new Core();
+                List<string> devices = tempCore.get_available_devices();
+                devices.Add("AUTO");
+
+                StaticLogger.Log($"[OpenVINO] Available hardware devices retrieved: {string.Join(", ", devices)}");
+                return devices;
+            }
+            catch (Exception ex)
+            {
+                StaticLogger.Log($"[ERROR] Failed to query OpenVINO devices: {ex.Message}");
+
+                // Safe fallback since CPU and AUTO routing are always available cross-platform
+                return new string[] { "CPU", "AUTO" };
+            }
+        }
+
+        private static string GetPythonExecutable()
+        {
+            foreach (var candidate in new[] { "python", "python3" })
+            {
+                try
+                {
+                    var psi = new ProcessStartInfo(candidate, "--version")
+                    {
+                        RedirectStandardOutput = true,
+                        RedirectStandardError = true,
+                        UseShellExecute = false,
+                        CreateNoWindow = true
+                    };
+                    using var p = Process.Start(psi);
+                    if (p == null)
+                    {
+                        continue;
+                    }
+
+                    p.WaitForExit(5000);
+                    if (p.ExitCode == 0)
+                    {
+                        return candidate;
+                    }
+                }
+                catch
+                {
+                }
+            }
+            return "python";
+        }
+
+        /// <summary>
+        /// Resolves the absolute path to the XML or ONNX topology using the DTO and the selected quantization folder structure.
+        /// </summary>
+        private static string ResolveXmlPath(OpenVinoModelInfo modelInfo, OpenVinoModelQuantization quant, string baseDirectory)
+        {
+            // Model folders may be organized as <baseDirectory>\<subrepo>\<modelId>\<quant> or directly as <baseDirectory>\<modelId>\<quant>.
+            // Try direct path first, then fallback to searching the baseDirectory tree for a matching model folder name.
+            string modelFolder = Path.Combine(baseDirectory, modelInfo.Id);
+            if (!Directory.Exists(modelFolder))
+            {
+                try
+                {
+                    var matches = Directory.GetDirectories(baseDirectory, modelInfo.Id, SearchOption.AllDirectories);
+                    if (matches != null && matches.Length > 0)
+                    {
+                        modelFolder = matches[0];
+                    }
+                }
+                catch { }
+            }
+
+            string targetQuantFolder = Path.Combine(modelFolder, quant.ToString());
+
+            if (!Directory.Exists(targetQuantFolder) && Directory.Exists(modelFolder))
+            {
+                var subDirs = Directory.GetDirectories(modelFolder);
+                foreach (var subDir in subDirs)
+                {
+                    string checkPath = Path.Combine(subDir, quant.ToString());
+                    if (Directory.Exists(checkPath) &&
+                        Directory.EnumerateFiles(checkPath, "*.*").Any(f => f.EndsWith(".xml") || f.EndsWith(".onnx")))
+                    {
+                        targetQuantFolder = checkPath;
+                        break;
+                    }
+                }
+            }
+
+            // Fix: Look for either standard OpenVINO XML description matrices or standalone ONNX binaries
+            string? modelFile = null;
+            if (Directory.Exists(targetQuantFolder))
+            {
+                modelFile = Directory.GetFiles(targetQuantFolder, "*.*")
+                    .FirstOrDefault(f => f.EndsWith(".xml", StringComparison.OrdinalIgnoreCase) ||
+                                         f.EndsWith(".onnx", StringComparison.OrdinalIgnoreCase));
+            }
+
+            // If no file found in explicit quant folder, search recursively in modelFolder and its subfolders.
+            if (string.IsNullOrEmpty(modelFile))
+            {
+                if (Directory.Exists(modelFolder))
+                {
+                    var allCandidates = Directory.GetFiles(modelFolder, "*.*", SearchOption.AllDirectories)
+                        .Where(f => f.EndsWith(".xml", StringComparison.OrdinalIgnoreCase) || f.EndsWith(".onnx", StringComparison.OrdinalIgnoreCase))
+                        .ToArray();
+
+                    // Prefer candidates that live under a quant subfolder (e.g. /FP32/ or /FP16/)
+                    modelFile = allCandidates.FirstOrDefault(f => f.IndexOf(Path.DirectorySeparatorChar + quant.ToString() + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase) >= 0)
+                                ?? allCandidates.FirstOrDefault();
+                }
+            }
+
+            if (string.IsNullOrEmpty(modelFile) || !File.Exists(modelFile))
+            {
+                // Collect available files to provide a more helpful error message when conversion is required
+                var available = new List<string>();
+                if (Directory.Exists(modelFolder))
+                {
+                    try { available = Directory.GetFiles(modelFolder, "*.*", SearchOption.AllDirectories).Select(f => Path.GetFileName(f)).ToList(); } catch { }
+                }
+
+                string availList = available.Count > 0 ? string.Join(", ", available.Take(20)) : "<no files found>";
+                string errMsg = $"No OpenVINO .xml or .onnx topology found for {modelInfo.Id} ({quant}). Searched: {targetQuantFolder} and {modelFolder}. Found files: {availList}";
+                StaticLogger.Log($"[ERROR] {errMsg}");
+
+                // If there are .bin (PyTorch) weights but no ONNX/XML, attempt an automated conversion using the included helper script.
+                bool hasBin = available.Any(n => n.EndsWith(".bin", StringComparison.OrdinalIgnoreCase) || n.Equals("pytorch_model.bin", StringComparison.OrdinalIgnoreCase));
+                if (hasBin)
+                {
+                    StaticLogger.Log($"[OpenVINO] Detected PyTorch weights for {modelInfo.Id}; requesting user permission to attempt automated ONNX/IR conversion using tools/convert_wav2vec2.");
+
+                    bool userApproved = false;
+                    try
+                    {
+                        if (ConfirmConversionCallback != null)
+                        {
+                            userApproved = ConfirmConversionCallback($"Model '{modelInfo.Id}' appears to contain PyTorch weights but no ONNX/XML. Try to convert it automatically now?\n\nThis requires Python with 'torch' and 'transformers' installed and may take several minutes.");
+                        }
+                        else
+                        {
+                            StaticLogger.Log("[OpenVINO] No UI confirmation callback registered; cannot ask user for conversion permission.");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        StaticLogger.Log($"[OpenVINO] Confirmation callback threw: {ex.Message}");
+                    }
+
+                    if (!userApproved)
+                    {
+                        string guidance = "Automatic conversion was cancelled or not approved. Install ONNX/XML for this model or run tools/convert_wav2vec2 manually.";
+                        StaticLogger.Log($"[OpenVINO] Automated conversion not approved: {guidance}");
+                        throw new FileNotFoundException(errMsg + " " + guidance);
+                    }
+
+                    StaticLogger.Log($"[OpenVINO] User approved automated conversion for {modelInfo.Id}; starting converter.");
+
+                    // Attempt to locate converter script in repository tree relative to base directory
+                    string? scriptPath = null;
+                    try
+                    {
+                        var baseDir = AppDomain.CurrentDomain.BaseDirectory;
+                        string probe = baseDir;
+                        for (int up = 0; up < 6 && scriptPath == null; up++)
+                        {
+                            try
+                            {
+                                var candidates = Directory.GetFiles(probe, "convert_wav2vec2.py", SearchOption.AllDirectories);
+                                if (candidates.Length > 0)
+                                {
+                                    scriptPath = candidates[0];
+                                }
+                            }
+                            catch { }
+                            probe = Path.GetFullPath(Path.Combine(probe, ".."));
+                        }
+                    }
+                    catch { }
+
+                    if (scriptPath == null)
+                    {
+                        StaticLogger.Log("[OpenVINO] Converter script not found in repository; cannot auto-convert. " + errMsg);
+                        throw new FileNotFoundException(errMsg + " Converter script not found.");
+                    }
+
+                    // Ensure target quant folder exists
+                    try { Directory.CreateDirectory(targetQuantFolder); } catch { }
+
+                    string pythonExe = GetPythonExecutable();
+                    StaticLogger.Log($"[OpenVINO][Converter] Using python executable: {pythonExe}");
+                    int converterExitCode = int.MinValue;
+                    string converterStdout = string.Empty;
+                    string converterStderr = string.Empty;
+
+                    // Check Python and required packages before invoking conversion
+                    try
+                    {
+                        var checkPsi = new ProcessStartInfo(pythonExe, "-c \"import transformers,torch\"")
+                        {
+                            RedirectStandardOutput = true,
+                            RedirectStandardError = true,
+                            UseShellExecute = false,
+                            CreateNoWindow = true
+                        };
+                        using var checkProc = Process.Start(checkPsi);
+                        if (checkProc != null)
+                        {
+                            string cout = checkProc.StandardOutput.ReadToEnd();
+                            string cerr = checkProc.StandardError.ReadToEnd();
+                            checkProc.WaitForExit(10000);
+                            if (checkProc.ExitCode != 0)
+                            {
+                                StaticLogger.Log($"[OpenVINO][Converter] Python environment missing required packages: {cerr.Trim()}");
+                                string guidance = "Install Python 3.8+ and required packages: run 'pip install torch transformers' in your environment, then retry or run tools/convert_wav2vec2 manually.";
+                                StaticLogger.Log($"[OpenVINO] {guidance}");
+
+                                // Ask user whether to attempt automatic pip install
+                                bool tryInstall = false;
+                                try
+                                {
+                                    if (ConfirmConversionCallback != null)
+                                    {
+                                        tryInstall = ConfirmConversionCallback("Required Python packages (torch, transformers) are missing. Try to install them automatically now? This will run 'python -m pip install --upgrade pip' and then install the packages.");
+                                    }
+                                }
+                                catch { }
+
+                                if (tryInstall)
+                                {
+                                    try
+                                    {
+                                        int upgradeExitCode = -1;
+                                        string upgradeStdout = string.Empty;
+                                        string upgradeStderr = string.Empty;
+                                        int installExitCode = -1;
+                                        string installStdout = string.Empty;
+                                        string installStderr = string.Empty;
+
+                                        // upgrade pip
+                                        var psiUpgrade = new ProcessStartInfo("python", "-m pip install --upgrade pip") { RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true };
+                                        if (ConversionRunner != null)
+                                        {
+                                            var owner = AppDomain.CurrentDomain.GetData("ActiveWindow");
+                                            var outu = ConversionRunner(psiUpgrade, owner!);
+                                            upgradeExitCode = outu.exitCode;
+                                            upgradeStdout = outu.stdout ?? string.Empty;
+                                            upgradeStderr = outu.stderr ?? string.Empty;
+                                            StaticLogger.Log($"[OpenVINO][Converter] pip upgrade exit={outu.exitCode}");
+                                        }
+                                        else
+                                        {
+                                            using var p = Process.Start(psiUpgrade);
+                                            if (p != null)
+                                            {
+                                                string outp = p.StandardOutput.ReadToEnd();
+                                                string errp = p.StandardError.ReadToEnd();
+                                                p.WaitForExit(600000);
+                                                upgradeExitCode = p.ExitCode;
+                                                upgradeStdout = outp;
+                                                upgradeStderr = errp;
+                                            }
+                                        }
+
+                                        // install packages
+                                        var psiInstall = new ProcessStartInfo("python", "-m pip install torch transformers") { RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true };
+                                        if (ConversionRunner != null)
+                                        {
+                                            var owner = AppDomain.CurrentDomain.GetData("ActiveWindow");
+                                            var outi = ConversionRunner(psiInstall, owner!);
+                                            installExitCode = outi.exitCode;
+                                            installStdout = outi.stdout ?? string.Empty;
+                                            installStderr = outi.stderr ?? string.Empty;
+                                        }
+                                        else
+                                        {
+                                            using var p2 = Process.Start(psiInstall);
+                                            if (p2 != null)
+                                            {
+                                                string outp2 = p2.StandardOutput.ReadToEnd();
+                                                string errp2 = p2.StandardError.ReadToEnd();
+                                                p2.WaitForExit(600000);
+                                                installExitCode = p2.ExitCode;
+                                                installStdout = outp2;
+                                                installStderr = errp2;
+                                            }
+                                        }
+
+                                        if (installExitCode != 0)
+                                        {
+                                            StaticLogger.Log("[OpenVINO][Converter] pip install returned non-zero exit; attempting elevated install via RunAs.");
+                                            var psiElev = new ProcessStartInfo(pythonExe, "-m pip install torch transformers") { UseShellExecute = true, Verb = "runas", CreateNoWindow = true };
+                                            var pElev = Process.Start(psiElev);
+                                            pElev?.WaitForExit();
+                                        }
+                                    }
+                                    catch (Exception ex)
+                                    {
+                                        StaticLogger.Log($"[OpenVINO] Automatic pip install failed: {ex.Message}");
+                                    }
+                                }
+                            }
+                        }
+
+                        var psi = new ProcessStartInfo(pythonExe, $"\"{scriptPath}\" \"{modelFolder}\" \"{targetQuantFolder}\" --run-mo")
+                        {
+                            RedirectStandardOutput = true,
+                            RedirectStandardError = true,
+                            UseShellExecute = false,
+                            CreateNoWindow = true
+                        };
+
+                        if (ConversionRunner != null)
+                        {
+                            var owner = AppDomain.CurrentDomain.GetData("ActiveWindow");
+                            var res = ConversionRunner(psi, owner!);
+                            converterExitCode = res.exitCode;
+                            converterStdout = res.stdout ?? string.Empty;
+                            converterStderr = res.stderr ?? string.Empty;
+                        }
+                        else
+                        {
+                            using var proc = Process.Start(psi);
+                            if (proc != null)
+                            {
+                                converterStdout = proc.StandardOutput.ReadToEnd();
+                                converterStderr = proc.StandardError.ReadToEnd();
+                                proc.WaitForExit(600000);
+                                converterExitCode = proc.ExitCode;
+                            }
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        StaticLogger.Log($"[OpenVINO] Automated conversion attempt failed: {ex.Message}");
+                    }
+
+                    // Retry discovery for an .xml or .onnx in the quant folder or model folder
+                    string? retry = null;
+                    try
+                    {
+                        if (Directory.Exists(targetQuantFolder))
+                        {
+                            retry = Directory.GetFiles(targetQuantFolder, "*.*", SearchOption.AllDirectories)
+                                .FirstOrDefault(f => f.EndsWith(".xml", StringComparison.OrdinalIgnoreCase) || f.EndsWith(".onnx", StringComparison.OrdinalIgnoreCase));
+                        }
+                        if (retry == null && Directory.Exists(modelFolder))
+                        {
+                            retry = Directory.GetFiles(modelFolder, "*.*", SearchOption.AllDirectories)
+                                .FirstOrDefault(f => f.EndsWith(".xml", StringComparison.OrdinalIgnoreCase) || f.EndsWith(".onnx", StringComparison.OrdinalIgnoreCase));
+                        }
+                    }
+                    catch { }
+
+                    if (!string.IsNullOrEmpty(retry))
+                    {
+                        StaticLogger.Log($"[OpenVINO] Conversion succeeded; discovered topology: {Path.GetFileName(retry)}");
+                        return retry;
+                    }
+                    else
+                    {
+                        throw new FileNotFoundException(errMsg + " Conversion attempted but no ONNX/XML produced. ExitCode=" + converterExitCode);
+                    }
+                }
+                throw new FileNotFoundException(errMsg);
+            }
+            return modelFile;
+        }
+
+        /// <summary>
+        /// Scans the local models directory to discover, parse, and load metadata for all downloaded OpenVINO or ONNX models.
+        /// </summary>
+        public static IEnumerable<OpenVinoModelInfo> GetModels(string modelsDirectory)
+        {
+            if (!Directory.Exists(modelsDirectory))
+            {
+                StaticLogger.Log($"[WARNING] Models directory not found: {modelsDirectory}");
+                return Array.Empty<OpenVinoModelInfo>();
+            }
+
+            StaticLogger.Log($"[OpenVINO] Scanning local models directory: {modelsDirectory}");
+            var modelInfos = new List<OpenVinoModelInfo>();
+
+            try
+            {
+                foreach (string subRepoDir in Directory.GetDirectories(modelsDirectory))
+                {
+                    string subRepoName = Path.GetFileName(subRepoDir);
+
+                    foreach (string modelDir in Directory.GetDirectories(subRepoDir))
+                    {
+                        string modelId = Path.GetFileName(modelDir);
+                        string ymlPath = Path.Combine(modelDir, "model.yml");
+                        string compositeYmlPath = Path.Combine(modelDir, "composite-model.yml");
+
+                        bool isNormal = File.Exists(ymlPath);
+                        bool isComposite = File.Exists(compositeYmlPath);
+
+                        // If there is neither a model.yml nor a composite descriptor, we still want to
+                        // detect folders that contain model files (onnx / xml / bin), e.g. tflite subrepo.
+                        if (!isNormal && !isComposite)
+                        {
+                            var directFiles = Directory.GetFiles(modelDir, "*.*", SearchOption.AllDirectories)
+                                .Where(f => f.EndsWith(".xml", StringComparison.OrdinalIgnoreCase) || f.EndsWith(".onnx", StringComparison.OrdinalIgnoreCase) || f.EndsWith(".bin", StringComparison.OrdinalIgnoreCase))
+                                .ToArray();
+                            if (directFiles.Length == 0)
+                            {
+                                continue;
+                            }
+
+                            // Create a lightweight model info based on discovered files
+                            var simpleInfo = new OpenVinoModelInfo
+                            {
+                                Id = modelId,
+                                ModelRepoUrl = $"local://{subRepoName}/{modelId}"
+                            };
+                            foreach (var fp in directFiles)
+                            {
+                                try
+                                {
+                                    var fi = new FileInfo(fp);
+                                    simpleInfo.UrlsOrPathSizes.TryAdd(fp, fi.Length);
+                                    if (string.IsNullOrEmpty(simpleInfo.ModelXmlPath) && (fp.EndsWith(".xml", StringComparison.OrdinalIgnoreCase) || fp.EndsWith(".onnx", StringComparison.OrdinalIgnoreCase)))
+                                    {
+                                        simpleInfo.ModelXmlPath = fp;
+                                    }
+
+                                    // Infer quantization from filename when possible (e.g., contains FP16)
+                                    try
+                                    {
+                                        var q = OpenVinoModelXmlParser.DetermineQuantization(fp);
+                                        if (q.HasValue)
+                                        {
+                                            // Prefer the file path as the 'URL' for local models
+                                            simpleInfo.QuantizationUrls.TryAdd(q.Value, fp);
+                                        }
+                                        else
+                                        {
+                                            // default to FP32 entry mapping to the file
+                                            simpleInfo.QuantizationUrls.TryAdd(OpenVinoModelQuantization.FP32, fp);
+                                        }
+                                    }
+                                    catch { }
+                                }
+                                catch { }
+                            }
+                            modelInfos.Add(simpleInfo);
+                            continue;
+                        }
+
+                        var modelInfo = new OpenVinoModelInfo
+                        {
+                            Id = modelId,
+                            ModelRepoUrl = $"https://github.com/openvinotoolkit/open_model_zoo/tree/master/models/{subRepoName}/{modelId}"
+                        };
+
+                        if (isNormal)
+                        {
+                            string content = File.ReadAllText(ymlPath);
+                            var parsed = OpenVinoModelXmlParser.ParseModelXmlContent(content, modelId, modelInfo.ModelRepoUrl);
+                            modelInfo.QuantizationUrls = parsed.QuantizationUrls;
+                        }
+                        else if (isComposite)
+                        {
+                            string content = File.ReadAllText(compositeYmlPath);
+                            var subModels = OpenVinoModelXmlParser.ExtractSubModelsFromCompositeContent(content, modelId);
+
+                            foreach (var subModel in subModels)
+                            {
+                                string subModelYml = Path.Combine(modelDir, subModel, "model.yml");
+                                if (File.Exists(subModelYml))
+                                {
+                                    string subContent = File.ReadAllText(subModelYml);
+                                    var subParsed = OpenVinoModelXmlParser.ParseModelXmlContent(subContent, subModel, $"{modelInfo.ModelRepoUrl}/{subModel}");
+
+                                    foreach (var kvp in subParsed.QuantizationUrls)
+                                    {
+                                        modelInfo.QuantizationUrls.TryAdd(kvp.Key, kvp.Value);
+                                    }
+                                }
+                            }
+                        }
+
+                        var localFiles = Directory.GetFiles(modelDir, "*.*", SearchOption.AllDirectories)
+                            .Where(f => f.EndsWith(".xml", StringComparison.OrdinalIgnoreCase) ||
+                                        f.EndsWith(".bin", StringComparison.OrdinalIgnoreCase) ||
+                                        f.EndsWith(".onnx", StringComparison.OrdinalIgnoreCase));
+
+                        foreach (string filePath in localFiles)
+                        {
+                            var fileInfo = new FileInfo(filePath);
+                            modelInfo.UrlsOrPathSizes.TryAdd(filePath, fileInfo.Length);
+
+                            if ((filePath.EndsWith(".xml", StringComparison.OrdinalIgnoreCase) ||
+                                 filePath.EndsWith(".onnx", StringComparison.OrdinalIgnoreCase)) &&
+                                string.IsNullOrEmpty(modelInfo.ModelXmlPath))
+                            {
+                                modelInfo.ModelXmlPath = filePath;
+                            }
+                        }
+                        modelInfos.Add(modelInfo);
+                    }
+                }
+                StaticLogger.Log($"[SUCCESS] Discovered and loaded {modelInfos.Count} local models.");
+            }
+            catch (Exception ex)
+            {
+                StaticLogger.Log($"[ERROR] Failed to read local model directories: {ex.Message}");
+            }
+
+            // Additional global scan: ensure any standalone model files under modelsDirectory (arbitrary nesting)
+            // are discovered even if they don't follow the repo/modelDir structure.
+            try
+            {
+                var allCandidates = Directory.GetFiles(modelsDirectory, "*.*", SearchOption.AllDirectories)
+                    .Where(f => f.EndsWith(".xml", StringComparison.OrdinalIgnoreCase) || f.EndsWith(".onnx", StringComparison.OrdinalIgnoreCase) || f.EndsWith(".bin", StringComparison.OrdinalIgnoreCase))
+                    .ToArray();
+
+                var existingPaths = new HashSet<string>(modelInfos.SelectMany(mi => mi.UrlsOrPathSizes.Keys), StringComparer.OrdinalIgnoreCase);
+
+                var groups = allCandidates.GroupBy(fp => Path.GetDirectoryName(fp) ?? string.Empty);
+                foreach (var g in groups)
+                {
+                    var parent = g.Key;
+                    if (string.IsNullOrEmpty(parent))
+                    {
+                        continue;
+                    }
+                    // skip if already represented
+                    if (existingPaths.Any(p => p.StartsWith(parent, StringComparison.OrdinalIgnoreCase)))
+                    {
+                        continue;
+                    }
+
+                    var files = g.ToArray();
+                    if (files.Length == 0)
+                    {
+                        continue;
+                    }
+
+                    var info = new OpenVinoModelInfo
+                    {
+                        Id = Path.GetFileName(parent),
+                        ModelRepoUrl = $"local://scan/{Path.GetRelativePath(modelsDirectory, parent).Replace('\\', '/')}"
+                    };
+
+                    foreach (var fp in files)
+                    {
+                        try
+                        {
+                            var fi = new FileInfo(fp);
+                            info.UrlsOrPathSizes.TryAdd(fp, fi.Length);
+                            if (string.IsNullOrEmpty(info.ModelXmlPath) && (fp.EndsWith(".xml", StringComparison.OrdinalIgnoreCase) || fp.EndsWith(".onnx", StringComparison.OrdinalIgnoreCase)))
+                            {
+                                info.ModelXmlPath = fp;
+                            }
+                        }
+                        catch { }
+                    }
+
+                    modelInfos.Add(info);
+                }
+            }
+            catch { }
+            return modelInfos;
+        }
+
+        public OpenVinoService(string deviceName = "AUTO")
+        {
+            this._core = new Core();
+            this._deviceName = deviceName;
+            StaticLogger.Log($"OpenVINO service initialized on device: {this._deviceName}");
+        }
+
+        public AudioModelRunner CreateAudioRunner(OpenVinoModelInfo modelInfo, OpenVinoModelQuantization quant, string baseDirectory)
+        {
+            string xmlPath = ResolveXmlPath(modelInfo, quant, baseDirectory);
+            return new AudioModelRunner(this._core, xmlPath, this._deviceName);
+        }
+
+        public ImageModelRunner CreateImageRunner(OpenVinoModelInfo modelInfo, OpenVinoModelQuantization quant, string baseDirectory)
+        {
+            string xmlPath = ResolveXmlPath(modelInfo, quant, baseDirectory);
+            return new ImageModelRunner(this._core, xmlPath, this._deviceName);
+        }
+
+        public void Dispose()
+        {
+            if (!this._isDisposed)
+            {
+                this._core.Dispose();
+                this._isDisposed = true;
+                GC.SuppressFinalize(this);
+            }
+        }
+
+        public abstract class OpenVinoModelRunner : IDisposable
+        {
+            protected Model Model;
+            protected CompiledModel CompiledModel;
+            protected InferRequest InferRequest;
+            private bool _runnerDisposed;
+
+            protected Tensor[]? FetchOutputTensors()
+            {
+                var infReq = this.InferRequest;
+                var type = infReq.GetType();
+
+                object TryInvoke(MethodInfo mi, object?[]? args = null)
+                {
+                    try { return mi.Invoke(infReq, args) ?? null!; } catch { return null!; }
+                }
+
+                var multiNames = new[] { "get_output_tensors", "get_outputs", "outputs", "outputs_list" };
+                foreach (var name in multiNames)
+                {
+                    var mm = type.GetMethod(name, Type.EmptyTypes);
+                    if (mm != null)
+                    {
+                        var res = TryInvoke(mm) as object;
+                        if (res is Tensor[] arr)
+                        {
+                            return arr;
+                        }
+
+                        if (res is System.Collections.IEnumerable enumRes)
+                        {
+                            var list = new List<Tensor>();
+                            foreach (var item in enumRes)
+                            {
+                                if (item is Tensor t)
+                                {
+                                    list.Add(t);
+                                }
+                                else
+                                {
+                                    var it = item?.GetType();
+                                    if (it != null)
+                                    {
+                                        var prop = it.GetProperty("Value") ?? it.GetProperty("Item2");
+                                        var val = prop?.GetValue(item);
+                                        if (val is Tensor tv)
+                                        {
+                                            list.Add(tv);
+                                        }
+                                    }
+                                }
+                            }
+                            if (list.Count > 0)
+                            {
+                                return list.ToArray();
+                            }
+                        }
+                    }
+                }
+
+                string[] TryGetNamesFrom(object src)
+                {
+                    if (src == null)
+                    {
+                        return Array.Empty<string>();
+                    }
+
+                    var st = src.GetType();
+                    var candidates = new[] { "get_output_names", "getOutputsNames", "get_outputs_names", "output_names", "get_result_names", "get_results_names", "results" };
+                    foreach (var n in candidates)
+                    {
+                        var mm = st.GetMethod(n, Type.EmptyTypes);
+                        if (mm != null)
+                        {
+                            try
+                            {
+                                var r = mm.Invoke(src, null);
+                                if (r is string[] sa)
+                                {
+                                    return sa;
+                                }
+
+                                if (r is System.Collections.IEnumerable e)
+                                {
+                                    var list = new List<string>();
+                                    foreach (var it in e)
+                                    {
+                                        if (it != null)
+                                        {
+                                            list.Add(it.ToString()!);
+                                        }
+                                    }
+
+                                    if (list.Count > 0)
+                                    {
+                                        return list.ToArray();
+                                    }
+                                }
+                            }
+                            catch { }
+                        }
+                    }
+                    return Array.Empty<string>();
+                }
+
+                var names = TryGetNamesFrom(infReq);
+                if (names.Length == 0)
+                {
+                    names = TryGetNamesFrom(this.CompiledModel);
+                }
+
+                if (names.Length == 0)
+                {
+                    names = TryGetNamesFrom(this.Model);
+                }
+
+                if (names.Length > 0)
+                {
+                    var list = new List<Tensor>();
+                    var candMethods = type.GetMethods().Where(m => m.GetParameters().Length == 1 && (m.Name.IndexOf("output", StringComparison.OrdinalIgnoreCase) >= 0 || m.Name.IndexOf("tensor", StringComparison.OrdinalIgnoreCase) >= 0)).ToArray();
+                    foreach (var nm in names)
+                    {
+                        bool found = false;
+                        foreach (var cm in candMethods)
+                        {
+                            try
+                            {
+                                var pType = cm.GetParameters()[0].ParameterType;
+                                object arg = nm;
+                                if (pType != typeof(string))
+                                {
+                                    arg = Convert.ChangeType(nm, pType);
+                                }
+
+                                var r = cm.Invoke(infReq, new object[] { arg });
+                                if (r is Tensor t) { list.Add(t); found = true; break; }
+                            }
+                            catch { }
+                        }
+
+                        if (!found)
+                        {
+                            var trySrcs = new object[] { this.CompiledModel, this.Model };
+                            foreach (var src in trySrcs)
+                            {
+                                if (src == null)
+                                {
+                                    continue;
+                                }
+
+                                var st = src.GetType();
+                                var ms = st.GetMethods().Where(m => m.GetParameters().Length == 1 && (m.Name.IndexOf("output", StringComparison.OrdinalIgnoreCase) >= 0 || m.Name.IndexOf("result", StringComparison.OrdinalIgnoreCase) >= 0)).ToArray();
+                                foreach (var m2 in ms)
+                                {
+                                    try
+                                    {
+                                        var pType = m2.GetParameters()[0].ParameterType;
+                                        object arg = nm;
+                                        if (pType != typeof(string))
+                                        {
+                                            arg = Convert.ChangeType(nm, pType);
+                                        }
+
+                                        var r2 = m2.Invoke(src, new object[] { arg });
+                                        if (r2 is Tensor t2) { list.Add(t2); found = true; break; }
+                                    }
+                                    catch { }
+                                }
+                                if (found)
+                                {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if (list.Count > 0)
+                    {
+                        return list.ToArray();
+                    }
+                }
+
+                try
+                {
+                    var single = infReq.get_output_tensor();
+                    return new[] { single };
+                }
+                catch (Exception ex)
+                {
+                    var candidates = new List<string>();
+                    var foundList = new List<Tensor>();
+
+                    Action<object?> probeType = (src) =>
+                    {
+                        if (src == null)
+                        {
+                            return;
+                        }
+
+                        var st = src.GetType();
+                        foreach (var m in st.GetMethods().Where(m => m.GetParameters().Length == 0 && m.ReturnType != typeof(void)))
+                        {
+                            var key = st.FullName + "." + m.Name;
+                            if (candidates.Contains(key))
+                            {
+                                continue;
+                            }
+
+                            candidates.Add(key);
+                            try
+                            {
+                                var r = m.Invoke(src, null);
+                                if (r is Tensor t)
+                                {
+                                    foundList.Add(t);
+                                }
+                            }
+                            catch { }
+                        }
+                    };
+
+                    probeType(infReq);
+                    probeType(this.CompiledModel);
+                    probeType(this.Model);
+
+                    if (foundList.Count > 0)
+                    {
+                        return foundList.ToArray();
+                    }
+
+                    throw new InvalidOperationException("Model produced multiple outputs and no dynamic named accessor binding is available.", ex);
+                }
+            }
+
+            protected OpenVinoModelRunner(Core core, string xmlPath, string deviceName)
+            {
+                this.Model = core.read_model(xmlPath);
+                this.CompiledModel = core.compile_model(this.Model, deviceName);
+                this.InferRequest = this.CompiledModel.create_infer_request();
+            }
+
+            protected static void SetTensorSafely(Tensor tensor, float[] data, long[] shape)
+            {
+                try
+                {
+                    long expectedCount = 1;
+                    bool unknownDim = false;
+                    foreach (var d in shape)
+                    {
+                        if (d <= 0) { unknownDim = true; break; }
+                        expectedCount *= d;
+                    }
+
+                    // Versuche, die native Tensor-Kapazität (property "size") zu ermitteln und
+                    // diese zur Autorität zu machen, falls verfügbar. Manche Modelle liefern
+                    // eine shape, die nicht mit der tatsächlichen internen Puffergröße übereinstimmt.
+                    try
+                    {
+                        var sizeProp = tensor.GetType().GetProperty("size");
+                        if (sizeProp != null)
+                        {
+                            var native = Convert.ToInt64(sizeProp.GetValue(tensor));
+                            if (native > 0)
+                            {
+                                expectedCount = native;
+                            }
+                        }
+                    }
+                    catch { }
+
+                    if (expectedCount <= 0)
+                    {
+                        try
+                        {
+                            tensor.set_data(data);
+                            return;
+                        }
+                        catch
+                        {
+                            throw new InvalidOperationException($"Cannot determine expected tensor capacity for shape [{string.Join(',', shape)}].");
+                        }
+                    }
+
+                    if (expectedCount == data.Length)
+                    {
+                        tensor.set_data(data);
+                        return;
+                    }
+
+                    if (data.Length > 0)
+                    {
+                        var resized = new float[expectedCount];
+                        for (long i = 0; i < expectedCount; i++)
+                        {
+                            long srcIdx = (long) Math.Floor(i * (double) data.Length / expectedCount);
+                            if (srcIdx < 0)
+                            {
+                                srcIdx = 0;
+                            }
+
+                            if (srcIdx >= data.Length)
+                            {
+                                srcIdx = data.Length - 1;
+                            }
+
+                            resized[i] = data[(int) srcIdx];
+                        }
+                        tensor.set_data(resized);
+                        return;
+                    }
+                    throw new InvalidOperationException($"Data length {data.Length} incompatible with expected shape [{string.Join(',', shape)}].");
+                }
+                catch
+                {
+                    throw;
+                }
+            }
+
+            public void Dispose()
+            {
+                if (!this._runnerDisposed)
+                {
+                    this.InferRequest.Dispose();
+                    this.CompiledModel.Dispose();
+                    this.Model.Dispose();
+                    this._runnerDisposed = true;
+                }
+            }
+        }
+
+        public class AudioModelRunner : OpenVinoModelRunner
+        {
+            public AudioModelRunner(Core core, string xmlPath, string deviceName)
+                : base(core, xmlPath, deviceName) { }
+
+            private static long[] AlignShapeToModelRank(Tensor inputTensor, long[] modelShapeHint, long elementCount)
+            {
+                try
+                {
+                    var shapeObj = (object) inputTensor.shape;
+                    int rank = 0;
+                    var nativeDims = new List<long>();
+
+                    if (shapeObj is System.Collections.IEnumerable enumShape)
+                    {
+                        foreach (var item in enumShape)
+                        {
+                            nativeDims.Add(Convert.ToInt64(item));
+                        }
+
+                        rank = nativeDims.Count;
+                    }
+                    else
+                    {
+                        var getRank = shapeObj.GetType().GetMethod("get_rank", Type.EmptyTypes);
+                        if (getRank != null)
+                        {
+                            rank = Convert.ToInt32(getRank.Invoke(shapeObj, null));
+                        }
+                    }
+
+                    bool isNativeDegenerate = rank <= 0 || (rank == 1 && (nativeDims.Count == 0 || nativeDims[0] <= 0));
+
+                    if (!isNativeDegenerate && modelShapeHint != null && modelShapeHint.Length > 1)
+                    {
+                        var target = (long[]) modelShapeHint.Clone();
+                        target[target.Length - 1] = elementCount;
+                        return target;
+                    }
+
+                    if (modelShapeHint != null && modelShapeHint.Length > 0)
+                    {
+                        var target = (long[]) modelShapeHint.Clone();
+                        target[target.Length - 1] = elementCount;
+                        return target;
+                    }
+                    return new long[] { 1, elementCount };
+                }
+                catch
+                {
+                    if (modelShapeHint != null && modelShapeHint.Length > 0)
+                    {
+                        var target = (long[]) modelShapeHint.Clone();
+                        target[target.Length - 1] = elementCount;
+                        return target;
+                    }
+                    return new long[] { 1, elementCount };
+                }
+            }
+
+            public float[] RunInference(float[] pcmData, ulong[] shape, IProgress<(int current, int total)>? progress = null, System.Threading.CancellationToken cancellationToken = default)
+            {
+                long GetTensorCapacity(Tensor t)
+                {
+                    try
+                    {
+                        var tt = t.GetType();
+                        var prop = tt.GetProperty("size");
+                        if (prop != null)
+                        {
+                            return Convert.ToInt64(prop.GetValue(t));
+                        }
+                    }
+                    catch { }
+                    return -1;
+                }
+
+                cancellationToken.ThrowIfCancellationRequested();
+                Tensor? inputTensor = null;
+                try
+                {
+                    inputTensor = this.InferRequest.get_input_tensor();
+                }
+                catch
+                {
+                    var ir = this.InferRequest;
+                    var irType = ir.GetType();
+                    try
+                    {
+                        var miAll = irType.GetMethod("get_input_tensors", BindingFlags.Public | BindingFlags.Instance | BindingFlags.NonPublic);
+                        if (miAll != null)
+                        {
+                            var arr = miAll.Invoke(ir, null) as System.Array;
+                            if (arr != null && arr.Length > 0)
+                            {
+                                inputTensor = arr.GetValue(0) as Tensor;
+                            }
+                        }
+                    }
+                    catch { }
+                }
+
+                if (inputTensor == null)
+                {
+                    throw new InvalidOperationException("Could not locate a single input tensor for this audio topology.");
+                }
+
+                long[] providedLongShape = Array.ConvertAll(shape, x => (long) x);
+                if (providedLongShape.Length == 1)
+                {
+                    providedLongShape = new long[] { 1, providedLongShape[0] };
+                }
+
+                long[] expectedShape;
+                try
+                {
+                    var shapeObj = (object) inputTensor.shape;
+                    if (shapeObj is System.Collections.IEnumerable enumShape)
+                    {
+                        var dims = new List<long>();
+                        foreach (var item in enumShape)
+                        {
+                            dims.Add(Convert.ToInt64(item));
+                        }
+
+                        expectedShape = dims.ToArray();
+                    }
+                    else
+                    {
+                        var getDims = shapeObj.GetType().GetMethod("get_dims", Type.EmptyTypes);
+                        expectedShape = getDims != null ? ((long[]?) getDims.Invoke(shapeObj, null) ?? providedLongShape) : providedLongShape;
+                    }
+
+                    // FIX: Wenn das Modell feste Dimensionen hat, aber der Rank mit dem vom User übergebenen Shape 
+                    // übereinstimmt, überschreiben wir es nicht unkontrolliert mit den Metadaten des Tensors.
+                    if (expectedShape.Length == providedLongShape.Length)
+                    {
+                        expectedShape = providedLongShape;
+                    }
+                }
+                catch
+                {
+                    expectedShape = providedLongShape;
+                }
+
+                long expectedElements = 1;
+                for (int i = 1; i < expectedShape.Length; i++)
+                {
+                    if (expectedShape[i] <= 0) { expectedElements = -1; break; }
+                    expectedElements *= expectedShape[i];
+                }
+
+                if (expectedElements <= 0)
+                {
+                    expectedElements = 1;
+                    for (int i = 1; i < providedLongShape.Length; i++)
+                    {
+                        expectedElements *= providedLongShape[i];
+                    }
+
+                    expectedShape = providedLongShape;
+                }
+
+                int providedLen = pcmData?.Length ?? 0;
+                bool shapeHasUnknown = expectedShape.Length <= 1 || expectedShape.Any(d => d <= 0);
+                if (shapeHasUnknown)
+                {
+                    try
+                    {
+                        long detectedCap = GetTensorCapacity(inputTensor);
+                        if (detectedCap > 0)
+                        {
+                            if (expectedShape.Length >= 2)
+                            {
+                                expectedShape[expectedShape.Length - 1] = detectedCap;
+                            }
+                            else
+                            {
+                                expectedShape = new long[] { 1, detectedCap };
+                            }
+
+                            expectedElements = detectedCap;
+                        }
+                        else
+                        {
+                            long fallback = Math.Min(65536, (long) providedLen);
+                            if (providedLongShape != null && providedLongShape.Length >= 2)
+                            {
+                                expectedShape = (long[]) providedLongShape.Clone();
+                                expectedShape[expectedShape.Length - 1] = fallback;
+                            }
+                            else
+                            {
+                                expectedShape = new long[] { 1, fallback };
+                            }
+                            expectedElements = fallback;
+                        }
+                    }
+                    catch
+                    {
+                        if (providedLongShape != null && providedLongShape.Length >= 2)
+                        {
+                            expectedShape = providedLongShape;
+                            expectedElements = providedLongShape[providedLongShape.Length - 1];
+                        }
+                    }
+                }
+
+                if (providedLen == 0)
+                {
+                    throw new InvalidOperationException("Audio has no PCM data.");
+                }
+
+                var results = new List<float>();
+
+                if (providedLen == expectedElements)
+                {
+                    var targetShape = AlignShapeToModelRank(inputTensor, expectedShape, expectedElements);
+                    inputTensor.shape = new Shape(targetShape);
+                    SetTensorSafely(inputTensor, pcmData ?? [], targetShape);
+                    progress?.Report((0, 1));
+                    this.InferRequest.infer();
+                    progress?.Report((1, 1));
+                    var outputs = this.FetchOutputTensors();
+                    if (outputs == null || outputs.Length == 0)
+                    {
+                        throw new InvalidOperationException("Model produced no outputs.");
+                    }
+
+                    if (outputs.Length == 1)
+                    {
+                        return outputs[0].get_data<float>((int) outputs[0].size);
+                    }
+
+                    foreach (var outT in outputs)
+                    {
+                        results.AddRange(outT.get_data<float>((int) outT.size));
+                    }
+
+                    return results.ToArray();
+                }
+
+                if (providedLen < expectedElements)
+                {
+                    var buffer = new float[expectedElements];
+                    Array.Copy(pcmData ?? [], 0, buffer, 0, providedLen);
+                    var padTarget = AlignShapeToModelRank(inputTensor, expectedShape, expectedElements);
+                    inputTensor.shape = new Shape(padTarget);
+                    SetTensorSafely(inputTensor, buffer, padTarget);
+                    progress?.Report((0, 1));
+                    this.InferRequest.infer();
+                    progress?.Report((1, 1));
+                    var outputs = this.FetchOutputTensors();
+                    if (outputs == null || outputs.Length == 0)
+                    {
+                        throw new InvalidOperationException("Model produced no outputs.");
+                    }
+
+                    if (outputs.Length == 1)
+                    {
+                        return outputs[0].get_data<float>((int) outputs[0].size);
+                    }
+
+                    foreach (var outT in outputs)
+                    {
+                        results.AddRange(outT.get_data<float>((int) outT.size));
+                    }
+
+                    return results.ToArray();
+                }
+
+                long tensorCap = GetTensorCapacity(inputTensor);
+                long elementsPerChunk = expectedElements;
+                if (tensorCap > 0 && tensorCap < expectedElements)
+                {
+                    elementsPerChunk = tensorCap;
+                    if (expectedShape.Length >= 3)
+                    {
+                        long channels = expectedShape.Length > 1 ? expectedShape[1] : 1;
+                        if (channels > 0)
+                        {
+                            long newLast = elementsPerChunk / channels;
+                            expectedShape[expectedShape.Length - 1] = newLast;
+                            expectedElements = channels * newLast;
+                            elementsPerChunk = expectedElements;
+                        }
+                    }
+                    else if (expectedShape.Length == 2)
+                    {
+                        expectedShape[1] = elementsPerChunk;
+                        expectedElements = elementsPerChunk;
+                    }
+                }
+
+                int chunks = (int) Math.Ceiling((double) providedLen / elementsPerChunk);
+                progress?.Report((0, chunks));
+
+                for (int ci = 0; ci < chunks; ci++)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    int offset = (int) (ci * elementsPerChunk);
+                    int remaining = Math.Max(0, providedLen - offset);
+                    var buffer = new float[elementsPerChunk];
+                    int copyLen = (int) Math.Min(remaining, elementsPerChunk);
+                    if (copyLen > 0)
+                    {
+                        Array.Copy(pcmData ?? [], offset, buffer, 0, copyLen);
+                    }
+
+                    var chunkTarget = AlignShapeToModelRank(inputTensor, expectedShape, elementsPerChunk);
+                    inputTensor.shape = new Shape(chunkTarget);
+                    SetTensorSafely(inputTensor, buffer, chunkTarget);
+                    progress?.Report((ci, chunks));
+
+                    this.InferRequest.infer();
+                    progress?.Report((ci + 1, chunks));
+
+                    var outputs = this.FetchOutputTensors();
+                    if (outputs == null || outputs.Length == 0)
+                    {
+                        throw new InvalidOperationException("Model produced no outputs.");
+                    }
+
+                    if (outputs.Length == 1)
+                    {
+                        results.AddRange(outputs[0].get_data<float>((int) outputs[0].size));
+                    }
+                    else
+                    {
+                        foreach (var outT in outputs)
+                        {
+                            results.AddRange(outT.get_data<float>((int) outT.size));
+                        }
+                    }
+                }
+                return results.ToArray();
+            }
+        }
+
+        public class ImageModelRunner : OpenVinoModelRunner
+        {
+            public ImageModelRunner(Core core, string xmlPath, string deviceName)
+                : base(core, xmlPath, deviceName) { }
+
+            public float[] RunInference(float[] rgbChannelsData, ulong width, ulong height, ulong channels = 3, IProgress<(int current, int total)>? progress = null)
+            {
+                Tensor? inputTensor = null;
+                try
+                {
+                    inputTensor = this.InferRequest.get_input_tensor();
+                }
+                catch
+                {
+                    var ir = this.InferRequest;
+                    var irType = ir.GetType();
+                    try
+                    {
+                        var miAll = irType.GetMethod("get_input_tensors", BindingFlags.Public | BindingFlags.Instance | BindingFlags.NonPublic);
+                        if (miAll != null)
+                        {
+                            var arr = miAll.Invoke(ir, null) as System.Array;
+                            if (arr != null && arr.Length > 0)
+                            {
+                                inputTensor = arr.GetValue(0) as Tensor;
+                            }
+                        }
+                    }
+                    catch { }
+                }
+
+                if (inputTensor == null)
+                {
+                    throw new InvalidOperationException("Could not resolve standard input tensor port.");
+                }
+
+                var expectedShape = inputTensor.shape;
+                long[] exp;
+                var shapeObj = (object) expectedShape;
+
+                if (shapeObj is System.Collections.IEnumerable enumShape)
+                {
+                    var dims = new List<long>();
+                    foreach (var item in enumShape)
+                    {
+                        dims.Add(Convert.ToInt64(item));
+                    }
+
+                    exp = dims.ToArray();
+                }
+                else
+                {
+                    var shapeType = shapeObj.GetType();
+                    var getDimsMethod = shapeType.GetMethod("get_dims", Type.EmptyTypes);
+                    if (getDimsMethod != null)
+                    {
+                        exp = (long[]?) getDimsMethod.Invoke(shapeObj, null) ?? Array.Empty<long>();
+                    }
+                    else
+                    {
+                        var toArrayMethod = shapeType.GetMethod("ToArray", Type.EmptyTypes);
+                        exp = toArrayMethod != null ? ((long[]?) toArrayMethod.Invoke(shapeObj, null) ?? Array.Empty<long>()) : Array.Empty<long>();
+                    }
+                }
+
+                if (exp == null || exp.Length == 0)
+                {
+                    exp = new long[] { 1, (long) channels, (long) height, (long) width };
+                }
+
+                long expC = exp.Length > 1 ? exp[1] : (long) channels;
+                int rankLen = exp.Length;
+                int providedChannels = (int) channels;
+                float[] inputDataToUse = rgbChannelsData;
+
+                if (rankLen >= 4)
+                {
+                    long expH = exp.Length > 2 ? exp[2] : (long) height;
+                    long expW = exp.Length > 3 ? exp[3] : (long) width;
+
+                    if (expH != (long) height || expW != (long) width)
+                    {
+                        inputDataToUse = ResizePlanarNearest(rgbChannelsData, providedChannels, (int) width, (int) height, (int) expW, (int) expH);
+                    }
+
+                    if (expC != (long) providedChannels)
+                    {
+                        int outC = (int) expC;
+                        int outH = (int) expH;
+                        int outW = (int) expW;
+                        int plane = outH * outW;
+                        var expanded = new float[outC * plane];
+                        for (int c = 0; c < outC; c++)
+                        {
+                            int destOff = c * plane;
+                            int srcC = c < providedChannels ? c : (providedChannels - 1);
+                            int srcOff = srcC * plane;
+                            if (inputDataToUse.Length >= (srcOff + plane))
+                            {
+                                Array.Copy(inputDataToUse, srcOff, expanded, destOff, plane);
+                            }
+                        }
+                        inputDataToUse = expanded;
+                        expC = outC;
+                    }
+
+                    var targetShape4 = new long[] { 1, expC, exp[2], exp[3] };
+                    inputTensor.shape = new Shape(targetShape4);
+                    SetTensorSafely(inputTensor, inputDataToUse, targetShape4);
+                }
+                else if (rankLen == 3)
+                {
+                    long expL = exp[2];
+                    int dstLen = (int) expL;
+                    int srcPlane = (int) width * (int) height;
+
+                    if (srcPlane != dstLen)
+                    {
+                        inputDataToUse = ResizePlanarToLength(rgbChannelsData, providedChannels, srcPlane, dstLen);
+                    }
+
+                    if (expC != (long) providedChannels)
+                    {
+                        int outC = (int) expC;
+                        var expanded = new float[outC * dstLen];
+                        for (int c = 0; c < outC; c++)
+                        {
+                            int destOff = c * dstLen;
+                            int srcC = c < providedChannels ? c : (providedChannels - 1);
+                            int srcOff = srcC * dstLen;
+                            if (inputDataToUse.Length >= (srcOff + dstLen))
+                            {
+                                Array.Copy(inputDataToUse, srcOff, expanded, destOff, dstLen);
+                            }
+                        }
+                        inputDataToUse = expanded;
+                        expC = outC;
+                    }
+
+                    var targetShape3 = new long[] { 1, expC, expL };
+                    inputTensor.shape = new Shape(targetShape3);
+                    SetTensorSafely(inputTensor, inputDataToUse, targetShape3);
+                }
+                else
+                {
+                    var targetShapeFallback = new long[] { 1, expC, (long) height, (long) width };
+                    inputTensor.shape = new Shape(targetShapeFallback);
+                    SetTensorSafely(inputTensor, inputDataToUse, targetShapeFallback);
+                }
+
+                progress?.Report((0, 1));
+                this.InferRequest.infer();
+                progress?.Report((1, 1));
+
+                var outputs = this.FetchOutputTensors();
+                if (outputs == null || outputs.Length == 0)
+                {
+                    throw new InvalidOperationException("Model produced no outputs.");
+                }
+
+                if (outputs.Length == 1)
+                {
+                    return outputs[0].get_data<float>((int) outputs[0].size);
+                }
+                else
+                {
+                    int total = outputs.Sum(t => (int) t.size);
+                    var result = new float[total];
+                    int pos = 0;
+                    foreach (var outT in outputs)
+                    {
+                        var data = outT.get_data<float>((int) outT.size);
+                        Array.Copy(data, 0, result, pos, data.Length);
+                        pos += data.Length;
+                    }
+                    return result;
+                }
+            }
+
+            private static float[] ResizePlanarNearest(float[] src, int channels, int srcW, int srcH, int dstW, int dstH)
+            {
+                int dstPx = dstW * dstH;
+                var dst = new float[channels * dstPx];
+                for (int ch = 0; ch < channels; ch++)
+                {
+                    int srcOffset = ch * srcW * srcH;
+                    int dstOffset = ch * dstW * dstH;
+                    for (int y = 0; y < dstH; y++)
+                    {
+                        int sy = (int) ((y + 0.5f) * srcH / dstH);
+                        if (sy < 0)
+                        {
+                            sy = 0;
+                        }
+
+                        if (sy >= srcH)
+                        {
+                            sy = srcH - 1;
+                        }
+
+                        for (int x = 0; x < dstW; x++)
+                        {
+                            int sx = (int) ((x + 0.5f) * srcW / dstW);
+                            if (sx < 0)
+                            {
+                                sx = 0;
+                            }
+
+                            if (sx >= srcW)
+                            {
+                                sx = srcW - 1;
+                            }
+
+                            dst[dstOffset + y * dstW + x] = src[srcOffset + sy * srcW + sx];
+                        }
+                    }
+                }
+                return dst;
+            }
+
+            private static float[] ResizePlanarToLength(float[] src, int channels, int srcLen, int dstLen)
+            {
+                var dst = new float[channels * dstLen];
+                for (int c = 0; c < channels; c++)
+                {
+                    int srcOff = c * srcLen;
+                    int dstOff = c * dstLen;
+                    for (int i = 0; i < dstLen; i++)
+                    {
+                        int si = (int) ((i + 0.5f) * srcLen / dstLen);
+                        if (si < 0)
+                        {
+                            si = 0;
+                        }
+
+                        if (si >= srcLen)
+                        {
+                            si = srcLen - 1;
+                        }
+
+                        dst[dstOff + i] = src[srcOff + si];
+                    }
+                }
+                return dst;
+            }
+        }
+    }
+}
