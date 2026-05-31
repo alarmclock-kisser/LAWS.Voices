@@ -57,7 +57,7 @@ namespace LAWS.Voices.Forms
                 this.numericUpDown_chunkSize.Value = Math.Clamp(this.lastChunkSize * 2, this.numericUpDown_chunkSize.Minimum, this.numericUpDown_chunkSize.Maximum);
             }
 
-            this.lastChunkSize = (int) numericUpDown_chunkSize.Value;
+            this.lastChunkSize = (int) this.numericUpDown_chunkSize.Value;
         }
 
         private void CudaActionsForm_Load(Object? sender, EventArgs e)

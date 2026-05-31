@@ -8,6 +8,7 @@ using System.Threading;
 using Microsoft.VisualBasic.FileIO;
 using LAWS.Voices.OpenVino.Processors;
 using LAWS.Voices.Cuda13;
+using LAWS.Voices.Multimodal.Audio.Processors;
 
 namespace LAWS.Voices.Forms
 {
@@ -79,6 +80,25 @@ namespace LAWS.Voices.Forms
             // no persistent merged list required; we build ordered list on selection
             this.Load += this.WindowMain_Load;
 
+        }
+
+        // Helper: show exception dialog with option to copy full exception text to clipboard
+        private void ShowExceptionWithCopy(Exception ex, string title)
+        {
+            try
+            {
+                string text = ex.ToString() ?? ex.Message;
+                string msg = text + "\r\n\r\nCopy to Clipboard?";
+                var dr = MessageBox.Show(msg, title, MessageBoxButtons.YesNo, MessageBoxIcon.Error);
+                if (dr == DialogResult.Yes)
+                {
+                    try { Clipboard.SetText(text); } catch { }
+                }
+            }
+            catch
+            {
+                try { MessageBox.Show(ex.ToString(), title, MessageBoxButtons.OK, MessageBoxIcon.Error); } catch { }
+            }
         }
 
         private static float Clamp(float v, float lo, float hi) => v < lo ? lo : (v > hi ? hi : v);
@@ -1052,7 +1072,7 @@ namespace LAWS.Voices.Forms
                         catch (Exception ex)
                         {
                             StaticLogger.Log(ex);
-                            this.BeginInvoke(new Action(() => MessageBox.Show(ex.ToString(), "Error during audio inference execution loop", MessageBoxButtons.OK, MessageBoxIcon.Error)));
+                            this.BeginInvoke(new Action(() => this.ShowExceptionWithCopy(ex, "Error during audio inference execution loop")));
                         }
                     }, cancellationToken);
 
@@ -1274,7 +1294,7 @@ namespace LAWS.Voices.Forms
                                         {
                                             try
                                             {
-                                                var viz = new ResultVisualizerForm(bmp, reportText);
+                                                var viz = new ResultVisualizerForm(bmp, reportText, extracted?.GazeVector);
                                                 viz.Show(this);
                                             }
                                             catch (Exception ex) { StaticLogger.Log("Failed to show visualizer: " + ex.Message); }
@@ -1292,7 +1312,7 @@ namespace LAWS.Voices.Forms
                         catch (Exception ex)
                         {
                             StaticLogger.Log(ex);
-                            this.BeginInvoke(new Action(() => MessageBox.Show(ex.ToString(), "Error during vision engine execution")));
+                            this.BeginInvoke(new Action(() => this.ShowExceptionWithCopy(ex, "Error during vision engine execution")));
                         }
                     });
 
@@ -1462,6 +1482,20 @@ namespace LAWS.Voices.Forms
                         var raw = this.lastInferenceTensorRaw;
                         int N = raw.Length;
 
+                        // Special-case: gaze-estimation models commonly emit a simple 3-element gaze vector [x,y,z]
+                        // If the active model id indicates gaze-estimation or the raw tensor length is exactly 3,
+                        // populate the ExtractionResult.GazeVector for downstream UI presentation.
+                        try
+                        {
+                            var mid = model?.Id ?? string.Empty;
+                            if ((N >= 3) && (mid.IndexOf("gaze", StringComparison.OrdinalIgnoreCase) >= 0 || N == 3))
+                            {
+                                er.GazeVector = new LAWS.Voices.OpenVino.Vector3D { X = raw[0], Y = raw[1], Z = raw[2] };
+                                StaticLogger.Log($"[Extract] Heuristic gaze vector found: X={raw[0]}, Y={raw[1]}, Z={raw[2]}");
+                            }
+                        }
+                        catch { }
+
                         // Heuristic 1: Scan for 2-element probability pairs (male, female) whose sum is ~1
                         for (int i = N - 2; i >= 0; i--)
                         {
@@ -1576,10 +1610,47 @@ namespace LAWS.Voices.Forms
                     foreach (var kv in er.RawSummaries) sb.AppendLine($" - {kv.Key}: {System.Text.Json.JsonSerializer.Serialize(kv.Value)}");
                 }
 
+                // Include gaze vector in summary if present
+                if (er.GazeVector != null)
+                {
+                    sb.AppendLine($"Gaze Vector: X={er.GazeVector.X:F4}, Y={er.GazeVector.Y:F4}, Z={er.GazeVector.Z:F4}");
+                }
+
                 var text = sb.ToString();
                 if (string.IsNullOrWhiteSpace(text)) text = "<no concise fields extracted>";
 
                 this.BeginInvoke(new Action(() => this.textBox_result.Text = text));
+
+                // If a gaze vector was found, prefer opening the visualizer with the current image and gaze overlay
+                if (er.GazeVector != null)
+                {
+                    try
+                    {
+                        // Resolve visual image: prefer selected resource, fallback to current preview
+                        ImageObj? imgObj = null;
+                        if (resourceIdx >= 0 && resourceIdx < orderedResources.Length && orderedResources[resourceIdx] is ImageObj selImg)
+                        {
+                            imgObj = selImg;
+                        }
+                        else
+                        {
+                            imgObj = WindowMain.currentPreviewResource as ImageObj;
+                        }
+
+                        if (imgObj != null && imgObj.Img != null)
+                        {
+                            Bitmap copyBmp = new Bitmap(imgObj.Img);
+                            var viz = new ResultVisualizerForm(copyBmp, text, er.GazeVector);
+                            viz.Show(this);
+                            return;
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        StaticLogger.Log("Failed to open visualizer for gaze vector: " + ex.Message);
+                        // fall-through to copy dialog if visualizer fails
+                    }
+                }
 
                 var dr = MessageBox.Show(text + Environment.NewLine + Environment.NewLine + "Copy to clipboard?", "Extracted Results", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
                 if (dr == DialogResult.Yes)
@@ -1926,6 +1997,170 @@ namespace LAWS.Voices.Forms
             int newScrollXa = (int) (rxa * this.pictureBox_view.Width - clientPos.X);
             int currentScrollY = -this.panel_view.AutoScrollPosition.Y;
             this.panel_view.AutoScrollPosition = new Point(newScrollXa, currentScrollY);
+        }
+
+        private async void button_fingerprinting_Click(object sender, EventArgs e)
+        {
+            try
+            {
+                // If CTRL is held, open OFD to select an audio file for fingerprinting
+                AudioObj? aud = null;
+                if ((Control.ModifierKeys & Keys.Control) != 0)
+                {
+                    // Start live microphone recording. Recording runs until user dismisses the prompt.
+                    AudioObj? recorded = null;
+                    try
+                    {
+                        // Start recording in background
+                        var recordTask = this.Audios.RecordAudioAsync();
+
+                        // Inform user how to stop recording
+                        var dr = MessageBox.Show(this, "Recording from default microphone. Click OK to stop recording and continue fingerprinting.", "Live Fingerprinting - Recording", MessageBoxButtons.OKCancel, MessageBoxIcon.Information);
+                        // If user cancelled, stop recording
+                        try { this.Audios.StopRecording(); } catch { }
+
+                        try
+                        {
+                            recorded = await recordTask;
+                        }
+                        catch (Exception ex)
+                        {
+                            StaticLogger.Log("Recording task failed: " + ex.Message);
+                            recorded = null;
+                        }
+
+                        if (recorded == null)
+                        {
+                            MessageBox.Show("No recording was captured or recording failed.", "Fingerprinting", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                            return;
+                        }
+
+                        // Add recorded audio to collection so it's visible and manageable
+                        this.Audios.AddAudio(recorded);
+                        this.numericUpDown_resourceId_SetMaximum();
+                        try { this.numericUpDown_resourceId.Value = this.numericUpDown_resourceId.Maximum; } catch { }
+
+                        aud = recorded;
+                    }
+                    catch (Exception ex)
+                    {
+                        StaticLogger.Log("Live recording for fingerprinting failed: " + ex.Message);
+                        MessageBox.Show("Live recording failed: " + ex.Message, "Fingerprinting", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                        return;
+                    }
+                }
+                else
+                {
+                    // Resolve selected resource similarly to other handlers
+                    var ordered = this.Images.ImagesBindingList.Cast<object>().Concat(this.Audios.Audios.Cast<object>())
+                        .OrderBy(r => r is ImageObj i ? i.CreatedAt : ((AudioObj) r).CreatedAt).ToArray();
+
+                    int index = (int) this.numericUpDown_resourceId.Value - 1;
+                    if (index >= 0 && index < ordered.Length && ordered[index] is AudioObj selAud)
+                    {
+                        aud = selAud;
+                    }
+                    else
+                    {
+                        aud = WindowMain.currentPreviewResource as AudioObj;
+                    }
+
+                    if (aud == null)
+                    {
+                        MessageBox.Show("No audio resource selected for fingerprinting.", "Fingerprinting", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                        return;
+                    }
+                }
+
+                // Prepare cancellation and progress reporting
+                using var cts = new CancellationTokenSource();
+                var progress = new Progress<double>(p =>
+                {
+                    try
+                    {
+                        if (this.progressBar_inferenceSteps.InvokeRequired)
+                        {
+                            this.progressBar_inferenceSteps.BeginInvoke(new Action(() =>
+                            {
+                                this.progressBar_inferenceSteps.Style = ProgressBarStyle.Continuous;
+                                this.progressBar_inferenceSteps.Minimum = 0;
+                                this.progressBar_inferenceSteps.Maximum = 100;
+                                this.progressBar_inferenceSteps.Value = Math.Clamp((int) (p * 100.0), 0, 100);
+                                this.progressBar_inferenceSteps.Visible = true;
+                            }));
+                        }
+                        else
+                        {
+                            this.progressBar_inferenceSteps.Style = ProgressBarStyle.Continuous;
+                            this.progressBar_inferenceSteps.Minimum = 0;
+                            this.progressBar_inferenceSteps.Maximum = 100;
+                            this.progressBar_inferenceSteps.Value = Math.Clamp((int) (p * 100.0), 0, 100);
+                            this.progressBar_inferenceSteps.Visible = true;
+                        }
+                    }
+                    catch { }
+                });
+
+                // Disable button while running to avoid re-entry
+                this.button_fingerprinting.Enabled = false;
+                var originalText = this.button_fingerprinting.Text;
+                this.button_fingerprinting.Text = "Fingerprinting...";
+
+                try
+                {
+                    // Instantiate processor (prefer file path if available)
+                    string? path = null;
+                    try { path = aud.FilePath; } catch { path = null; }
+
+                    var processor = new FingerprintingProcessor(path, progress, cts.Token);
+
+                    await Task.Run(async () => await processor.ProcessAudioObjectAsync(aud), cts.Token);
+
+                    // Offer to dump fingerprints to disk
+                    try
+                    {
+                        var sfd = new SaveFileDialog
+                        {
+                            Filter = "CSV files (*.csv)|*.csv|All files (*.*)|*.*",
+                            FileName = (aud.Name ?? "audio") + "_fingerprints.csv",
+                            DefaultExt = "csv"
+                        };
+                        if (sfd.ShowDialog(this) == DialogResult.OK)
+                        {
+                            processor.DumpFingerprintsToDisk(sfd.FileName);
+                            MessageBox.Show($"Fingerprints saved to: {sfd.FileName}", "Fingerprinting", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                        }
+                        else
+                        {
+                            MessageBox.Show("Fingerprinting completed.", "Fingerprinting", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        StaticLogger.Log("Failed to persist fingerprint output: " + ex.Message);
+                        MessageBox.Show("Fingerprinting completed but saving failed: " + ex.Message, "Fingerprinting", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    }
+                }
+                catch (OperationCanceledException)
+                {
+                    MessageBox.Show("Fingerprinting cancelled.", "Fingerprinting", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                }
+                catch (Exception ex)
+                {
+                    StaticLogger.Log("Fingerprinting error: " + ex.Message);
+                    MessageBox.Show("Fingerprinting failed: " + ex.Message, "Fingerprinting", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                }
+                finally
+                {
+                    this.button_fingerprinting.Text = originalText;
+                    this.button_fingerprinting.Enabled = true;
+                    try { this.progressBar_inferenceSteps.Visible = false; } catch { }
+                }
+            }
+            catch (Exception ex)
+            {
+                StaticLogger.Log("Unhandled fingerprinting handler error: " + ex.Message);
+            }
         }
 
         private void pictureBox_view_Paint(object? sender, PaintEventArgs e)

@@ -426,7 +426,7 @@ namespace LAWS.Voices.OpenVino.Processors
         /// </summary>
         /// <param name="microEvents">The raw flat list of events returned from ExtractActivityTimeline.</param>
         /// <param name="maxPauseSeconds">The maximum gap of padding allowed before a song sequence is considered terminated.</param>
-        public static List<BirdSongBlock> ClusterEventsIntoSongs(List<BirdActivityEvent> microEvents, double maxPauseSeconds = 1.2)
+        public static List<BirdSongBlock> ClusterEventsIntoSongs(List<BirdActivityEvent> microEvents, double maxPauseSeconds = 1.2, double maxSongSeconds = 1.0)
         {
             var songs = new List<BirdSongBlock>();
             if (microEvents == null || microEvents.Count == 0)
@@ -447,8 +447,18 @@ namespace LAWS.Voices.OpenVino.Processors
                     continue;
                 }
 
+                var firstEvent = currentChunk[0];
                 var lastEvent = currentChunk[^1];
                 double deltaSeconds = (currentEvent.Timestamp - lastEvent.Timestamp).TotalSeconds;
+                double prospectiveDuration = (currentEvent.Timestamp - firstEvent.Timestamp).TotalSeconds;
+
+                // If adding this event would exceed the maximum allowed song length, finalize current and start new
+                if (prospectiveDuration > maxSongSeconds)
+                {
+                    songs.Add(FinalizeSongBlock(currentChunk));
+                    currentChunk = new List<BirdActivityEvent> { currentEvent };
+                    continue;
+                }
 
                 if (deltaSeconds <= maxPauseSeconds)
                 {
@@ -459,7 +469,7 @@ namespace LAWS.Voices.OpenVino.Processors
                 {
                     // Gap threshold exceeded. Close out the active song node and start a fresh sequence
                     songs.Add(FinalizeSongBlock(currentChunk));
-                    currentChunk = [currentEvent];
+                    currentChunk = new List<BirdActivityEvent> { currentEvent };
                 }
             }
 

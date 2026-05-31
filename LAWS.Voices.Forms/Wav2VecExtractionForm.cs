@@ -26,7 +26,7 @@ namespace LAWS.Voices.Forms
             this.reportText = report ?? string.Empty;
             this.sourceAudio = audio;
             this.songBlocks = songs ?? [];
-            InitializeComponent();
+            this.InitializeComponent();
         }
 
         private void InitializeComponent()
@@ -59,7 +59,7 @@ namespace LAWS.Voices.Forms
             this.btnExportZip.Width = 110;
             this.btnExportZip.Left = this.btnCopy.Right + 8;
             this.btnExportZip.Top = 8;
-            this.btnExportZip.Click += BtnExportZip_Click;
+            this.btnExportZip.Click += this.BtnExportZip_Click;
 
             this.btnClose = new Button();
             this.btnClose.Text = "Close";

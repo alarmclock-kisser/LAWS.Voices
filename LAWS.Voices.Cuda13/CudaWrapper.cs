@@ -2,6 +2,8 @@
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Numerics;
+using System.Collections.Concurrent;
+using System.Threading;
 using System.Text;
 using AsynCUDA12.Runtime;
 using System.Linq;
@@ -11,6 +13,9 @@ namespace LAWS.Voices.Cuda13
 {
     public class CudaWrapper
     {
+        private readonly ConcurrentDictionary<CudaService, SemaphoreSlim> _serviceLocks = new();
+        private readonly ConcurrentDictionary<CudaService, BlockingCollection<Action>> _serviceQueues = new();
+        private readonly ConcurrentDictionary<CudaService, Task> _serviceWorkers = new();
         public readonly List<CudaService> Services = [];
         public static readonly BindingList<string> Logs = CudaLogger.LogMessages;
         public CudaCompiler? Compiler => this.Services.FirstOrDefault()?.Compiler;
@@ -111,88 +116,85 @@ namespace LAWS.Voices.Cuda13
                         object? pushedObj = null;
                         try
                         {
-                            pushedObj = await service.PushChunksAsync(batch);
-                            dynamic? dyn = pushedObj;
-                            IntPtr ptr = dyn?.IndexPointer ?? IntPtr.Zero;
-                            CudaLogger.Log($"[FFT] Device {service.SelectedDeviceId}: push returned ptr=0x{ptr.ToString("X")} ");
-
-                            if (ptr == IntPtr.Zero)
+                            // Ensure a dedicated worker thread exists for this service so all CUDA ops run on the same thread/context
+                            var q = this._serviceQueues.GetOrAdd(service, _ => new BlockingCollection<Action>(new ConcurrentQueue<Action>()));
+                            this._serviceWorkers.GetOrAdd(service, svc => Task.Factory.StartNew(() =>
                             {
-                                CudaLogger.Log($"[FFT] Device {service.SelectedDeviceId}: push returned null pointer for batch start {bStart}, skipping batch.");
-                                continue;
-                            }
-
-                            IntPtr resultPtr = await service.Fourier.PerformFftAsync(ptr, false);
-                            CudaLogger.Log($"[FFT] Device {service.SelectedDeviceId}: PerformFftAsync returned ptr=0x{resultPtr.ToString("X")} for batch start {bStart}");
-
-                            if (resultPtr == IntPtr.Zero) continue;
-
-                            // cuFFT returns interleaved floats (float2). Do not try to Pull<Complex> (uses double) first
-                            CudaLogger.Log($"[FFT] Device {service.SelectedDeviceId}: attempting Pull<float2> for batch start {bStart}");
-                            try
-                            {
-                                var pulledFloat2 = await service.PullChunksAsync<float2>(resultPtr);
-                                if (pulledFloat2 != null)
+                                foreach (var act in q.GetConsumingEnumerable())
                                 {
-                                    foreach (var f2Chunk in pulledFloat2)
-                                    {
-                                        if (f2Chunk == null)
-                                        {
-                                            results.Add(Array.Empty<Complex>());
-                                            continue;
-                                        }
-
-                                        int len = f2Chunk.Length;
-                                        var cchunk = new Complex[len];
-                                        for (int i = 0; i < len; i++)
-                                        {
-                                            var val = f2Chunk[i];
-                                            // float2 has X and Y fields
-                                            float re = val.x;
-                                            float im = val.y;
-                                            cchunk[i] = new Complex(re, im);
-                                        }
-                                        results.Add(cchunk);
-                                    }
-                                    continue;
+                                    try { act(); } catch (Exception ex) { CudaLogger.Log($"[Worker] Device {svc.SelectedDeviceId}: worker action exception: {ex.Message}"); }
                                 }
-                            }
-                            catch (Exception ex)
-                            {
-                                CudaLogger.Log($"[FFT] Device {service.SelectedDeviceId}: Pull<float2> attempt failed: {ex.Message}");
-                            }
+                            }, TaskCreationOptions.LongRunning));
 
-                            CudaLogger.Log($"[FFT] Device {service.SelectedDeviceId}: Pull<float2> returned null for batch start {bStart}, trying float fallback");
-                            var pulledFloats = await service.PullChunksAsync<float>(resultPtr);
-                            if (pulledFloats == null)
+                            // Use a TaskCompletionSource to get result from worker
+                            var tcs = new TaskCompletionSource<List<Complex[]>>();
+                            q.Add(() =>
                             {
-                                CudaLogger.Log($"[FFT] Device {service.SelectedDeviceId}: Pull<float> also returned null for batch start {bStart}");
-                                continue;
-                            }
-
-                            try
-                            {
-                                foreach (var floatChunk in pulledFloats)
+                                try
                                 {
-                                    if (floatChunk == null)
+                                    var localResults = new List<Complex[]>();
+                                    var pushed = service.PushChunksAsync(batch).GetAwaiter().GetResult();
+                                    dynamic? dyn = pushed;
+                                    IntPtr ptr = dyn?.IndexPointer ?? IntPtr.Zero;
+                                    CudaLogger.Log($"[FFT] Device {service.SelectedDeviceId}: push returned ptr=0x{ptr.ToString("X")} ");
+
+                                    if (ptr != IntPtr.Zero)
                                     {
-                                        results.Add(Array.Empty<Complex>());
-                                        continue;
+                                        IntPtr resultPtr = service.Fourier.PerformFftAsync(ptr, false).GetAwaiter().GetResult();
+                                        CudaLogger.Log($"[FFT] Device {service.SelectedDeviceId}: PerformFftAsync returned ptr=0x{resultPtr.ToString("X")} for batch start {bStart}");
+
+                                        if (resultPtr != IntPtr.Zero)
+                                        {
+                                            try
+                                            {
+                                                var pulledFloat2 = service.PullChunksAsync<float2>(resultPtr).GetAwaiter().GetResult();
+                                                if (pulledFloat2 != null)
+                                                {
+                                                    foreach (var f2Chunk in pulledFloat2)
+                                                    {
+                                                        if (f2Chunk == null) { localResults.Add(Array.Empty<Complex>()); continue; }
+                                                        int len = f2Chunk.Length;
+                                                        var cchunk = new Complex[len];
+                                                        for (int i = 0; i < len; i++) { var v = f2Chunk[i]; cchunk[i] = new Complex(v.x, v.y); }
+                                                        localResults.Add(cchunk);
+                                                    }
+                                                }
+                                                else
+                                                {
+                                                    var pulledFloats = service.PullChunksAsync<float>(resultPtr).GetAwaiter().GetResult();
+                                                    if (pulledFloats != null)
+                                                    {
+                                                        foreach (var floatChunk in pulledFloats)
+                                                        {
+                                                            if (floatChunk == null) { localResults.Add(Array.Empty<Complex>()); continue; }
+                                                            int len = floatChunk.Length / 2;
+                                                            var cchunk = new Complex[len];
+                                                            for (int i = 0; i < len; i++) { float re = floatChunk.Length > 2 * i ? floatChunk[2 * i] : 0f; float im = floatChunk.Length > 2 * i + 1 ? floatChunk[2 * i + 1] : 0f; cchunk[i] = new Complex(re, im); }
+                                                            localResults.Add(cchunk);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            catch (Exception ex)
+                                            {
+                                                CudaLogger.Log($"[FFT] Device {service.SelectedDeviceId}: Pull attempt failed: {ex.Message}");
+                                            }
+                                        }
                                     }
-                                    int len = floatChunk.Length / 2;
-                                    var cchunk = new Complex[len];
-                                    for (int i = 0; i < len; i++)
-                                    {
-                                        float re = floatChunk.Length > 2 * i ? floatChunk[2 * i] : 0f;
-                                        float im = floatChunk.Length > 2 * i + 1 ? floatChunk[2 * i + 1] : 0f;
-                                        cchunk[i] = new Complex(re, im);
-                                    }
-                                    results.Add(cchunk);
+
+                                    if (pushed is IDisposable d) { try { d.Dispose(); } catch { } }
+                                    tcs.SetResult(localResults);
                                 }
-                            }
-                            catch (Exception ex)
+                                catch (Exception ex)
+                                {
+                                    tcs.SetException(ex);
+                                }
+                            });
+
+                            var batchResults = await tcs.Task;
+                            if (batchResults != null)
                             {
-                                CudaLogger.Log($"[FFT] Device {service.SelectedDeviceId}: failed to convert pulled floats to Complex: {ex.Message}");
+                                results.AddRange(batchResults);
                             }
                         }
                         finally
@@ -266,31 +268,49 @@ namespace LAWS.Voices.Cuda13
                         object? pushedObj = null;
                         try
                         {
-                            pushedObj = await service.PushChunksAsync(batch);
-                            dynamic? dyn = pushedObj;
-                            IntPtr ptr = dyn?.IndexPointer ?? IntPtr.Zero;
-                            CudaLogger.Log($"[IFFT] Device {service.SelectedDeviceId}: push returned ptr=0x{ptr.ToString("X")} ");
-
-                            if (ptr == IntPtr.Zero)
+                            var q = this._serviceQueues.GetOrAdd(service, _ => new BlockingCollection<Action>(new ConcurrentQueue<Action>()));
+                            this._serviceWorkers.GetOrAdd(service, svc => Task.Factory.StartNew(() =>
                             {
-                                CudaLogger.Log($"[IFFT] Device {service.SelectedDeviceId}: push returned null pointer for batch start {bStart}, skipping batch.");
-                                continue;
-                            }
+                                foreach (var act in q.GetConsumingEnumerable())
+                                {
+                                    try { act(); } catch (Exception ex) { CudaLogger.Log($"[Worker] Device {svc.SelectedDeviceId}: worker action exception: {ex.Message}"); }
+                                }
+                            }, TaskCreationOptions.LongRunning));
 
-                            IntPtr resultPtr = await service.Fourier.PerformIfftAsync(ptr);
-                            CudaLogger.Log($"[IFFT] Device {service.SelectedDeviceId}: PerformIfftAsync returned ptr=0x{resultPtr.ToString("X")} for batch start {bStart}");
-
-                            if (resultPtr == IntPtr.Zero) continue;
-
-                            var pulled = await service.PullChunksAsync<float>(resultPtr);
-                            if (pulled != null)
+                            var tcs = new TaskCompletionSource<List<float[]>>();
+                            q.Add(() =>
                             {
-                                results.AddRange(pulled);
-                            }
-                            else
-                            {
-                                CudaLogger.Log($"[IFFT] Device {service.SelectedDeviceId}: Pull<float> returned null for batch start {bStart}");
-                            }
+                                try
+                                {
+                                    var local = new List<float[]>();
+                                    var pushed = service.PushChunksAsync(batch).GetAwaiter().GetResult();
+                                    dynamic? dyn = pushed;
+                                    IntPtr ptr = dyn?.IndexPointer ?? IntPtr.Zero;
+                                    CudaLogger.Log($"[IFFT] Device {service.SelectedDeviceId}: push returned ptr=0x{ptr.ToString("X")} ");
+
+                                    if (ptr != IntPtr.Zero)
+                                    {
+                                        IntPtr resultPtr = service.Fourier.PerformIfftAsync(ptr).GetAwaiter().GetResult();
+                                        CudaLogger.Log($"[IFFT] Device {service.SelectedDeviceId}: PerformIfftAsync returned ptr=0x{resultPtr.ToString("X")} for batch start {bStart}");
+
+                                        if (resultPtr != IntPtr.Zero)
+                                        {
+                                            var pulled = service.PullChunksAsync<float>(resultPtr).GetAwaiter().GetResult();
+                                            if (pulled != null) local.AddRange(pulled);
+                                        }
+                                    }
+
+                                    if (pushed is IDisposable d) { try { d.Dispose(); } catch { } }
+                                    tcs.SetResult(local);
+                                }
+                                catch (Exception ex)
+                                {
+                                    tcs.SetException(ex);
+                                }
+                            });
+
+                            var batchResults = await tcs.Task;
+                            if (batchResults != null) results.AddRange(batchResults);
                         }
                         finally
                         {

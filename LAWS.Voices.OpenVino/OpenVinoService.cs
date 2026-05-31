@@ -1644,6 +1644,164 @@ namespace LAWS.Voices.OpenVino
 
                 if (inputTensor == null)
                 {
+                    // Attempt multi-input path: many vision models (gaze-estimation) expose multiple input tensors
+                    // e.g., left eye, right eye and head pose vector. Try to locate all input tensors and populate them
+                    // by resizing the provided full-frame planar RGB image into each tensor's expected spatial dimensions
+                    try
+                    {
+                        // Discover input tensor accessors returning collections
+                        Tensor[]? inputTensors = null;
+                        var ir = this.InferRequest;
+                        var irType = ir.GetType();
+                        var candMethods = irType.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
+                            .Where(m => m.GetParameters().Length == 0 && (m.Name.IndexOf("input", StringComparison.OrdinalIgnoreCase) >= 0 || m.Name.IndexOf("inputs", StringComparison.OrdinalIgnoreCase) >= 0))
+                            .ToArray();
+
+                        foreach (var m in candMethods)
+                        {
+                            try
+                            {
+                                var r = m.Invoke(ir, null);
+                                if (r is Tensor[] arr && arr.Length > 0)
+                                {
+                                    inputTensors = arr;
+                                    break;
+                                }
+                                if (r is System.Collections.IEnumerable e)
+                                {
+                                    var list = new List<Tensor>();
+                                    foreach (var it in e)
+                                    {
+                                        if (it is Tensor t) list.Add(t);
+                                    }
+                                    if (list.Count > 0) { inputTensors = list.ToArray(); break; }
+                                }
+                            }
+                            catch { }
+                        }
+
+                        // Fallback: probe indexed get_input_tensor(i)
+                        if (inputTensors == null)
+                        {
+                            var list = new List<Tensor>();
+                            for (ulong i = 0; i < 8; i++)
+                            {
+                                try
+                                {
+                                    var t = ir.get_input_tensor(i);
+                                    if (t != null) list.Add(t);
+                                }
+                                catch { break; }
+                            }
+                            if (list.Count > 0) inputTensors = list.ToArray();
+                        }
+
+                        if (inputTensors != null && inputTensors.Length > 0)
+                        {
+                            // For each input tensor, determine its expected shape and fill appropriately
+                            for (int ti = 0; ti < inputTensors.Length; ti++)
+                            {
+                                var t = inputTensors[ti];
+                                // Derive shape dims
+                                long[] shapeArr = Array.Empty<long>();
+                                try
+                                {
+                                    var tShapeObj = (object) t.shape;
+                                    if (tShapeObj is System.Collections.IEnumerable tEnumShape)
+                                    {
+                                        var dims = new List<long>();
+                                        foreach (var it in tEnumShape) dims.Add(Convert.ToInt64(it));
+                                        shapeArr = dims.ToArray();
+                                    }
+                                    else
+                                    {
+                                        var st = tShapeObj.GetType();
+                                        var getDims = st.GetMethod("get_dims", Type.EmptyTypes);
+                                        if (getDims != null) shapeArr = (long[]?) getDims.Invoke(tShapeObj, null) ?? Array.Empty<long>();
+                                    }
+                                }
+                                catch { }
+
+                                // If tensor looks like a small vector (e.g., head pose 3 elements), fill zeros
+                                if (shapeArr.Length >= 1 && (shapeArr.All(d => d <= 3) || t.size <= 16))
+                                {
+                                    // Prepare a small float vector (zeros)
+                                    int len = (int) Math.Max(1L, Math.Min(16L, Convert.ToInt64(t.size)));
+                                    var small = new float[len];
+                                    try { t.set_data(small); } catch { OpenVinoService.OpenVinoModelRunner.SetTensorSafely(t, small, shapeArr.Length > 0 ? shapeArr : new long[] { len }); }
+                                    continue;
+                                }
+
+                                // If tensor appears spatial (rank >=3 or size large), resize the provided image
+                                // Expecting typical layout [1,C,H,W] or [1,C,T,H,W]
+                                long channelsLong = Convert.ToInt64(channels);
+                                long heightLong = Convert.ToInt64(height);
+                                long widthLong = Convert.ToInt64(width);
+                                int targetC = (int) Math.Max(1L, shapeArr.Length > 1 ? shapeArr[1] : channelsLong);
+                                int targetH = (int) (shapeArr.Length > 2 ? shapeArr[2] : heightLong);
+                                int targetW = (int) (shapeArr.Length > 3 ? shapeArr[3] : widthLong);
+
+                                // Normalize fallback
+                                if (targetH <= 0) targetH = (int) height;
+                                if (targetW <= 0) targetW = (int) width;
+
+                                var resized = ResizePlanarNearest(rgbChannelsData, (int) channels, (int) width, (int) height, targetW, targetH);
+                                // If channel counts differ, expand/repeat as existing logic
+                                if (targetC != (int) channels)
+                                {
+                                    var plane = targetH * targetW;
+                                    var expanded = new float[targetC * plane];
+                                    for (int c = 0; c < targetC; c++)
+                                    {
+                                        int destOff = c * plane;
+                                        int srcC = c < (int)channels ? c : (int) channels - 1;
+                                        int srcOff = srcC * plane;
+                                        if (resized.Length >= srcOff + plane)
+                                            Array.Copy(resized, srcOff, expanded, destOff, plane);
+                                    }
+                                    resized = expanded;
+                                }
+
+                                long[] targetShape;
+                                if (shapeArr.Length >= 4)
+                                    targetShape = new long[] { 1, targetC, targetH, targetW };
+                                else if (shapeArr.Length == 3)
+                                    targetShape = new long[] { 1, targetC, targetH * targetW };
+                                else
+                                    targetShape = new long[] { 1, targetC, targetH, targetW };
+
+                                try
+                                {
+                                    var setMethod = typeof(OpenVinoService.OpenVinoModelRunner).GetMethod("SetTensorSafely", BindingFlags.NonPublic | BindingFlags.Static);
+                                    if (setMethod != null)
+                                    {
+                                        setMethod.Invoke(null, new object[] { t, resized, targetShape });
+                                    }
+                                    else
+                                    {
+                                        t.set_data(resized);
+                                    }
+                                }
+                                catch (TargetInvocationException tie) { throw tie.InnerException ?? tie; }
+                            }
+
+                            // All input tensors populated, run inference
+                            this.InferRequest.infer();
+                            var outs = this.FetchOutputTensors();
+                            if (outs == null || outs.Length == 0) throw new InvalidOperationException("Model produced no outputs.");
+                            if (outs.Length == 1) return outs[0].get_data<float>((int) outs[0].size);
+                            int total = outs.Sum(t => (int) t.size);
+                            var result = new float[total]; int pos = 0;
+                            foreach (var outT in outs) { var data = outT.get_data<float>((int) outT.size); Array.Copy(data, 0, result, pos, data.Length); pos += data.Length; }
+                            return result;
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        // fall through to original single-input error path with diagnostic
+                        StaticLogger.Log("Multi-input inference attempt failed: " + ex.Message);
+                    }
+
                     throw new InvalidOperationException("Could not locate a single input tensor for this image topology.");
                 }
 

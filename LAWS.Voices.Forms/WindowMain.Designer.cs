@@ -56,6 +56,7 @@
             this.button_saveJson = new Button();
             this.button_saveTxt = new Button();
             this.button_openCuda = new Button();
+            this.button_fingerprinting = new Button();
             this.panel_view.SuspendLayout();
             ((System.ComponentModel.ISupportInitialize) this.pictureBox_view).BeginInit();
             this.contextMenuStrip_result.SuspendLayout();
@@ -318,11 +319,23 @@
             this.button_openCuda.UseVisualStyleBackColor = false;
             this.button_openCuda.Click += this.button_openCuda_Click;
             // 
+            // button_fingerprinting
+            // 
+            this.button_fingerprinting.BackColor = Color.FromArgb(  192,   192,   255);
+            this.button_fingerprinting.Location = new Point(570, 319);
+            this.button_fingerprinting.Name = "button_fingerprinting";
+            this.button_fingerprinting.Size = new Size(122, 23);
+            this.button_fingerprinting.TabIndex = 20;
+            this.button_fingerprinting.Text = "Fingerprinting";
+            this.button_fingerprinting.UseVisualStyleBackColor = false;
+            this.button_fingerprinting.Click += this.button_fingerprinting_Click;
+            // 
             // WindowMain
             // 
             this.AutoScaleDimensions = new SizeF(7F, 15F);
             this.AutoScaleMode = AutoScaleMode.Font;
             this.ClientSize = new Size(704, 581);
+            this.Controls.Add(this.button_fingerprinting);
             this.Controls.Add(this.button_openCuda);
             this.Controls.Add(this.button_saveTxt);
             this.Controls.Add(this.button_saveJson);
@@ -385,5 +398,6 @@
         private ToolStripMenuItem loadResultFromTXTToolStripMenuItem;
         private Button button_openCuda;
         private ToolStripMenuItem toggleCollapseExpandLogToolStripMenuItem;
+        private Button button_fingerprinting;
     }
 }

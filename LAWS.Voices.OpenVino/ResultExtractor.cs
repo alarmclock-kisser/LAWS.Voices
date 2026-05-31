@@ -39,21 +39,21 @@ namespace LAWS.Voices.OpenVino
         public override string ToString()
         {
             var sb = new System.Text.StringBuilder();
-            sb.AppendLine($"=================[ Model: {ModelIdentity} ]=================");
-            if (Age.HasValue) sb.AppendLine($" -> Age: {Age.Value:F1} years old (Conf: {AgeConfidence:P1})");
-            if (GenderIndex.HasValue) sb.AppendLine($" -> Gender: {(GenderIndex == 0 ? "Male" : "Female")} (M: {MaleProbability:P1} / F: {FemaleProbability:P1})");
-            if (!string.IsNullOrEmpty(DominantEmotion)) sb.AppendLine($" -> Emotion: {DominantEmotion}");
-            if (GazeVector != null) sb.AppendLine($" -> Gaze Vector: X={GazeVector.X:F3}, Y={GazeVector.Y:F3}, Z={GazeVector.Z:F3}");
-            if (Detections.Any()) sb.AppendLine($" -> Detections Count: {Detections.Count} (Top Score: {Detections.Max(d => d.Score):P1})");
-            if (KeyPoints.Any()) sb.AppendLine($" -> Structural Keypoints Extracted: {KeyPoints.Count}");
-            if (Segmentation != null) sb.AppendLine($" -> Segmentation Grid: {Segmentation.Width}x{Segmentation.Height} | Unique ClassIDs: {Segmentation.Pixels.Cast<int>().Distinct().Count()}");
-            if (AudioSignalOut != null) sb.AppendLine($" -> Generated Audio Buffer: {AudioSignalOut.Length} floating-point samples");
-            if (TimeSeriesForecast != null) sb.AppendLine($" -> Forecast Matrix: {TimeSeriesForecast.Length} horizons x {TimeSeriesForecast[0].Length} metrics");
+            sb.AppendLine($"=================[ Model: {this.ModelIdentity} ]=================");
+            if (this.Age.HasValue) sb.AppendLine($" -> Age: {this.Age.Value:F1} years old (Conf: {this.AgeConfidence:P1})");
+            if (this.GenderIndex.HasValue) sb.AppendLine($" -> Gender: {(this.GenderIndex == 0 ? "Male" : "Female")} (M: {this.MaleProbability:P1} / F: {this.FemaleProbability:P1})");
+            if (!string.IsNullOrEmpty(this.DominantEmotion)) sb.AppendLine($" -> Emotion: {this.DominantEmotion}");
+            if (this.GazeVector != null) sb.AppendLine($" -> Gaze Vector: X={this.GazeVector.X:F3}, Y={this.GazeVector.Y:F3}, Z={this.GazeVector.Z:F3}");
+            if (this.Detections.Any()) sb.AppendLine($" -> Detections Count: {this.Detections.Count} (Top Score: {this.Detections.Max(d => d.Score):P1})");
+            if (this.KeyPoints.Any()) sb.AppendLine($" -> Structural Keypoints Extracted: {this.KeyPoints.Count}");
+            if (this.Segmentation != null) sb.AppendLine($" -> Segmentation Grid: {this.Segmentation.Width}x{this.Segmentation.Height} | Unique ClassIDs: {this.Segmentation.Pixels.Cast<int>().Distinct().Count()}");
+            if (this.AudioSignalOut != null) sb.AppendLine($" -> Generated Audio Buffer: {this.AudioSignalOut.Length} floating-point samples");
+            if (this.TimeSeriesForecast != null) sb.AppendLine($" -> Forecast Matrix: {this.TimeSeriesForecast.Length} horizons x {this.TimeSeriesForecast[0].Length} metrics");
 
-            if (Classifications.Any())
+            if (this.Classifications.Any())
             {
                 sb.AppendLine(" -> Top Classifications:");
-                foreach (var cls in Classifications.Take(5))
+                foreach (var cls in this.Classifications.Take(5))
                     sb.AppendLine($"    * [{cls.Index}] {cls.Name ?? "Unknown"}: {cls.Confidence:P2}");
             }
             return sb.ToString();
