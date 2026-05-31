@@ -1020,18 +1020,76 @@ namespace LAWS.Voices.Forms
                                             {
                                                 var frames = afp.Frames ?? new System.Collections.Generic.List<LAWS.Voices.OpenVino.Processors.Wav2Vec2Processor.FrameAnalysisResult>();
                                                 var fps = new System.Collections.Generic.List<LAWS.Voices.Multimodal.Audio.Processors.FingerprintingProcessor.Fingerprint>();
-                                                int total = Math.Max(1, frames.Count);
-                                                for (int i = 0; i < frames.Count; i++)
+
+                                                // If there are no frames, skip. Otherwise, compute per-frame duration and merge consecutive frames
+                                                // with the same dominant token into variable-length segments so we don't cut continuous bird phrases.
+                                                if (frames.Count > 0)
                                                 {
-                                                    var fr = frames[i];
-                                                    var fp = new LAWS.Voices.Multimodal.Audio.Processors.FingerprintingProcessor.Fingerprint();
-                                                    try { fp.Timestamp = aud.CreatedAt.AddMilliseconds((aud.Duration.TotalMilliseconds * i) / (double) total); } catch { fp.Timestamp = DateTime.Now; }
-                                                    fp.DurationMs = (long) Math.Max(1, aud.Duration.TotalMilliseconds / total);
-                                                    fp.ToneCount = 1;
-                                                    fp.Features = new System.Collections.Concurrent.ConcurrentDictionary<string, float>();
-                                                    fp.Features["Confidence"] = (float) fr.Confidence;
-                                                    fp.Features["Entropy"] = (float) fr.Entropy;
-                                                    fps.Add(fp);
+                                                    double totalMs = Math.Max(1.0, aud.Duration.TotalMilliseconds);
+                                                    // Heuristic: Wav2Vec2 typical frame stride is ~20 ms.
+                                                    // If too few frames are reported, avoid over-inflated frame durations.
+                                                    int reportedFrames = Math.Max(1, frames.Count);
+                                                    int minExpectedFrames = (int) Math.Max(1, Math.Round(totalMs / 20.0));
+                                                    int effectiveFrames = Math.Max(reportedFrames, minExpectedFrames);
+                                                    double frameMs = totalMs / effectiveFrames;
+
+                                                    int segStart = 0;
+                                                    string curToken = frames[0].DominantToken ?? string.Empty;
+                                                    double accConf = frames[0].Confidence;
+                                                    int accCount = 1;
+
+                                                    // Merge frames into segments, but avoid merging across unknown tokens or very low confidence frames
+                                                    const double MinConfidenceToMerge = 0.35;
+                                                    for (int i = 1; i < frames.Count; i++)
+                                                    {
+                                                        var fr = frames[i];
+                                                        var token = fr.DominantToken ?? string.Empty;
+
+                                                        bool isUnknown = string.IsNullOrWhiteSpace(token) || token == "<unk>" || token == "[pad]";
+                                                        bool highConfidence = fr.Confidence >= MinConfidenceToMerge;
+
+                                                        // Only merge if token equals current AND the frame is reasonably confident
+                                                        if (!isUnknown && token == curToken && highConfidence)
+                                                        {
+                                                            accConf += fr.Confidence;
+                                                            accCount++;
+                                                            continue;
+                                                        }
+
+                                                        // finalize segment [segStart .. i-1]
+                                                        try
+                                                        {
+                                                            var fp = new LAWS.Voices.Multimodal.Audio.Processors.FingerprintingProcessor.Fingerprint();
+                                                            fp.Timestamp = aud.CreatedAt.AddMilliseconds(segStart * frameMs);
+                                                            fp.DurationMs = (long)Math.Max(1, Math.Round(accCount * frameMs));
+                                                            fp.ToneCount = 1;
+                                                            fp.Features = new System.Collections.Concurrent.ConcurrentDictionary<string, float>();
+                                                            fp.Features["Confidence"] = (float)(accConf / accCount);
+                                                            fp.Features["Entropy"] = (float)frames[segStart].Entropy;
+                                                            fps.Add(fp);
+                                                        }
+                                                        catch { }
+
+                                                        // start new segment at this frame if it's a valid token; otherwise start next valid token as a new segment
+                                                        segStart = i;
+                                                        curToken = isUnknown ? string.Empty : token;
+                                                        accConf = fr.Confidence;
+                                                        accCount = 1;
+                                                    }
+
+                                                    // finalize last segment
+                                                    try
+                                                    {
+                                                        var fp = new LAWS.Voices.Multimodal.Audio.Processors.FingerprintingProcessor.Fingerprint();
+                                                        fp.Timestamp = aud.CreatedAt.AddMilliseconds(segStart * frameMs);
+                                                        fp.DurationMs = (long) Math.Max(1, Math.Round(accCount * frameMs));
+                                                        fp.ToneCount = 1;
+                                                        fp.Features = new System.Collections.Concurrent.ConcurrentDictionary<string, float>();
+                                                        fp.Features["Confidence"] = (float)(accConf / accCount);
+                                                        fp.Features["Entropy"] = (float)frames[segStart].Entropy;
+                                                        fps.Add(fp);
+                                                    }
+                                                    catch { }
                                                 }
 
                                                 // show visualizer on UI thread

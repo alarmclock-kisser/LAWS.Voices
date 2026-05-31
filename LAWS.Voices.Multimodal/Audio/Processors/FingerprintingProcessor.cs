@@ -20,234 +20,351 @@ namespace LAWS.Voices.Multimodal.Audio.Processors
             public long DurationMs { get; set; } = 0;
             public int ToneCount { get; set; } = 0;
 
-            // Use ConcurrentDictionary for thread-safe updates in parallel processing
             public ConcurrentDictionary<string, float> Features { get; set; } = new ConcurrentDictionary<string, float>();
             public ConcurrentDictionary<Fingerprint, float> Deriverates { get; set; } = new ConcurrentDictionary<Fingerprint, float>();
+        }
+
+        private class SingerTrack
+        {
+            public Guid TrackId { get; } = Guid.NewGuid();
+            public List<Fingerprint> Nodes { get; } = new List<Fingerprint>();
+            public float CurrentDominantFreq { get; set; }
+            public int MissedFrames { get; set; } = 0;
+            public List<(int FrameIndex, float[] AudioFrame)> ActiveFrames { get; } = new List<(int, float[])>();
         }
 
         private readonly CancellationToken _cancellationToken;
         private readonly IProgress<double>? _progress;
         private readonly ConcurrentBag<Fingerprint> _memoryPool = new ConcurrentBag<Fingerprint>();
-        private const int ShortTermMemoryLimit = 50; // Maximum number of historical fingerprints to cross-reference
 
         public List<Fingerprint> CapturedFingerprints => this._memoryPool.OrderBy(f => f.Timestamp).ToList();
+        public List<AudioObj> IsolatedBirdSamples { get; } = new List<AudioObj>();
 
-        /// <summary>
-        /// Initializes the Fingerprinting Processor. 
-        /// Automatically maps processing path based on the input context parameters.
-        /// </summary>
+        private const int ShortTermMemoryLimit = 50;
+
+        // HARTE GRENZE: Wie viele Frames darf der Vogel schweigen, bevor der Satz zerschnitten wird?
+        // 35 Frames * ~23ms = ~800 Millisekunden Erholungs-Pause innerhalb eines Satzes erlaubt.
+        private const int TrackMaxSilenceFrames = 35;
+        private const float FrequencyTrackingTolerance = 400f; // Etwas strikter (400 Hz), um Vögel nicht zu vermischen
+
         public FingerprintingProcessor(string? audioFilePath = null, IProgress<double>? progress = null, CancellationToken cancellationToken = default)
         {
             this._cancellationToken = cancellationToken;
             this._progress = progress;
-
-            if (!string.IsNullOrEmpty(audioFilePath) && File.Exists(audioFilePath))
-            {
-                StaticLogger.Log($"[Fingerprinting] Initializing standalone file-based processing pipeline for: {Path.GetFileName(audioFilePath)}");
-                // Native background task dispatcher would execute file ingestion loop here
-            }
-            else
-            {
-                StaticLogger.Log("[Fingerprinting] No valid target file path provided. Initializing live microphone stream intercept listener loop...");
-                // Native background task dispatcher would bind to the loudest hardware channel line loop here
-            }
         }
 
-        /// <summary>
-        /// Orchestrates the bioacoustic feature extraction loop over a concrete AudioObj container.
-        /// Accounts for the dual-independent syrinx voice bands and maps long-term/short-term derivation patterns.
-        /// </summary>
         public async Task ProcessAudioObjectAsync(AudioObj audio)
         {
-            if (audio == null || audio.Data == null || audio.Data.Length == 0)
-            {
-                StaticLogger.Log("[Fingerprinting Error] Cannot execute fingerprinting matrix on an empty or null AudioObj reference context.");
-                return;
-            }
+            if (audio == null || audio.Data == null || audio.Data.Length == 0) return;
 
-            StaticLogger.Log($"[Fingerprinting Engine] Starting processing sweep for audio track: '{audio.Name}' ({audio.Duration:mm\\:ss\\.fff})");
+            StaticLogger.Log($"[CASA BSS Engine] Starting High-End Blind Source Separation for: '{audio.Name}'");
 
-            // Extract native parameters from context
-            float[] pcmSamples = audio.Data;
+            float[] pcmSamples = audio.Channels > 1 ? this.ConvertToMono(audio.Data, audio.Channels) : audio.Data;
             int sampleRate = audio.SampleRate > 0 ? audio.SampleRate : 44100;
-            int channels = audio.Channels > 0 ? audio.Channels : 1;
 
-            // Ensure we are working with unified mono data streams for clear spectral calculations
-            if (channels > 1)
-            {
-                pcmSamples = this.ConvertToMono(pcmSamples, channels);
-            }
-
-            // Define high-resolution STFT framing windows (e.g., 46.4ms windows at 44.1kHz)
             int windowSize = 2048;
-            int hopSize = 1024; // 50% overlap window
+            int hopSize = 1024; // 50% Overlap
             double frameDurationMs = (windowSize / (double) sampleRate) * 1000.0;
+            float hzPerBin = (float) sampleRate / windowSize;
 
-            int totalSamples = pcmSamples.Length;
-            int maxFrames = (totalSamples - windowSize) / hopSize;
+            int maxFrames = (pcmSamples.Length - windowSize) / hopSize;
+            if (maxFrames <= 0) return;
 
-            if (maxFrames <= 0)
+            float[] sineWindow = Enumerable.Range(0, windowSize)
+                .Select(i => (float) Math.Sin(Math.PI * i / windowSize)).ToArray();
+
+            var spectra = new Complex[maxFrames][];
+            var magnitudes = new float[maxFrames][];
+
+            StaticLogger.Log("[CASA BSS Engine] Phase 1: Parallel STFT Analysis...");
+            await Task.Run(() =>
             {
-                StaticLogger.Log("[Fingerprinting Warning] Audio data duration is shorter than the minimum window allocation sizing bounds.");
-                return;
+                Parallel.For(0, maxFrames, new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount, CancellationToken = _cancellationToken }, f =>
+                {
+                    float[] windowBuffer = new float[windowSize];
+                    Array.Copy(pcmSamples, f * hopSize, windowBuffer, 0, windowSize);
+                    for (int i = 0; i < windowSize; i++) windowBuffer[i] *= sineWindow[i];
+
+                    Complex[] fft = this.ExecuteForwardFFT(windowBuffer);
+                    spectra[f] = fft;
+                    magnitudes[f] = this.CalculateMagnitudeSpectrum(fft);
+                });
+            }, _cancellationToken);
+
+            // NEU: Dynamic Spectral Noise Subtraction (Berechnet das konstante Grundrauschen)
+            StaticLogger.Log("[CASA BSS Engine] Phase 1.5: Computing Adaptive Noise Floor Profile...");
+            float[] noiseFloor = this.ComputeNoiseFloor(magnitudes);
+
+            StaticLogger.Log("[CASA BSS Engine] Phase 2: Prominence-based Target Extraction & Tracking...");
+            var activeTracks = new List<SingerTrack>();
+            var completedTracks = new List<SingerTrack>();
+
+            for (int f = 0; f < maxFrames; f++)
+            {
+                if (_cancellationToken.IsCancellationRequested) break;
+                // report progress periodically if a progress reporter was provided
+                if ((f & 0x3F) == 0) // every 64 frames
+                {
+                    try { _progress?.Report((double)f / Math.Max(1, maxFrames)); } catch { }
+                }
+
+                // Erhöhe den Totmann-Schalter für alle aktiven Vögel
+                foreach (var track in activeTracks) track.MissedFrames++;
+
+                // NEU: Übergebe das Noise-Profile, um nur ECHTE Vogel-Peaks zu finden
+                var peaks = this.ExtractSyrinxVoicePeaks(magnitudes[f], hzPerBin, noiseFloor, peakCount: 3);
+
+                foreach (var peak in peaks)
+                {
+                    // Suche eine aktive Spur, die in der Nähe dieser Frequenz liegt
+                    var matchedTrack = activeTracks
+                        .Where(t => Math.Abs(t.CurrentDominantFreq - peak.Frequency) < FrequencyTrackingTolerance)
+                        .OrderBy(t => Math.Abs(t.CurrentDominantFreq - peak.Frequency))
+                        .FirstOrDefault();
+
+                    if (matchedTrack == null)
+                    {
+                        matchedTrack = new SingerTrack { CurrentDominantFreq = peak.Frequency };
+                        activeTracks.Add(matchedTrack);
+                    }
+
+                    // Vogel singt wieder! Reset des Totmann-Schalters und anpassen der Leitfrequenz
+                    matchedTrack.MissedFrames = 0;
+                    matchedTrack.CurrentDominantFreq = (matchedTrack.CurrentDominantFreq * 0.7f) + (peak.Frequency * 0.3f); // Smoothed Tracking
+
+                    // Isoliere das Audio
+                    Complex[] maskedSpectrum = this.ApplySoftGaussianMask(spectra[f], peak.Frequency, hzPerBin);
+                    float[] isolatedAudioFrame = this.ExecuteInverseFFT(maskedSpectrum);
+
+                    for (int i = 0; i < windowSize; i++) isolatedAudioFrame[i] *= sineWindow[i];
+
+                    matchedTrack.ActiveFrames.Add((f, isolatedAudioFrame));
+
+                    // Baue Fingerprint mit neuen, mächtigen Akustik-Features
+                    var fp = new Fingerprint
+                    {
+                        Timestamp = audio.CreatedAt.AddMilliseconds(f * (hopSize / (double) sampleRate) * 1000.0),
+                        // Use frameDurationMs as base but allow downstream merging to determine actual segment lengths
+                        DurationMs = (long)Math.Max(1, Math.Round(frameDurationMs)),
+                        ToneCount = peaks.Count
+                    };
+                    fp.Features["VoiceBandA_Freq"] = peak.Frequency;
+                    fp.Features["VoiceBandA_Amp"] = peak.Amplitude;
+                    fp.Features["Prominence"] = peak.Prominence;
+                    fp.Features["SpectralCentroid"] = peak.Centroid;
+
+                    matchedTrack.Nodes.Add(fp);
+                    _memoryPool.Add(fp);
+                }
+
+                // GRENZE ÜBERSCHRITTEN: Vogel hat länger als 800ms nicht gesungen -> Spur eiskalt durchtrennen!
+                var deadTracks = activeTracks.Where(t => t.MissedFrames > TrackMaxSilenceFrames).ToList();
+                foreach (var dt in deadTracks)
+                {
+                    activeTracks.Remove(dt);
+                    if (dt.ActiveFrames.Count > 5) completedTracks.Add(dt); // Nur Sätze übernehmen, die >100ms lang sind
+                }
             }
+            completedTracks.AddRange(activeTracks.Where(t => t.ActiveFrames.Count > 5));
 
-            // Pre-calculate Hanning window coefficients to eliminate spectral leakage edge anomalies
-            float[] hanningWeights = Enumerable.Range(0, windowSize)
-                .Select(i => (float)(0.5 * (1.0 - Math.Cos(2.0 * Math.PI * i / (windowSize - 1))))).ToArray();
-
-            int processed = 0;
-
-            // Use partitioning for parallel processing of frames
-            var rangePartitioner = System.Collections.Concurrent.Partitioner.Create(0, maxFrames);
+            StaticLogger.Log($"[CASA BSS Engine] Phase 3: Dynamic Chunk Assembly. Identified {completedTracks.Count} tight vocal segments...");
 
             await Task.Run(() =>
             {
-                ParallelOptions po = new ParallelOptions() { CancellationToken = this._cancellationToken, MaxDegreeOfParallelism = Environment.ProcessorCount };
-
-                Parallel.ForEach(rangePartitioner, po, () =>
+                Parallel.ForEach(completedTracks, new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount }, track =>
                 {
-                    // thread-local buffers
-                    return new
+                    int firstFrameIndex = track.ActiveFrames.First().FrameIndex;
+                    int lastFrameIndex = track.ActiveFrames.Last().FrameIndex;
+
+                    // Exakte Länge, kein sinnloses Padding vom Anfang der Datei!
+                    int exactLength = (lastFrameIndex - firstFrameIndex) * hopSize + windowSize;
+                    float[] reconstructedPcm = new float[exactLength];
+
+                    // OLA (Overlap-Add) Rekonstruktion
+                    foreach (var frameData in track.ActiveFrames)
                     {
-                        windowBuffer = new float[windowSize]
-                    };
-                }, (range, loopState, local) =>
-                {
-                    for (int f = range.Item1; f < range.Item2; f++)
-                    {
-                        if (this._cancellationToken.IsCancellationRequested) { loopState.Stop(); break; }
-
-                        int sampleOffset = f * hopSize;
-                        Array.Copy(pcmSamples, sampleOffset, local.windowBuffer, 0, windowSize);
-
-                        // Apply windowing function on-the-fly
-                        for (int i = 0; i < windowSize; i++) local.windowBuffer[i] *= hanningWeights[i];
-
-                        Complex[] fftComplex = this.ExecuteForwardFFT(local.windowBuffer);
-                        float[] magnitudeSpectrum = this.CalculateMagnitudeSpectrum(fftComplex);
-
-                        float spectralEnergy = magnitudeSpectrum.Sum();
-                        if (spectralEnergy < 0.05f) continue;
-
-                        var dominantPeaks = this.ExtractSyrinxVoicePeaks(magnitudeSpectrum, sampleRate, windowSize, peakCount: 2);
-
-                        var fingerprint = new Fingerprint
+                        int localOffset = (frameData.FrameIndex - firstFrameIndex) * hopSize;
+                        for (int j = 0; j < windowSize; j++)
                         {
-                            Timestamp = audio.CreatedAt.AddMilliseconds(f * (hopSize / (double)sampleRate) * 1000.0),
-                            DurationMs = (long)frameDurationMs,
-                            ToneCount = dominantPeaks.Count
-                        };
-
-                        fingerprint.Features["SpectralEnergy"] = spectralEnergy;
-                        fingerprint.Features["SpectralCentroid"] = this.ComputeSpectralCentroid(magnitudeSpectrum, sampleRate, windowSize);
-                        fingerprint.Features["SpectralFlatness"] = this.ComputeSpectralFlatness(magnitudeSpectrum);
-
-                        if (dominantPeaks.Count > 0)
-                        {
-                            fingerprint.Features["VoiceBandA_Freq"] = dominantPeaks[0].Frequency;
-                            fingerprint.Features["VoiceBandA_Amp"] = dominantPeaks[0].Amplitude;
+                            reconstructedPcm[localOffset + j] += frameData.AudioFrame[j];
                         }
-                        if (dominantPeaks.Count > 1)
-                        {
-                            fingerprint.Features["VoiceBandB_Freq"] = dominantPeaks[1].Frequency;
-                            fingerprint.Features["VoiceBandB_Amp"] = dominantPeaks[1].Amplitude;
-                            fingerprint.Features["SyrinxDeltaFreq"] = Math.Abs(dominantPeaks[0].Frequency - dominantPeaks[1].Frequency);
-                            fingerprint.Features["SyrinxHarmonicInterplay"] = dominantPeaks[1].Amplitude / Math.Max(0.001f, dominantPeaks[0].Amplitude);
-                        }
-                        else
-                        {
-                            fingerprint.Features["VoiceBandB_Freq"] = 0f;
-                            fingerprint.Features["VoiceBandB_Amp"] = 0f;
-                            fingerprint.Features["SyrinxDeltaFreq"] = 0f;
-                            fingerprint.Features["SyrinxHarmonicInterplay"] = 0f;
-                        }
-
-                        // store node
-                        this._memoryPool.Add(fingerprint);
-
-                        int cur = Interlocked.Increment(ref processed);
-                        if (cur % 100 == 0 || cur == maxFrames) this._progress?.Report((double)cur / maxFrames);
                     }
-                    return local;
-                }, _ => { });
-            }, this._cancellationToken);
 
-            StaticLogger.Log($"[Fingerprinting Engine] First pass complete. Compiled and vectorized {this._memoryPool.Count} bioacoustic fingerprint nodes (pre-derivation).");
+                    // Entferne absolute Reststille an den äußeren Kanten
+                    float[] trimmedPcm = this.TrimSilence(reconstructedPcm, 0.005f);
 
-            // Second phase: derive cross-references in parallel using snapshot
-            try
-            {
-                var snapshot = this._memoryPool.OrderBy(f => f.Timestamp).ToList();
-                int total = snapshot.Count;
-                ParallelOptions po2 = new ParallelOptions() { CancellationToken = this._cancellationToken, MaxDegreeOfParallelism = Math.Max(1, Environment.ProcessorCount - 1) };
-                Parallel.ForEach(Partitioner.Create(0, total), po2, range =>
-                {
-                    for (int i = range.Item1; i < range.Item2; i++)
+                    if (trimmedPcm.Length > sampleRate * 0.1) // Muss mind. 100ms lang sein
                     {
-                        var target = snapshot[i];
-                        // perform local comparison with recent history window
-                        int start = Math.Max(0, i - ShortTermMemoryLimit);
-                        for (int j = start; j < i; j++)
+                        string id = track.TrackId.ToString().Substring(0, 4);
+                        var isolatedAudio = new AudioObj(trimmedPcm, sampleRate, 1, 16, $"{audio.Name}_Bird_{id}_{track.CurrentDominantFreq:F0}Hz");
+
+                        lock (IsolatedBirdSamples)
                         {
-                            var pastNode = snapshot[j];
-                            float distance = 0f;
-                            string[] targetKeys = new string[] { "VoiceBandA_Freq", "VoiceBandB_Freq", "SpectralCentroid", "SpectralFlatness" };
-                            foreach (var key in targetKeys)
-                            {
-                                if (target.Features.TryGetValue(key, out float valA) && pastNode.Features.TryGetValue(key, out float valB))
-                                {
-                                    float scalar = key.Contains("Freq") ? 1000f : 1f;
-                                    float delta = (valA - valB) / scalar;
-                                    distance += delta * delta;
-                                }
-                            }
-                            float score = (float)(1.0 / (1.0 + Math.Sqrt(distance)));
-                            if (score > 0.75f)
-                            {
-                                target.Deriverates.TryAdd(pastNode, score);
-                            }
+                            IsolatedBirdSamples.Add(isolatedAudio);
                         }
                     }
                 });
+            }, _cancellationToken);
 
-                StaticLogger.Log($"[Fingerprinting Engine] Cross-reference pass complete.");
-            }
-            catch (OperationCanceledException)
+            this.DeriveHistoricalCrossReferences();
+            StaticLogger.Log($"[CASA BSS Engine] Complete. Extracted {IsolatedBirdSamples.Count} tight, dynamic bird vocalizations.");
+        }
+
+        // =========================================================================
+        // NEU: CASA BSS KERN-ALGORITHMEN
+        // =========================================================================
+
+        /// <summary>
+        /// Sucht die leisesten Frames (Bodenrauschen) der Aufnahme und erstellt einen globalen Störgeräusch-Abdruck.
+        /// </summary>
+        private float[] ComputeNoiseFloor(float[][] magnitudes)
+        {
+            int bins = magnitudes[0].Length;
+            float[] noiseFloor = new float[bins];
+
+            // Nimm die 5% der leisesten Frames (wo garantiert kein Vogel singt)
+            var quietestFrames = magnitudes.OrderBy(m => m.Sum()).Take(Math.Max(10, magnitudes.Length / 20)).ToList();
+
+            if (quietestFrames.Count == 0) return noiseFloor;
+
+            for (int i = 0; i < bins; i++)
             {
-                StaticLogger.Log("Cross-reference pass cancelled.");
+                noiseFloor[i] = quietestFrames.Average(m => m[i]);
             }
+            return noiseFloor;
+        }
+
+        private class PeakNode
+        {
+            public float Frequency { get; set; }
+            public float Amplitude { get; set; }
+            public float Prominence { get; set; }
+            public float Centroid { get; set; }
         }
 
         /// <summary>
-        /// Serializes the entire in-memory fingerprint profile registry cache flatly to disk storage.
+        /// Sucht nach Peaks mit echter Prominence (Schärfe). Ignoriert konstantes Rauschen komplett.
         /// </summary>
-        public void DumpFingerprintsToDisk(string targetFilePath)
+        private List<PeakNode> ExtractSyrinxVoicePeaks(float[] spectrum, float hzPerBin, float[] noiseFloor, int peakCount)
         {
-            try
+            var peaks = new List<PeakNode>();
+            int binCount = spectrum.Length;
+            float[] cleanSpectrum = new float[binCount];
+
+            // 1. Spectral Subtraction (Ziehe das Rauschen vom Frame ab)
+            float totalEnergy = 0f;
+            for (int i = 0; i < binCount; i++)
             {
-                var sb = new StringBuilder();
-                sb.AppendLine("Id,Timestamp,DurationMs,ToneCount,VoiceBandA_Freq,VoiceBandB_Freq,SyrinxDeltaFreq,SpectralCentroid,SpectralFlatness");
+                cleanSpectrum[i] = Math.Max(0, spectrum[i] - (noiseFloor[i] * 2.0f)); // 2x Multiplikator killt Rauschen sicher
+                totalEnergy += cleanSpectrum[i];
+            }
 
-                foreach (var f in this.CapturedFingerprints)
+            for (int p = 0; p < peakCount; p++)
+            {
+                float maxVal = 0f;
+                int maxIdx = -1;
+
+                int minBin = (int) (500 / hzPerBin);
+                int maxBin = Math.Min(binCount - 1, (int) (9000 / hzPerBin));
+
+                // 2. Finde den stärksten Peak
+                for (int b = minBin; b <= maxBin; b++)
                 {
-                    f.Features.TryGetValue("VoiceBandA_Freq", out float vA);
-                    f.Features.TryGetValue("VoiceBandB_Freq", out float vB);
-                    f.Features.TryGetValue("SyrinxDeltaFreq", out float delta);
-                    f.Features.TryGetValue("SpectralCentroid", out float centroid);
-                    f.Features.TryGetValue("SpectralFlatness", out float flatness);
-
-                    sb.AppendLine($"{f.Id},{f.Timestamp:yyyy-MM-dd HH:mm:ss.fff},{f.DurationMs},{f.ToneCount},{vA:F2},{vB:F2},{delta:F2},{centroid:F2},{flatness:F5}");
+                    if (cleanSpectrum[b] > maxVal)
+                    {
+                        maxVal = cleanSpectrum[b];
+                        maxIdx = b;
+                    }
                 }
 
-                File.WriteAllText(targetFilePath, sb.ToString());
-                StaticLogger.Log($"[Fingerprinting Storage] Successfully dumped acoustic matrix footprint profiles onto path: {targetFilePath}");
+                if (maxIdx == -1 || maxVal < 0.01f) break;
+
+                // 3. Prominence-Prüfung (Ist es ein scharfer Ton oder nur ein breiter Rausch-Buckel?)
+                int neighborhood = (int) (200 / hzPerBin);
+                float localAvg = 0;
+                int count = 0;
+                for (int j = Math.Max(0, maxIdx - neighborhood); j <= Math.Min(binCount - 1, maxIdx + neighborhood); j++)
+                {
+                    if (j != maxIdx) { localAvg += spectrum[j]; count++; }
+                }
+                localAvg /= Math.Max(1, count);
+
+                // Wenn der Ton nicht mindestens 3-mal lauter ist als seine direkte Umgebung, ist es KEIN Vogel!
+                float prominence = maxVal / Math.Max(0.001f, localAvg);
+                if (prominence < 3.0f)
+                {
+                    cleanSpectrum[maxIdx] = 0f; // Ignorieren und weitersuchen
+                    continue;
+                }
+
+                // 4. Feature Extraction: Spectral Centroid (Schwerpunkt des Tons) berechnen
+                float centroidNumerator = 0f;
+                float centroidDenominator = 0f;
+                for (int j = Math.Max(0, maxIdx - 5); j <= Math.Min(binCount - 1, maxIdx + 5); j++)
+                {
+                    centroidNumerator += j * hzPerBin * cleanSpectrum[j];
+                    centroidDenominator += cleanSpectrum[j];
+                }
+                float centroid = centroidDenominator > 0 ? centroidNumerator / centroidDenominator : maxIdx * hzPerBin;
+
+                peaks.Add(new PeakNode
+                {
+                    Frequency = maxIdx * hzPerBin,
+                    Amplitude = maxVal,
+                    Prominence = prominence,
+                    Centroid = centroid
+                });
+
+                // Peak auslöschen, um den nächsten Vogel zu finden
+                int exclusionRadius = (int) (400f / hzPerBin);
+                for (int m = Math.Max(0, maxIdx - exclusionRadius); m <= Math.Min(binCount - 1, maxIdx + exclusionRadius); m++)
+                {
+                    cleanSpectrum[m] = 0f;
+                }
             }
-            catch (Exception ex)
-            {
-                StaticLogger.Log($"[Fingerprinting Storage Error] Serialization sequence failed: {ex.Message}");
-            }
+
+            return peaks;
         }
+
+        private Complex[] ApplySoftGaussianMask(Complex[] originalSpectrum, float targetFreq, float hzPerBin)
+        {
+            Complex[] masked = new Complex[originalSpectrum.Length];
+            float sigma = 300f; // Frequenz-Breite des Vogels
+            float varianceMultiplier = 2f * sigma * sigma;
+
+            for (int i = 0; i < originalSpectrum.Length; i++)
+            {
+                float freq = (i <= originalSpectrum.Length / 2) ? (i * hzPerBin) : ((originalSpectrum.Length - i) * hzPerBin);
+
+                float diff1 = freq - targetFreq;
+                float mask1 = (float) Math.Exp(-(diff1 * diff1) / varianceMultiplier);
+
+                float diff2 = freq - (targetFreq * 2.0f); // Erste Harmonische (Oberton)
+                float mask2 = (float) Math.Exp(-(diff2 * diff2) / varianceMultiplier) * 0.4f;
+
+                float totalMask = Math.Min(1.0f, mask1 + mask2);
+
+                masked[i] = new Complex(originalSpectrum[i].Real * totalMask, originalSpectrum[i].Imaginary * totalMask);
+            }
+            return masked;
+        }
+
+        private float[] TrimSilence(float[] audio, float threshold)
+        {
+            int start = 0;
+            while (start < audio.Length && Math.Abs(audio[start]) < threshold) start++;
+            int end = audio.Length - 1;
+            while (end > start && Math.Abs(audio[end]) < threshold) end--;
+
+            if (start >= end) return new float[0];
+            float[] trimmed = new float[end - start + 1];
+            Array.Copy(audio, start, trimmed, 0, trimmed.Length);
+            return trimmed;
+        }
+
+        // =========================================================================
+        // STANDARD FFT & HELPER FUNKTIONEN
+        // =========================================================================
 
         private float[] ConvertToMono(float[] stereoData, int channelCount)
         {
@@ -256,148 +373,10 @@ namespace LAWS.Voices.Multimodal.Audio.Processors
             for (int i = 0; i < frames; i++)
             {
                 float sum = 0f;
-                for (int c = 0; c < channelCount; c++)
-                {
-                    sum += stereoData[i * channelCount + c];
-                }
+                for (int c = 0; c < channelCount; c++) sum += stereoData[i * channelCount + c];
                 mono[i] = sum / channelCount;
             }
             return mono;
-        }
-
-        private class PeakNode
-        {
-            public float Frequency { get; set; }
-            public float Amplitude { get; set; }
-        }
-
-        /// <summary>
-        /// Scans the spectrum to isolate multiple fully independent dominant peaks.
-        /// Prevents locking onto adjacent bins of the same frequency peak by applying an exclusion band filter.
-        /// </summary>
-        private List<PeakNode> ExtractSyrinxVoicePeaks(float[] spectrum, int sampleRate, int windowSize, int peakCount)
-        {
-            var peaks = new List<PeakNode>();
-            int binCount = spectrum.Length;
-            float hzPerBin = (float) sampleRate / windowSize;
-
-            // Clone spectrum to allow destructive masking during peak isolation passes
-            float[] spectrumCopy = new float[binCount];
-            Array.Copy(spectrum, spectrumCopy, binCount);
-
-            for (int p = 0; p < peakCount; p++)
-            {
-                float maxVal = 0f;
-                int maxIdx = -1;
-
-                // Scan active frequency bounds where most bird vocalizations occur (e.g., 500 Hz to 8000 Hz)
-                int minBin = (int) (500 / hzPerBin);
-                int maxBin = Math.Min(binCount - 1, (int) (9000 / hzPerBin));
-
-                for (int b = minBin; b <= maxBin; b++)
-                {
-                    if (spectrumCopy[b] > maxVal)
-                    {
-                        maxVal = spectrumCopy[b];
-                        maxIdx = b;
-                    }
-                }
-
-                if (maxIdx == -1 || maxVal < 0.005f) break; // Signal threshold break
-
-                peaks.Add(new PeakNode
-                {
-                    Frequency = maxIdx * hzPerBin,
-                    Amplitude = maxVal
-                });
-
-                // Apply spectral exclusion masking zone (clear ±200Hz around identified peak)
-                int exclusionRadiusBins = (int) (200f / hzPerBin);
-                int startMask = Math.Max(0, maxIdx - exclusionRadiusBins);
-                int endMask = Math.Min(binCount - 1, maxIdx + exclusionRadiusBins);
-
-                for (int m = startMask; m <= endMask; m++)
-                {
-                    spectrumCopy[m] = 0f;
-                }
-            }
-
-            return peaks;
-        }
-
-        /// <summary>
-        /// Tracks pattern remixes and similarities against historical context nodes in memory.
-        /// Calculates vector distances to map short-term transitions and long-term acoustic derivations.
-        /// </summary>
-        private void DeriveHistoricalCrossReferences(Fingerprint target)
-        {
-            var historyPool = this._memoryPool.OrderByDescending(f => f.Timestamp).Take(ShortTermMemoryLimit).ToList();
-            if (historyPool.Count == 0) return;
-
-            string[] targetKeys = new string[] { "VoiceBandA_Freq", "VoiceBandB_Freq", "SpectralCentroid", "SpectralFlatness" };
-
-            var po = new ParallelOptions { CancellationToken = this._cancellationToken, MaxDegreeOfParallelism = Math.Max(1, Environment.ProcessorCount / 2) };
-            try
-            {
-                Parallel.ForEach(historyPool, po, pastNode =>
-                {
-                    float distance = 0f;
-                    foreach (var key in targetKeys)
-                    {
-                        if (target.Features.TryGetValue(key, out float valA) && pastNode.Features.TryGetValue(key, out float valB))
-                        {
-                            float scalar = key.Contains("Freq") ? 1000f : 1f;
-                            float delta = (valA - valB) / scalar;
-                            distance += delta * delta;
-                        }
-                    }
-
-                    float score = (float)(1.0 / (1.0 + Math.Sqrt(distance)));
-                    if (score > 0.75f)
-                    {
-                        target.Deriverates.TryAdd(pastNode, score);
-                    }
-                });
-            }
-            catch (OperationCanceledException)
-            {
-                StaticLogger.Log("DeriveHistoricalCrossReferences cancelled.");
-            }
-        }
-
-        private float ComputeSpectralCentroid(float[] spectrum, int sampleRate, int windowSize)
-        {
-            float hzPerBin = (float) sampleRate / windowSize;
-            float weightedSum = 0f;
-            float totalEnergy = 0f;
-
-            for (int i = 0; i < spectrum.Length; i++)
-            {
-                float freq = i * hzPerBin;
-                weightedSum += freq * spectrum[i];
-                totalEnergy += spectrum[i];
-            }
-
-            return totalEnergy > 0f ? weightedSum / totalEnergy : 0f;
-        }
-
-        private float ComputeSpectralFlatness(float[] spectrum)
-        {
-            double logSum = 0.0;
-            double sum = 0.0;
-            int count = spectrum.Length;
-
-            for (int i = 0; i < count; i++)
-            {
-                float val = Math.Max(spectrum[i], 1e-7f); // Avoid log(0) calculation traps
-                logSum += Math.Log(val);
-                sum += val;
-            }
-
-            double geometricMean = Math.Exp(logSum / count);
-            double arithmeticMean = sum / count;
-
-            return arithmeticMean > 0.0 ? (float) (geometricMean / arithmeticMean) : 0f;
         }
 
         private Complex[] ExecuteForwardFFT(float[] samples)
@@ -406,7 +385,6 @@ namespace LAWS.Voices.Multimodal.Audio.Processors
             Complex[] complexBuffer = new Complex[n];
             for (int i = 0; i < n; i++) complexBuffer[i] = new Complex(samples[i], 0.0);
 
-            // Standard radix-2 in-place decimation-in-time calculation engine sequence
             for (int i = 1, j = 0; i < n; i++)
             {
                 int bit = n >> 1;
@@ -435,15 +413,106 @@ namespace LAWS.Voices.Multimodal.Audio.Processors
             return complexBuffer;
         }
 
+        private float[] ExecuteInverseFFT(Complex[] spectrum)
+        {
+            int n = spectrum.Length;
+            Complex[] complexBuffer = new Complex[n];
+
+            for (int i = 0; i < n; i++) complexBuffer[i] = new Complex(spectrum[i].Real, -spectrum[i].Imaginary);
+
+            for (int i = 1, j = 0; i < n; i++)
+            {
+                int bit = n >> 1;
+                while ((j & bit) != 0) { j ^= bit; bit >>= 1; }
+                j ^= bit;
+                if (i < j) { var temp = complexBuffer[i]; complexBuffer[i] = complexBuffer[j]; complexBuffer[j] = temp; }
+            }
+
+            for (int len = 2; len <= n; len <<= 1)
+            {
+                double angle = -2.0 * Math.PI / len;
+                Complex wlen = new Complex(Math.Cos(angle), Math.Sin(angle));
+                for (int i = 0; i < n; i += len)
+                {
+                    Complex w = new Complex(1.0, 0.0);
+                    for (int j = 0; j < len / 2; j++)
+                    {
+                        Complex u = complexBuffer[i + j];
+                        Complex v = complexBuffer[i + j + len / 2] * w;
+                        complexBuffer[i + j] = u + v;
+                        complexBuffer[i + j + len / 2] = u - v;
+                        w *= wlen;
+                    }
+                }
+            }
+
+            float[] outputPcm = new float[n];
+            for (int i = 0; i < n; i++) outputPcm[i] = (float) (complexBuffer[i].Real / n);
+            return outputPcm;
+        }
+
         private float[] CalculateMagnitudeSpectrum(Complex[] fftOutput)
         {
             int halfSize = fftOutput.Length / 2;
             float[] magnitudes = new float[halfSize];
-            for (int i = 0; i < halfSize; i++)
-            {
-                magnitudes[i] = (float) fftOutput[i].Magnitude;
-            }
+            for (int i = 0; i < halfSize; i++) magnitudes[i] = (float) fftOutput[i].Magnitude;
             return magnitudes;
+        }
+
+        private void DeriveHistoricalCrossReferences()
+        {
+            var historyPool = this._memoryPool.OrderByDescending(f => f.Timestamp).Take(ShortTermMemoryLimit).ToList();
+            if (historyPool.Count == 0) return;
+
+            string[] targetKeys = { "VoiceBandA_Freq", "Prominence" };
+
+            Parallel.ForEach(historyPool, new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, Environment.ProcessorCount / 2) }, target =>
+            {
+                foreach (var pastNode in historyPool)
+                {
+                    if (target == pastNode) continue;
+
+                    float distance = 0f;
+                    foreach (var key in targetKeys)
+                    {
+                        if (target.Features.TryGetValue(key, out float valA) && pastNode.Features.TryGetValue(key, out float valB))
+                        {
+                            float scalar = key.Contains("Freq") ? 1000f : 10f;
+                            float delta = (valA - valB) / scalar;
+                            distance += delta * delta;
+                        }
+                    }
+
+                    float score = (float) (1.0 / (1.0 + Math.Sqrt(distance)));
+                    if (score > 0.85f) target.Deriverates.TryAdd(pastNode, score);
+                }
+            });
+        }
+
+        public void DumpFingerprintsToDisk(string targetFilePath)
+        {
+            try
+            {
+                var sb = new StringBuilder();
+                sb.AppendLine("Id,Timestamp,DurationMs,ToneCount,VoiceBandA_Freq,VoiceBandA_Amp,Prominence,SpectralCentroid");
+
+                foreach (var f in CapturedFingerprints)
+                {
+                    f.Features.TryGetValue("VoiceBandA_Freq", out float freq);
+                    f.Features.TryGetValue("VoiceBandA_Amp", out float amp);
+                    f.Features.TryGetValue("Prominence", out float prom);
+                    f.Features.TryGetValue("SpectralCentroid", out float centroid);
+
+                    sb.AppendLine($"{f.Id},{f.Timestamp:yyyy-MM-dd HH:mm:ss.fff},{f.DurationMs},{f.ToneCount},{freq:F2},{amp:F5},{prom:F2},{centroid:F2}");
+                }
+
+                File.WriteAllText(targetFilePath, sb.ToString());
+                StaticLogger.Log($"[Fingerprinting Storage] Successfully dumped {CapturedFingerprints.Count} BSS profiles to disk.");
+            }
+            catch (Exception ex)
+            {
+                StaticLogger.Log($"[Fingerprinting Storage Error] Serialization failed: {ex.Message}");
+            }
         }
     }
 }

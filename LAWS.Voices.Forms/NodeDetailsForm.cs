@@ -24,11 +24,16 @@ namespace LAWS.Voices.Forms
         private BufferedWaveProvider? bufferedProvider;
         private MemoryStream? playbackStream = null;
 
-        public NodeDetailsForm(int index, FingerprintingProcessor.Fingerprint node, AudioObj? sourceAudio)
+        private DateTime? segmentStart;
+        private DateTime? segmentEnd;
+
+        public NodeDetailsForm(int index, FingerprintingProcessor.Fingerprint node, AudioObj? sourceAudio, DateTime? segmentStart = null, DateTime? segmentEnd = null)
         {
             this.nodeIndex = index;
             this.node = node;
             this.sourceAudio = sourceAudio;
+            this.segmentStart = segmentStart;
+            this.segmentEnd = segmentEnd;
             this.InitializeComponent();
             this.Load += NodeDetailsForm_Load;
         }
@@ -77,13 +82,20 @@ namespace LAWS.Voices.Forms
                 var sb = new System.Text.StringBuilder();
                 sb.AppendLine($"Index: {this.nodeIndex}");
                 sb.AppendLine($"Timestamp: {this.node.Timestamp:O}");
-                sb.AppendLine($"DurationMs: {this.node.DurationMs}");
+                double durMs = this.segmentEnd != null && this.segmentStart != null ? (this.segmentEnd.Value - this.segmentStart.Value).TotalMilliseconds : this.node.DurationMs;
+                sb.AppendLine($"SegmentDurationMs: {durMs:F0}");
                 sb.AppendLine($"ToneCount: {this.node.ToneCount}");
                 sb.AppendLine("Features:");
                 foreach (var kv in this.node.Features) sb.AppendLine($"  {kv.Key}: {kv.Value}");
                 this.txtInfo.Text = sb.ToString();
             }
             catch { }
+        }
+
+        protected override void OnFormClosing(FormClosingEventArgs e)
+        {
+            try { Stop(); } catch { }
+            base.OnFormClosing(e);
         }
 
         private async Task PlayAsync()
@@ -95,9 +107,14 @@ namespace LAWS.Voices.Forms
 
                 int sr = this.sourceAudio.SampleRate > 0 ? this.sourceAudio.SampleRate : 44100;
                 int ch = this.sourceAudio.Channels > 0 ? this.sourceAudio.Channels : 1;
-                long startSample = (long)Math.Max(0, Math.Floor((this.node.Timestamp - this.sourceAudio.CreatedAt).TotalSeconds * sr) * ch);
-                long lenSamples = (long)Math.Max(1, Math.Ceiling(this.node.DurationMs / 1000.0 * sr) * ch);
-                long endSample = Math.Min(this.sourceAudio.Data.Length, startSample + lenSamples);
+                // prefer segment bounds if provided, otherwise use node timestamp/duration
+                DateTime sdt = this.segmentStart ?? this.node.Timestamp;
+                DateTime edt = this.segmentEnd ?? this.node.Timestamp.AddMilliseconds(Math.Max(1, this.node.DurationMs));
+                // add small padding
+                sdt = sdt.AddMilliseconds(-40);
+                edt = edt.AddMilliseconds(40);
+                long startSample = (long)Math.Max(0, Math.Floor((sdt - this.sourceAudio.CreatedAt).TotalSeconds * sr) * ch);
+                long endSample = (long)Math.Min(this.sourceAudio.Data.Length, Math.Ceiling((edt - this.sourceAudio.CreatedAt).TotalSeconds * sr) * ch);
                 if (endSample <= startSample) { MessageBox.Show(this, "Node audio segment is empty.", "Play", MessageBoxButtons.OK, MessageBoxIcon.Information); return; }
 
                 int len = (int)(endSample - startSample);

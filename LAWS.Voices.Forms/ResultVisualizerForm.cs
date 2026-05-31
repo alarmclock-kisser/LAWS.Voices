@@ -3,16 +3,28 @@ using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using LAWS.Voices.OpenVino;
+using System.Linq;
 using LAWS.Voices.Multimodal.Audio.Processors;
 using LAWS.Voices.Multimodal.Audio;
 using NAudio.Wave;
 using System.IO;
 using System.IO.Compression;
+using System.Diagnostics;
 using System.Windows.Forms;
 using LAWS.Voices.Shared;
+using System.ComponentModel;
 
 namespace LAWS.Voices.Forms
 {
+    // Panel that ignores mouse wheel to prevent it from scrolling the parent automatically
+    public class NoWheelScrollPanel : Panel
+    {
+        protected override void OnMouseWheel(MouseEventArgs e)
+        {
+            // swallow mouse wheel to avoid default scroll behavior; parent handles zoom explicitly
+            // Do nothing here to prevent automatic scrolling
+        }
+    }
     public class ResultVisualizerForm : Form
     {
         private Bitmap? bmp;
@@ -21,7 +33,7 @@ namespace LAWS.Voices.Forms
         private AudioObj? sourceAudio = null;
         private List<LAWS.Voices.OpenVino.Processors.Wav2Vec2Processor.BirdSongBlock>? songBlocks = null;
         private PictureBox pictureBox = new();
-        private Panel picturePanel = new Panel();
+        private Panel picturePanel = new NoWheelScrollPanel();
         private Button btnCopy = new();
         private Button btnSave = new();
         private Button btnClose = new();
@@ -35,18 +47,26 @@ namespace LAWS.Voices.Forms
         private int treeBaseHeight = 600;
         private Point panStartMouse = Point.Empty;
         private Point panStartScroll = Point.Empty;
+        // manual scroll offsets (we don't use AutoScroll to avoid scrollbar/jump behavior)
+        private Point picturePanelScroll = Point.Empty;
         private bool isPanning = false;
+        private bool dragMoved = false;
+        private bool suppressClickOnce = false;
+        private const int DragThreshold = 5;
         // Async render control
         private CancellationTokenSource? renderCts = null;
         private Task? renderTask = null;
         private readonly object renderLockObj = new object();
         private System.Threading.Timer? zoomDebounceTimer = null;
         private readonly object zoomLock = new object();
+        private PointF? lastZoomAnchor = null;
         private WaveOutEvent? playbackDevice = null;
         private AudioFileReader? playbackReader = null;
         private string? playbackTempFile = null;
         private Button btnNodePlay = new Button();
         private int? selectedNodeIndex = null;
+        // Keep a single NodeDetailsForm instance to avoid multiple open windows
+        private NodeDetailsForm? openNodeDetailsForm = null;
 
         public string ReportText { get; private set; } = string.Empty;
 
@@ -73,6 +93,7 @@ namespace LAWS.Voices.Forms
                 }
                 catch { }
             }
+
         }
 
         private void SortNodesBy(string key)
@@ -277,9 +298,12 @@ namespace LAWS.Voices.Forms
             panel.Controls.Add(this.btnClose);
 
             // picturePanel wraps pictureBox to allow scrolling / panning when zoomed
-            this.picturePanel = new Panel();
+            this.picturePanel = new NoWheelScrollPanel();
             this.picturePanel.Dock = DockStyle.Fill;
-            this.picturePanel.AutoScroll = true;
+            // Disable AutoScroll and hide scrollbars; we manage panning manually to avoid jumpy behavior
+            this.picturePanel.AutoScroll = false;
+            this.picturePanel.HorizontalScroll.Enabled = false;
+            this.picturePanel.VerticalScroll.Enabled = false;
             this.picturePanel.BackColor = Color.Black;
 
             this.pictureBox.Dock = DockStyle.None;
@@ -315,6 +339,8 @@ namespace LAWS.Voices.Forms
 
             this.pictureBox.ContextMenuStrip = cms;
 
+            // position pictureBox according to manual scroll offsets
+            this.pictureBox.Location = new Point(-this.picturePanelScroll.X, -this.picturePanelScroll.Y);
             this.picturePanel.Controls.Add(this.pictureBox);
             this.Controls.Add(this.picturePanel);
             this.Controls.Add(panel);
@@ -477,12 +503,26 @@ namespace LAWS.Voices.Forms
         }
 
         // Thread-safe update
-        public void SetImage(Bitmap newBitmap)
+        public void SetImage(Bitmap newBitmap, PointF? anchor = null, Point? anchorPanelPoint = null)
         {
             if (newBitmap == null) return;
             if (this.InvokeRequired) { this.BeginInvoke(new Action(() => this.SetImage(newBitmap))); return; }
             try
             {
+                // preserve previous center ratios if anchor not provided
+                double prevCenterXRatio = 0.5, prevCenterYRatio = 0.5;
+                int prevBoxWidth = this.pictureBox.Width > 0 ? this.pictureBox.Width : (this.bmp?.Width ?? 1);
+                int prevBoxHeight = this.pictureBox.Height > 0 ? this.pictureBox.Height : (this.bmp?.Height ?? 1);
+                if (anchor == null && this.bmp != null)
+                {
+                    try
+                    {
+                        prevCenterXRatio = (this.picturePanel.AutoScrollPosition.X * -1.0 + this.picturePanel.ClientSize.Width / 2.0) / Math.Max(1.0, prevBoxWidth);
+                        prevCenterYRatio = (this.picturePanel.AutoScrollPosition.Y * -1.0 + this.picturePanel.ClientSize.Height / 2.0) / Math.Max(1.0, prevBoxHeight);
+                    }
+                    catch { prevCenterXRatio = 0.5; prevCenterYRatio = 0.5; }
+                }
+
                 try { this.pictureBox.Image?.Dispose(); } catch { }
                 try { this.bmp?.Dispose(); } catch { }
                 this.bmp = newBitmap;
@@ -490,11 +530,44 @@ namespace LAWS.Voices.Forms
                 {
                     try { var overlay = this.RenderGazeOverlay(this.bmp, this.gazeVector); this.bmp.Dispose(); this.bmp = overlay; } catch { }
                 }
-                // reset zoom/scroll
-                this.imageZoom = 1f;
-                this.pictureBox.Size = this.bmp.Size;
+
+                // reset zoom? keep current imageZoom but set pictureBox size according to bmp and zoom
+                // For tree view, RenderTreeAsync already renders at a scaled size for sharpness, so don't multiply by imageZoom again.
+                if (this.isTreeView)
+                {
+                    this.pictureBox.Size = new Size(this.bmp.Width, this.bmp.Height);
+                }
+                else
+                {
+                    this.pictureBox.Size = new Size((int)(this.bmp.Width * this.imageZoom), (int)(this.bmp.Height * this.imageZoom));
+                }
                 this.pictureBox.Image = this.bmp;
-                this.picturePanel.AutoScrollPosition = new Point(0, 0);
+
+                // compute new scroll to keep anchor/center
+                double anchorXRatio = 0.5, anchorYRatio = 0.5;
+                if (anchor != null)
+                {
+                    anchorXRatio = anchor.Value.X; anchorYRatio = anchor.Value.Y;
+                }
+                else
+                {
+                    anchorXRatio = prevCenterXRatio; anchorYRatio = prevCenterYRatio;
+                }
+
+                int newScrollX = (int)(anchorXRatio * this.pictureBox.Width - this.picturePanel.ClientSize.Width / 2.0);
+                int newScrollY = (int)(anchorYRatio * this.pictureBox.Height - this.picturePanel.ClientSize.Height / 2.0);
+                try
+                {
+                    int maxScrollX = Math.Max(0, this.pictureBox.Width - this.picturePanel.ClientSize.Width);
+                    int maxScrollY = Math.Max(0, this.pictureBox.Height - this.picturePanel.ClientSize.Height);
+                    newScrollX = Math.Clamp(newScrollX, 0, maxScrollX);
+                    newScrollY = Math.Clamp(newScrollY, 0, maxScrollY);
+                    // apply to manual scroll and update pictureBox position
+                    this.picturePanelScroll = new Point(newScrollX, newScrollY);
+                    this.pictureBox.Location = new Point(-this.picturePanelScroll.X, -this.picturePanelScroll.Y);
+                }
+                catch { }
+
                 // ensure pictureBox gets focus to capture mouse wheel
                 this.pictureBox.Focus();
             }
@@ -608,7 +681,7 @@ namespace LAWS.Voices.Forms
             return bmp;
         }
 
-        private async Task RenderTreeAsync(int baseW, int baseH)
+        private async Task RenderTreeAsync(int baseW, int baseH, PointF? anchorRatio = null, Point? anchorPanelPoint = null)
         {
             lock (this.renderLockObj)
             {
@@ -629,7 +702,7 @@ namespace LAWS.Voices.Forms
                     // marshal back to UI
                     if (!this.IsDisposed && !this.Disposing)
                     {
-                        this.BeginInvoke(new Action(() => this.SetImage(bmp)));
+                        this.BeginInvoke(new Action(() => this.SetImage(bmp, anchorRatio, anchorPanelPoint)));
                     }
                 }
                 catch (Exception ex) { StaticLogger.Log("RenderTreeAsync failed: " + ex.Message); }
@@ -705,6 +778,12 @@ namespace LAWS.Voices.Forms
         {
             try
             {
+                // If a drag just finished, suppress the next click (prevents opening node on drag-release)
+                if (this.suppressClickOnce)
+                {
+                    this.suppressClickOnce = false;
+                    return;
+                }
                 if (!this.isTreeView || this.lastTreeNodePoints == null || this.fingerprints == null) return;
                 // compute client point in image coordinates
                 var img = this.pictureBox.Image as Bitmap;
@@ -758,10 +837,115 @@ namespace LAWS.Voices.Forms
             {
                 if (this.fingerprints == null || nodeIndex < 0 || nodeIndex >= this.fingerprints.Count) return;
                 var node = this.fingerprints[nodeIndex];
-                var details = new NodeDetailsForm(nodeIndex, node, this.sourceAudio);
-                details.Show(this);
+                // expand around selected node to form a playback segment
+                var seg = ExpandSegmentAroundIndex(this.fingerprints, nodeIndex, mergeGapMs: 400);
+                // Ensure only one node details window exists at a time
+                try { if (this.openNodeDetailsForm != null && !this.openNodeDetailsForm.IsDisposed) this.openNodeDetailsForm.Close(); } catch { }
+                this.openNodeDetailsForm = new NodeDetailsForm(nodeIndex, node, this.sourceAudio, seg.start, seg.end);
+                this.openNodeDetailsForm.FormClosed += (_, __) => { try { this.openNodeDetailsForm = null; } catch { } };
+                this.openNodeDetailsForm.Show(this);
             }
             catch (Exception ex) { StaticLogger.Log("ShowNodeDetails failed: " + ex.Message); }
+        }
+
+        private List<(DateTime start, DateTime end)> BuildFingerprintSegments(List<FingerprintingProcessor.Fingerprint> fps, int mergeGapMs = 200, int minSegmentMs = 120)
+        {
+            var result = new List<(DateTime start, DateTime end)>();
+            if (fps == null || fps.Count == 0) return result;
+            var ordered = fps.OrderBy(f => f.Timestamp).ToList();
+            DateTime curStart = ordered[0].Timestamp;
+            DateTime curEnd = ordered[0].Timestamp.AddMilliseconds(Math.Max(1, ordered[0].DurationMs));
+            for (int i = 1; i < ordered.Count; i++)
+            {
+                var f = ordered[i];
+                var fStart = f.Timestamp;
+                var fEnd = f.Timestamp.AddMilliseconds(Math.Max(1, f.DurationMs));
+                if (fStart <= curEnd.AddMilliseconds(mergeGapMs))
+                {
+                    // extend
+                    if (fEnd > curEnd) curEnd = fEnd;
+                }
+                else
+                {
+                    // finalize current
+                    if ((curEnd - curStart).TotalMilliseconds >= minSegmentMs) result.Add((curStart, curEnd));
+                    curStart = fStart; curEnd = fEnd;
+                }
+            }
+            if ((curEnd - curStart).TotalMilliseconds >= minSegmentMs) result.Add((curStart, curEnd));
+            return result;
+        }
+
+        private (DateTime start, DateTime end) ExpandSegmentAroundIndex(List<FingerprintingProcessor.Fingerprint> fps, int index, int mergeGapMs = 400)
+        {
+            if (fps == null || fps.Count == 0) return (DateTime.MinValue, DateTime.MinValue);
+            var ordered = fps.OrderBy(f => f.Timestamp).ToList();
+            if (index < 0) index = 0;
+            if (index >= ordered.Count) index = ordered.Count - 1;
+            // find the fingerprint reference in ordered list by matching timestamp and id
+            var target = fps[index];
+            int i = ordered.FindIndex(f => f.Id == target.Id && f.Timestamp == target.Timestamp);
+            if (i < 0) i = ordered.FindIndex(f => f.Timestamp == target.Timestamp);
+            if (i < 0) i = 0;
+
+            DateTime start = ordered[i].Timestamp;
+            // Compute an initial end that is based on neighbor midpoints rather than trusting DurationMs
+            DateTime end;
+            if (ordered.Count == 1)
+            {
+                // single node: use a sensible default (1s) or clamp to source audio duration if available
+                double defaultMs = 1000.0;
+                if (this.sourceAudio != null) defaultMs = Math.Min(defaultMs, Math.Max(100.0, this.sourceAudio.Duration.TotalMilliseconds / 10.0));
+                end = start.AddMilliseconds(defaultMs);
+            }
+            else if (i < ordered.Count - 1 && i > 0)
+            {
+                // middle node: use midpoint between previous and next timestamp
+                var prev = ordered[i - 1].Timestamp;
+                var next = ordered[i + 1].Timestamp;
+                long midTicks = (prev.Ticks + next.Ticks) / 2;
+                end = new DateTime(midTicks);
+                // ensure end is at least start + 1ms
+                if (end <= start) end = start.AddMilliseconds(1);
+            }
+            else if (i == 0)
+            {
+                // first node: use midpoint to next
+                var next = ordered[Math.Min(i + 1, ordered.Count - 1)].Timestamp;
+                long midTicks = (start.Ticks + next.Ticks) / 2;
+                end = new DateTime(Math.Max(start.Ticks + 1, midTicks));
+            }
+            else
+            {
+                // last node: use midpoint from previous
+                var prev = ordered[Math.Max(0, i - 1)].Timestamp;
+                long midTicks = (prev.Ticks + start.Ticks) / 2;
+                end = new DateTime(Math.Max(start.Ticks + 1, midTicks));
+            }
+
+            // expand left
+            for (int L = i - 1; L >= 0; L--)
+            {
+                var prev = ordered[L];
+                var gap = (start - prev.Timestamp).TotalMilliseconds;
+                if (gap <= mergeGapMs)
+                {
+                    start = prev.Timestamp;
+                }
+                else break;
+            }
+            // expand right
+            for (int R = i + 1; R < ordered.Count; R++)
+            {
+                var next = ordered[R];
+                var gap = (next.Timestamp - end).TotalMilliseconds;
+                if (gap <= mergeGapMs)
+                {
+                    end = next.Timestamp.AddMilliseconds(Math.Max(1, next.DurationMs));
+                }
+                else break;
+            }
+            return (start, end);
         }
 
         private async Task PlayNodeAudioAsync(int nodeIndex)
@@ -827,7 +1011,9 @@ namespace LAWS.Voices.Forms
             if (e.Button != MouseButtons.Left) return;
             this.isPanning = true;
             this.panStartMouse = this.pictureBox.PointToScreen(e.Location);
-            this.panStartScroll = this.picturePanel.AutoScrollPosition;
+            // use manual scroll offsets instead of AutoScrollPosition
+            this.panStartScroll = this.picturePanelScroll;
+            this.dragMoved = false;
             this.pictureBox.Cursor = Cursors.Hand;
             this.pictureBox.Capture = true;
         }
@@ -837,9 +1023,16 @@ namespace LAWS.Voices.Forms
             if (!this.isPanning) return;
             var screen = this.pictureBox.PointToScreen(e.Location);
             var dx = screen.X - this.panStartMouse.X; var dy = screen.Y - this.panStartMouse.Y;
-            var newScrollX = -(this.panStartScroll.X + dx);
-            var newScrollY = -(this.panStartScroll.Y + dy);
-            this.picturePanel.AutoScrollPosition = new Point(newScrollX, newScrollY);
+            if (Math.Abs(dx) > DragThreshold || Math.Abs(dy) > DragThreshold) this.dragMoved = true;
+            var newScrollX = this.panStartScroll.X - dx;
+            var newScrollY = this.panStartScroll.Y - dy;
+            // clamp to image bounds
+            int maxScrollX = Math.Max(0, Math.Max(0, this.pictureBox.Width) - this.picturePanel.ClientSize.Width);
+            int maxScrollY = Math.Max(0, Math.Max(0, this.pictureBox.Height) - this.picturePanel.ClientSize.Height);
+            newScrollX = Math.Clamp(newScrollX, 0, maxScrollX);
+            newScrollY = Math.Clamp(newScrollY, 0, maxScrollY);
+            this.picturePanelScroll = new Point(newScrollX, newScrollY);
+            this.pictureBox.Location = new Point(-this.picturePanelScroll.X, -this.picturePanelScroll.Y);
         }
 
         private void PictureBox_MouseUp(object? sender, MouseEventArgs e)
@@ -847,40 +1040,89 @@ namespace LAWS.Voices.Forms
             this.isPanning = false;
             this.pictureBox.Cursor = Cursors.Default;
             this.pictureBox.Capture = false;
+            // If we moved during drag, suppress the next click event
+            if (this.dragMoved)
+            {
+                this.suppressClickOnce = true;
+            }
         }
 
         private void PictureBox_MouseWheel(object? sender, MouseEventArgs e)
         {
             if (this.bmp == null) return;
             float factor = (float)Math.Pow(1.12f, e.Delta / 120f);
-            this.imageZoom = Math.Clamp(this.imageZoom * factor, 0.01f, 24f);
+            try { StaticLogger.Log($"MouseWheel start: Delta={e.Delta}, factor={factor}, imageZoom(before)={this.imageZoom}, AutoScroll={this.picturePanel.AutoScrollPosition}, pictureBox.Left={this.pictureBox.Left}, pictureBox.Size={this.pictureBox.Size}"); } catch { }
+            // compute new zoom
+            float newZoom = Math.Clamp(this.imageZoom * factor, 0.01f, 24f);
 
-            // If we are in tree view, re-render bitmap at the requested zoom scale to keep it sharp
+            // Compute mouse position relative to the visible viewport (panel) and image-relative coordinates
+            var panelMouse = this.picturePanel.PointToClient(Cursor.Position); // mouse relative to visible panel
+            // clamp panelMouse to panel bounds
+            panelMouse.X = Math.Clamp(panelMouse.X, 0, this.picturePanel.ClientSize.Width);
+            panelMouse.Y = Math.Clamp(panelMouse.Y, 0, this.picturePanel.ClientSize.Height);
+
+            int curScrollX = this.picturePanelScroll.X;
+            int curScrollY = this.picturePanelScroll.Y;
+            int oldPicW = Math.Max(1, this.pictureBox.Width);
+            int oldPicH = Math.Max(1, this.pictureBox.Height);
+
+            // image pixel coord under mouse before zoom (in pictureBox pixel space)
+            double imgX = panelMouse.X + curScrollX;
+            double imgY = panelMouse.Y + curScrollY;
+
+            // If we are in tree view, schedule a re-render at new zoom scale and do NOT change scroll here.
             if (this.isTreeView && this.fingerprints != null && this.fingerprints.Count > 0)
             {
-                // Debounce repeated wheel events to avoid jumping back and forth
+                this.imageZoom = newZoom;
+                var clientPosLocal = this.picturePanel.PointToClient(Cursor.Position);
+                // clamp to viewport
+                clientPosLocal.X = Math.Clamp(clientPosLocal.X, 0, this.picturePanel.ClientSize.Width);
+                clientPosLocal.Y = Math.Clamp(clientPosLocal.Y, 0, this.picturePanel.ClientSize.Height);
+                int scrollX = this.picturePanelScroll.X;
+                int scrollY = this.picturePanelScroll.Y;
+                    float anchorRx = (float)((clientPosLocal.X + scrollX) / (double)Math.Max(1, this.pictureBox.Width));
+                    float anchorRy = (float)((clientPosLocal.Y + scrollY) / (double)Math.Max(1, this.pictureBox.Height));
+                    anchorRx = Math.Clamp(anchorRx, 0f, 1f);
+                    anchorRy = Math.Clamp(anchorRy, 0f, 1f);
+                    var anchor = new PointF(anchorRx, anchorRy);
                 lock (this.zoomLock)
                 {
                     try { this.zoomDebounceTimer?.Change(System.Threading.Timeout.Infinite, System.Threading.Timeout.Infinite); } catch { }
                     this.zoomDebounceTimer = new System.Threading.Timer(_ =>
                     {
-                        try { _ = this.RenderTreeAsync(this.treeBaseWidth, this.treeBaseHeight); } catch { }
+                        try { _ = this.RenderTreeAsync(this.treeBaseWidth, this.treeBaseHeight, anchor, new Point(clientPosLocal.X, clientPosLocal.Y)); } catch { }
                     }, null, 180, System.Threading.Timeout.Infinite);
                 }
-            }
-            else
-            {
-                // fallback: just scale image
-                var newW = (int)(this.bmp.Width * this.imageZoom);
-                var newH = (int)(this.bmp.Height * this.imageZoom);
-                this.pictureBox.Size = new Size(Math.Max(1, newW), Math.Max(1, newH));
+                // Do not set AutoScrollPosition here; SetImage will apply anchor when new bitmap is ready.
+                return;
             }
 
-            var clientPos = e.Location;
-            float rx = (clientPos.X + this.picturePanel.AutoScrollPosition.X - this.pictureBox.Left) / (float)Math.Max(1, this.pictureBox.Width);
-            int newScrollX = (int)(rx * this.pictureBox.Width - clientPos.X);
-            int currentScrollY = -this.picturePanel.AutoScrollPosition.Y;
-            this.picturePanel.AutoScrollPosition = new Point(newScrollX, currentScrollY);
+            // Non-tree: immediate resize of pictureBox according to new zoom and preserve point under cursor
+            this.imageZoom = newZoom;
+            int newW = (int)(this.bmp.Width * this.imageZoom);
+            int newH = (int)(this.bmp.Height * this.imageZoom);
+            newW = Math.Max(1, newW); newH = Math.Max(1, newH);
+            // set new size
+            this.pictureBox.Size = new Size(newW, newH);
+
+            // compute new scroll so that the same image pixel stays under the mouse
+            double scaleX = (double)newW / oldPicW;
+            double scaleY = (double)newH / oldPicH;
+            // compute where the same image pixel (imgX,imgY) should appear within the panel after scaling
+            int computedScrollX = (int)Math.Round(imgX * scaleX - (panelMouse.X));
+            int computedScrollY = (int)Math.Round(imgY * scaleY - (panelMouse.Y));
+
+            try
+            {
+                int maxScrollX = Math.Max(0, this.pictureBox.Width - this.picturePanel.ClientSize.Width);
+                int maxScrollY = Math.Max(0, this.pictureBox.Height - this.picturePanel.ClientSize.Height);
+                computedScrollX = Math.Clamp(computedScrollX, 0, maxScrollX);
+                computedScrollY = Math.Clamp(computedScrollY, 0, maxScrollY);
+                // apply to manual scroll and reposition pictureBox
+                this.picturePanelScroll = new Point(computedScrollX, computedScrollY);
+                this.pictureBox.Location = new Point(-this.picturePanelScroll.X, -this.picturePanelScroll.Y);
+            }
+            catch { }
         }
 
         private void PictureBox_Paint(object? sender, PaintEventArgs e)

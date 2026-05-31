@@ -1,0 +1,112 @@
+## WORKSPACE EXECUTIVE SUMMARY (YAML)
+# Generated: 2026-05-31T14:16:51.9432735+02:00
+# Root: C:\Users\marce\source\repos\alarmclock-kisser\LAWS.Voices
+Architecture:
+  Type: Backend (C#/.NET)
+  Scale: 45 relevant source files
+  Components: 0
+  Controllers: 0
+  Models: 0
+  Services: 1
+---
+- File: LAWS.Voices.Cuda13\LAWS.Voices.Cuda13.csproj
+  Preview: "<Project Sdk='Microsoft.NET.Sdk'>  <PropertyGroup>   <TargetFramework>net10.0</TargetFramework>   <ImplicitUsings>enable</ImplicitUsings>   <Nullable>..."
+- File: LAWS.Voices.Downloader\LAWS.Voices.Downloader.csproj
+  Preview: "<Project Sdk='Microsoft.NET.Sdk'>  <PropertyGroup>   <OutputType>Exe</OutputType>   <TargetFramework>net10.0</TargetFramework>   <ImplicitUsings>enabl..."
+- File: LAWS.Voices.Forms\LAWS.Voices.Forms.csproj
+  Preview: "<Project Sdk='Microsoft.NET.Sdk'>  <PropertyGroup>   <OutputType>WinExe</OutputType>   <TargetFramework>net10.0-windows</TargetFramework>   <Nullable>..."
+- File: LAWS.Voices.Multimodal\LAWS.Voices.Multimodal.csproj
+  Preview: "<Project Sdk='Microsoft.NET.Sdk'>  <PropertyGroup>   <TargetFramework>net10.0</TargetFramework>   <ImplicitUsings>enable</ImplicitUsings>   <Nullable>..."
+- File: LAWS.Voices.OpenVino\LAWS.Voices.OpenVino.csproj
+  Preview: "<Project Sdk='Microsoft.NET.Sdk'> 	<PropertyGroup> 		<TargetFramework>net10.0</TargetFramework> 		<ImplicitUsings>enable</ImplicitUsings> 		<Nullable>..."
+- File: LAWS.Voices.Shared\LAWS.Voices.Shared.csproj
+  Preview: "<Project Sdk='Microsoft.NET.Sdk'>  <PropertyGroup>   <TargetFramework>net10.0</TargetFramework>   <ImplicitUsings>enable</ImplicitUsings>   <Nullable>..."
+- File: LAWS.Voices.slnx
+  Preview: "<Solution>  <Project Path='LAWS.Voices.Cuda13/LAWS.Voices.Cuda13.csproj' Id='fe3be126-0057-4cb7-98da-53c814fb9c0c' />  <Project Path='LAWS.Voices.Down..."
+- File: LICENSE.txt
+  Preview: "MIT License Copyright (c) [year] [fullname] Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associat..."
+- File: README.md
+  Preview: "# LAWS.Voices.Downloader"
+- File: .github\copilot-instructions.md
+  Preview: "# Copilot Instructions ## Projektrichtlinien - Preference: UI language should always be English for window UI, dialogs, prompts and logs in this repos..."
+- File: LAWS.Voices.Cuda13\CudaWrapper.cs
+  Preview: "using System; using System.Collections.Generic; using System.ComponentModel; using System.Numerics; using System.Collections.Concurrent; using System...."
+- File: LAWS.Voices.Downloader\appsettings.json
+  Preview: "{  'ModelZooBaseUrl': 'https://github.com/openvinotoolkit/open_model_zoo/tree/master/models',  'ModelsDirectory': 'D:\\Models\\OpenVino',  'TimeoutDow..."
+- File: LAWS.Voices.Downloader\OpenVinoModelDownloader.cs
+  Preview: "using LAWS.Voices.Shared; using System; using System.Collections.Generic; using System.IO; using System.Linq; using System.Net.Http; using System.Text..."
+- File: LAWS.Voices.Downloader\OpenVinoModelXmlParser.cs
+  Symbols: [OpenVinoModelXmlParser]
+  Preview: "using LAWS.Voices.Shared; using System; using System.Collections.Generic; using System.Linq; using System.Net.Http; using System.Threading.Tasks; name..."
+- File: LAWS.Voices.Downloader\Program.cs
+  Symbols: [Pro]
+  Preview: "using LAWS.Voices.Shared; using Microsoft.Extensions.Configuration; using System; using System.Collections.Generic; using System.IO; using System.Linq..."
+- File: LAWS.Voices.Forms\appsettings.json
+  Preview: "{  'ModelZooBaseUrl': 'https://github.com/openvinotoolkit/open_model_zoo/tree/master/models',  'ModelsDirectory': 'D:\\Models\\OpenVino',  'TimeoutDow..."
+- File: LAWS.Voices.Forms\CudaActionsForm.cs
+  Preview: "using LAWS.Voices.Cuda13; using LAWS.Voices.Multimodal.Audio; using LAWS.Voices.Shared; using System; using System.Numerics; using System.Collections...."
+- File: LAWS.Voices.Forms\CudaActionsForm.Designer.cs
+  Symbols: [CudaActionsForm]
+  Preview: "namespace LAWS.Voices.Forms {   partial class CudaActionsForm   {     /// <summary>     /// Required designer variable.     /// </summary>     private..."
+- File: LAWS.Voices.Forms\NodeDetailsForm.cs
+  Preview: "using System; using System.Drawing; using System.IO; using System.Threading.Tasks; using System.Windows.Forms; using LAWS.Voices.Multimodal.Audio.Proc..."
+- File: LAWS.Voices.Forms\Program.cs
+  Symbols: [Program]
+  Preview: "using LAWS.Voices.Shared; using Microsoft.Extensions.Configuration; using Microsoft.Extensions.DependencyInjection; namespace LAWS.Voices.Forms {   in..."
+- File: LAWS.Voices.Forms\ProgressForm.cs
+  Symbols: [ProgressForm]
+  Preview: "using System; using System.Diagnostics; using System.Text; using System.Threading.Tasks; using System.Windows.Forms; namespace LAWS.Voices.Forms {   p..."
+- File: LAWS.Voices.Forms\ResultVisualizerForm.cs
+  Symbols: [BuildFingerprintSegments, ShowNodeDetails, InitializeComponent, BtnExportTree_Click, PictureBox_Paint, BtnShowTree_Click, ExportSongSamplesAsync, SetImage, PictureBox_MouseWheel, BtnCopy_Click, RenderFingerprintTreeSvg, for, for, for, for]
+  Preview: "using System; using System.Collections.Generic; using System.Drawing; using System.Drawing.Drawing2D; using LAWS.Voices.OpenVino; using System.Linq; u..."
+- File: LAWS.Voices.Forms\Wav2VecExtractionForm.cs
+  Preview: "using System; using System.Collections.Generic; using System.Drawing; using System.IO; using System.IO.Compression; using System.Linq; using System.Te..."
+- File: LAWS.Voices.Forms\Wav2VecVisualizerForm.cs
+  Preview: "using System; using System.Drawing; using System.Windows.Forms; using System.IO; using System.IO.Compression; using NAudio.Wave; using LAWS.Voices.Mul..."
+- File: LAWS.Voices.Forms\WindowMain.cs
+  Preview: "using LAWS.Voices.Multimodal.Audio; using LAWS.Voices.Multimodal.Image; using LAWS.Voices.OpenVino; using LAWS.Voices.Shared; using OpenVinoSharp; usi..."
+- File: LAWS.Voices.Forms\WindowMain.Designer.cs
+  Symbols: [WindowMain]
+  Preview: "namespace LAWS.Voices.Forms {   partial class WindowMain   {     /// <summary>     /// Required designer variable.     /// </summary>     private Syst..."
+- File: LAWS.Voices.OpenVino\OpenVinoService.cs
+  Preview: "using System; using System.Collections.Generic; using System.Reflection; using System.IO; using System.Linq; using System.Text.RegularExpressions; usi..."
+- File: LAWS.Voices.OpenVino\ResultExtractor.cs
+  Symbols: [ExtractionResult]
+  Preview: "using System; using System.Collections.Generic; using System.Linq; using OpenVinoSharp; namespace LAWS.Voices.OpenVino {   #region Data Models   publi..."
+- File: LAWS.Voices.OpenVino\TimeSeriesRunner.cs
+  Preview: "using System; using System.Buffers; using System.Collections.Generic; using System.Reflection; using System.Threading; using LAWS.Voices.Shared; names..."
+- File: LAWS.Voices.Shared\Appsettings.cs
+  Symbols: [Appsettings]
+  Preview: "using System; using System.Collections.Generic; using System.Text; using System.Text.Json.Serialization; namespace LAWS.Voices.Shared {   public class..."
+- File: LAWS.Voices.Shared\OpenVinoModelInfo.cs
+  Preview: "using System; using System.Collections.Generic; using System.Text; using System.Text.Json.Serialization; namespace LAWS.Voices.Shared {   public enum ..."
+- File: LAWS.Voices.Shared\StaticLogger.cs
+  Preview: "using System; using System.Collections.Concurrent; using System.Collections.Generic; using System.ComponentModel; using System.Runtime.Serialization; ..."
+- File: LAWS.Voices.Multimodal\Audio\AudioHandling.cs
+  Preview: "using System; using System.Collections.Concurrent; using System.Collections.Generic; using System.ComponentModel; using System.IO; using System.Linq; ..."
+- File: LAWS.Voices.Multimodal\Audio\AudioObj.cs
+  Preview: "using LAWS.Voices.Shared; using Microsoft.VisualBasic; using NAudio.Wave; using NAudio.Wave.SampleProviders; using System; using System.Collections.Ge..."
+- File: LAWS.Voices.Multimodal\Image\ImageCollection.cs
+  Preview: "using System; using System.Collections.Concurrent; using System.Collections.Generic; using System.ComponentModel; using System.Drawing; using System.D..."
+- File: LAWS.Voices.Multimodal\Image\ImageObj.cs
+  Preview: "using System; using System.Drawing; using System.Drawing.Imaging; using System.IO; using System.Runtime.InteropServices; using System.Runtime.Versioni..."
+- File: LAWS.Voices.OpenVino\Processors\AclNetProcessor.cs
+  Symbols: [AclNetAnalysisResult]
+  Preview: "using LAWS.Voices.Shared; using System; using System.Collections.Generic; using System.Linq; namespace LAWS.Voices.OpenVino.Processors {   public clas..."
+- File: LAWS.Voices.OpenVino\Processors\BirdNETProcessor.cs
+  Symbols: [BirdNetAnalysisResult]
+  Preview: "using LAWS.Voices.Shared; using OpenVinoSharp; using System; using System.Collections.Generic; using System.IO; using System.Linq; using System.Reflec..."
+- File: LAWS.Voices.OpenVino\Processors\Wav2Vec2Processor.cs
+  Preview: "using LAWS.Voices.Shared; using OpenVinoSharp; using System; using System.Collections.Generic; using System.Linq; using System.Reflection; using Syste..."
+- File: LAWS.Voices.OpenVino\Processors\Wav2VecVisualizer.cs
+  Symbols: [Wav2Vec2Visualizer]
+  Preview: "using System; using System.Drawing; using System.Drawing.Imaging; using System.Linq; using System.Runtime.Versioning; namespace LAWS.Voices.OpenVino.P..."
+- File: tools\convert_wav2vec2\convert_wav2vec2.ps1
+  Preview: "param( 	[Parameter(Mandatory=$true)][string]$ModelDir, 	[Parameter(Mandatory=$true)][string]$OutDir, 	[int]$SampleLen = 16000, 	[int]$Opset = 11, 	[sw..."
+- File: tools\convert_wav2vec2\convert_wav2vec2.py
+  Preview: "#!/usr/bin/env python3 ''' Export a local HuggingFace wav2vec2 model (pytorch checkpoint) to ONNX and optionally run the OpenVINO Model Optimizer to p..."
+- File: tools\convert_wav2vec2\README.md
+  Preview: "Convert wav2vec2 PyTorch checkpoint to ONNX and OpenVINO IR Steps 1) Place the HuggingFace wav2vec2 model files (config.json, pytorch_model.bin, vocab..."
+- File: LAWS.Voices.Multimodal\Audio\Processors\FingerprintingProcessor.cs
+  Symbols: [ExecuteForwardFFT, PeakNode, DeriveHistoricalCrossReferences, to, FingerprintingProcessor, FingerprintingProcessor, for, for, for, for, for, for, for, for, for]
+  Preview: "using LAWS.Voices.Shared; using System; using System.Collections.Concurrent; using System.Collections.Generic; using System.IO; using System.Linq; usi..."
