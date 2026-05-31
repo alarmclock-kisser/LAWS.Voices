@@ -18,6 +18,7 @@ namespace LAWS.Voices.Forms
         private Button btnPlay = new Button();
         private Button btnPause = new Button();
         private Button btnStop = new Button();
+        private Button btnExport = new Button();
         private TextBox txtInfo = new TextBox();
 
         private WaveOutEvent? playbackDevice;
@@ -35,7 +36,7 @@ namespace LAWS.Voices.Forms
             this.segmentStart = segmentStart;
             this.segmentEnd = segmentEnd;
             this.InitializeComponent();
-            this.Load += NodeDetailsForm_Load;
+            this.Load += this.NodeDetailsForm_Load;
         }
 
         private void InitializeComponent()
@@ -55,24 +56,102 @@ namespace LAWS.Voices.Forms
             this.btnPlay.Left = 12;
             this.btnPlay.Top = 240;
             this.btnPlay.Width = 90;
-            this.btnPlay.Click += async (_, __) => await PlayAsync();
+            this.btnPlay.Click += this.BtnPlay_Click;
 
             this.btnPause.Text = "Pause";
             this.btnPause.Left = this.btnPlay.Right + 8;
             this.btnPause.Top = 240;
             this.btnPause.Width = 90;
-            this.btnPause.Click += (_, __) => Pause();
+            this.btnPause.Click += (_, __) => this.Pause();
 
             this.btnStop.Text = "Stop";
             this.btnStop.Left = this.btnPause.Right + 8;
             this.btnStop.Top = 240;
             this.btnStop.Width = 90;
-            this.btnStop.Click += (_, __) => Stop();
+            this.btnStop.Click += (_, __) => this.Stop();
+
+            this.btnExport.Text = "Export";
+            this.btnExport.Left = this.btnStop.Right + 8;
+            this.btnExport.Top = 240;
+            this.btnExport.Width = 90;
+            this.btnExport.Click += this.BtnExport_Click;
 
             this.Controls.Add(this.txtInfo);
             this.Controls.Add(this.btnPlay);
             this.Controls.Add(this.btnPause);
             this.Controls.Add(this.btnStop);
+            this.Controls.Add(this.btnExport);
+        }
+
+        private async void BtnPlay_Click(object? sender, EventArgs e)
+        {
+            await this.PlayAsync();
+        }
+
+        private void BtnExport_Click(object? sender, EventArgs e)
+        {
+            try
+            {
+                if (this.sourceAudio == null) { MessageBox.Show(this, "No source audio available.", "Export", MessageBoxButtons.OK, MessageBoxIcon.Warning); return; }
+
+                string music = Environment.GetFolderPath(Environment.SpecialFolder.MyMusic);
+                var sfd = new SaveFileDialog();
+                sfd.InitialDirectory = music;
+                sfd.Filter = "Wave Files (*.wav)|*.wav";
+                string baseName = this.sourceAudio?.Name ?? "sample";
+                foreach (var inv in Path.GetInvalidFileNameChars()) baseName = baseName.Replace(inv, '_');
+                sfd.FileName = $"{baseName}_node{this.nodeIndex}.wav";
+                if (sfd.ShowDialog(this) != DialogResult.OK) return;
+
+                var bytes = this.BuildSegmentWavBytes();
+                if (bytes == null || bytes.Length == 0) { MessageBox.Show(this, "No audio to export.", "Export", MessageBoxButtons.OK, MessageBoxIcon.Information); return; }
+                File.WriteAllBytes(sfd.FileName, bytes);
+                MessageBox.Show(this, $"Exported to: {sfd.FileName}", "Export", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(this, "Export failed: " + ex.Message, "Export", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        private byte[]? BuildSegmentWavBytes()
+        {
+            try
+            {
+                if (this.sourceAudio == null) return null;
+                int sr = this.sourceAudio.SampleRate > 0 ? this.sourceAudio.SampleRate : 44100;
+                int ch = this.sourceAudio.Channels > 0 ? this.sourceAudio.Channels : 1;
+                DateTime sdt = this.segmentStart ?? this.node.Timestamp;
+                DateTime edt = this.segmentEnd ?? this.node.Timestamp.AddMilliseconds(Math.Max(1, this.node.DurationMs));
+                sdt = sdt.AddMilliseconds(-40);
+                edt = edt.AddMilliseconds(40);
+                long startSample = (long)Math.Max(0, Math.Floor((sdt - this.sourceAudio.CreatedAt).TotalSeconds * sr) * ch);
+                long endSample = (long)Math.Min(this.sourceAudio.Data.Length, Math.Ceiling((edt - this.sourceAudio.CreatedAt).TotalSeconds * sr) * ch);
+                if (endSample <= startSample) return null;
+                int len = (int)(endSample - startSample);
+                var buf = new float[len];
+                Array.Copy(this.sourceAudio.Data, startSample, buf, 0, len);
+
+                var ms = new MemoryStream();
+                var waveFormat = new WaveFormat(sr, 16, ch);
+                using (var writer = new WaveFileWriter(ms, waveFormat))
+                {
+                    var buffer = new byte[len * 2];
+                    int bi = 0;
+                    for (int i = 0; i < len; i++)
+                    {
+                        short s = (short)Math.Max(short.MinValue, Math.Min(short.MaxValue, (int)(buf[i] * 32767.0f)));
+                        buffer[bi++] = (byte)(s & 0xFF);
+                        buffer[bi++] = (byte)((s >> 8) & 0xFF);
+                    }
+                    writer.Write(buffer, 0, buffer.Length);
+                    writer.Flush();
+                }
+                var bytes = ms.ToArray();
+                try { ms.Dispose(); } catch { }
+                return bytes;
+            }
+            catch { return null; }
         }
 
         private void NodeDetailsForm_Load(object? sender, EventArgs e)
@@ -94,7 +173,7 @@ namespace LAWS.Voices.Forms
 
         protected override void OnFormClosing(FormClosingEventArgs e)
         {
-            try { Stop(); } catch { }
+            try { this.Stop(); } catch { }
             base.OnFormClosing(e);
         }
 
@@ -103,7 +182,7 @@ namespace LAWS.Voices.Forms
             try
             {
                 if (this.sourceAudio == null) { MessageBox.Show(this, "No source audio available.", "Play", MessageBoxButtons.OK, MessageBoxIcon.Warning); return; }
-                Stop();
+                this.Stop();
 
                 int sr = this.sourceAudio.SampleRate > 0 ? this.sourceAudio.SampleRate : 44100;
                 int ch = this.sourceAudio.Channels > 0 ? this.sourceAudio.Channels : 1;
@@ -113,8 +192,11 @@ namespace LAWS.Voices.Forms
                 // add small padding
                 sdt = sdt.AddMilliseconds(-40);
                 edt = edt.AddMilliseconds(40);
-                long startSample = (long)Math.Max(0, Math.Floor((sdt - this.sourceAudio.CreatedAt).TotalSeconds * sr) * ch);
-                long endSample = (long)Math.Min(this.sourceAudio.Data.Length, Math.Ceiling((edt - this.sourceAudio.CreatedAt).TotalSeconds * sr) * ch);
+                // compute frame positions with rounding to avoid zero-length due to floor/ceil on very short segments
+                double startFrame = (sdt - this.sourceAudio.CreatedAt).TotalSeconds * sr;
+                double endFrame = (edt - this.sourceAudio.CreatedAt).TotalSeconds * sr;
+                long startSample = (long)Math.Max(0, Math.Round(startFrame)) * ch;
+                long endSample = (long)Math.Min(this.sourceAudio.Data.Length, Math.Max(startSample + 1, (long)Math.Round(endFrame) * ch));
                 if (endSample <= startSample) { MessageBox.Show(this, "Node audio segment is empty.", "Play", MessageBoxButtons.OK, MessageBoxIcon.Information); return; }
 
                 int len = (int)(endSample - startSample);

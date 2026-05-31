@@ -1,9 +1,9 @@
 ## WORKSPACE EXECUTIVE SUMMARY (YAML)
-# Generated: 2026-05-31T14:16:51.9432735+02:00
-# Root: C:\Users\marce\source\repos\alarmclock-kisser\LAWS.Voices
+# Generated: 2026-06-01T01:09:59.0082504+02:00
+# Root: C:\Users\op\source\repos\alarmclock-kisser\LAWS.Voices
 Architecture:
   Type: Backend (C#/.NET)
-  Scale: 45 relevant source files
+  Scale: 47 relevant source files
   Components: 0
   Controllers: 0
   Models: 0
@@ -48,6 +48,12 @@ Architecture:
 - File: LAWS.Voices.Forms\CudaActionsForm.Designer.cs
   Symbols: [CudaActionsForm]
   Preview: "namespace LAWS.Voices.Forms {   partial class CudaActionsForm   {     /// <summary>     /// Required designer variable.     /// </summary>     private..."
+- File: LAWS.Voices.Forms\FingerprintingSettingsForm.cs
+  Symbols: [FingerprintingSettingsForm, FingerprintingSettingsForm]
+  Preview: "using System; using System.Drawing; using System.Windows.Forms; namespace LAWS.Voices.Forms {   public partial class FingerprintingSettingsForm : Form..."
+- File: LAWS.Voices.Forms\FingerprintingSettingsForm.Designer.cs
+  Symbols: [FingerprintingSettingsForm]
+  Preview: "using System; using System.Windows.Forms; using System.Drawing; namespace LAWS.Voices.Forms {   partial class FingerprintingSettingsForm   {     // pe..."
 - File: LAWS.Voices.Forms\NodeDetailsForm.cs
   Preview: "using System; using System.Drawing; using System.IO; using System.Threading.Tasks; using System.Windows.Forms; using LAWS.Voices.Multimodal.Audio.Proc..."
 - File: LAWS.Voices.Forms\Program.cs
@@ -57,7 +63,6 @@ Architecture:
   Symbols: [ProgressForm]
   Preview: "using System; using System.Diagnostics; using System.Text; using System.Threading.Tasks; using System.Windows.Forms; namespace LAWS.Voices.Forms {   p..."
 - File: LAWS.Voices.Forms\ResultVisualizerForm.cs
-  Symbols: [BuildFingerprintSegments, ShowNodeDetails, InitializeComponent, BtnExportTree_Click, PictureBox_Paint, BtnShowTree_Click, ExportSongSamplesAsync, SetImage, PictureBox_MouseWheel, BtnCopy_Click, RenderFingerprintTreeSvg, for, for, for, for]
   Preview: "using System; using System.Collections.Generic; using System.Drawing; using System.Drawing.Drawing2D; using LAWS.Voices.OpenVino; using System.Linq; u..."
 - File: LAWS.Voices.Forms\Wav2VecExtractionForm.cs
   Preview: "using System; using System.Collections.Generic; using System.Drawing; using System.IO; using System.IO.Compression; using System.Linq; using System.Te..."
@@ -108,5 +113,5 @@ Architecture:
 - File: tools\convert_wav2vec2\README.md
   Preview: "Convert wav2vec2 PyTorch checkpoint to ONNX and OpenVINO IR Steps 1) Place the HuggingFace wav2vec2 model files (config.json, pytorch_model.bin, vocab..."
 - File: LAWS.Voices.Multimodal\Audio\Processors\FingerprintingProcessor.cs
-  Symbols: [ExecuteForwardFFT, PeakNode, DeriveHistoricalCrossReferences, to, FingerprintingProcessor, FingerprintingProcessor, for, for, for, for, for, for, for, for, for]
-  Preview: "using LAWS.Voices.Shared; using System; using System.Collections.Concurrent; using System.Collections.Generic; using System.IO; using System.Linq; usi..."
+  Symbols: [catch, FingerprintingProcessor, for, for, for, for, for, for, for, for, for, for, for, for, for]
+  Preview: "using LAWS.Voices.Shared; // Stellen Sie sicher, dass diese Abhängigkeit korrekt ist using System; using System.Collections.Concurrent; using System.C..."

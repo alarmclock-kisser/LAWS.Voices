@@ -2215,9 +2215,29 @@ namespace LAWS.Voices.Forms
                     string? path = null;
                     try { path = aud.FilePath; } catch { path = null; }
 
-                    var processor = new FingerprintingProcessor(path, progress, cts.Token);
+                    // Show settings dialog before running fingerprinting
+                    FingerprintingProcessor? processor = null;
+                    using (var dlg = new FingerprintingSettingsForm())
+                    {
+                        if (dlg.ShowDialog(this) != DialogResult.OK)
+                        {
+                            MessageBox.Show("Fingerprinting cancelled by user.", "Fingerprinting", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                            return;
+                        }
 
-                    await Task.Run(async () => await processor.ProcessAudioObjectAsync(aud), cts.Token);
+                        processor = new FingerprintingProcessor(path, progress, cts.Token);
+                        await Task.Run(async () => await processor.ProcessAudioObjectAsync(
+                            aud,
+                            dlg.TrackMaxSilenceFrames,
+                            dlg.FrequencyTrackingTolerance,
+                            dlg.StereoDeviationTolerance,
+                            dlg.ProminenceOutlierHighFactor,
+                            dlg.ProminenceOutlierLowFactor,
+                            dlg.MinSampleDensity,
+                            dlg.MinDurationSeconds,
+                            dlg.TrimThresholdMultiplier
+                        ), cts.Token);
+                    }
 
                     // Offer to dump fingerprints to disk
                     try
@@ -2228,7 +2248,7 @@ namespace LAWS.Voices.Forms
                             FileName = (aud.Name ?? "audio") + "_fingerprints.csv",
                             DefaultExt = "csv"
                         };
-                        if (sfd.ShowDialog(this) == DialogResult.OK)
+                        if (sfd.ShowDialog(this) == DialogResult.OK && processor != null)
                         {
                             processor.DumpFingerprintsToDisk(sfd.FileName);
                             MessageBox.Show($"Fingerprints saved to: {sfd.FileName}", "Fingerprinting", MessageBoxButtons.OK, MessageBoxIcon.Information);
@@ -2246,7 +2266,7 @@ namespace LAWS.Voices.Forms
                     // Show visualizer with produced fingerprints and allow node playback
                     try
                     {
-                        var fps = processor.CapturedFingerprints;
+                        var fps = processor?.CapturedFingerprints ?? new System.Collections.Generic.List<LAWS.Voices.Multimodal.Audio.Processors.FingerprintingProcessor.Fingerprint>();
                         // attempt to obtain song blocks from Wav2Vec2 if available (best-effort)
                         List<Wav2Vec2Processor.BirdSongBlock>? songBlocks = null;
                         try

@@ -24,6 +24,8 @@ namespace LAWS.Voices.Forms
             // swallow mouse wheel to avoid default scroll behavior; parent handles zoom explicitly
             // Do nothing here to prevent automatic scrolling
         }
+
+
     }
     public class ResultVisualizerForm : Form
     {
@@ -64,6 +66,7 @@ namespace LAWS.Voices.Forms
         private AudioFileReader? playbackReader = null;
         private string? playbackTempFile = null;
         private Button btnNodePlay = new Button();
+        private Button btnCopyRandom = new Button();
         private int? selectedNodeIndex = null;
         // Keep a single NodeDetailsForm instance to avoid multiple open windows
         private NodeDetailsForm? openNodeDetailsForm = null;
@@ -281,6 +284,48 @@ namespace LAWS.Voices.Forms
             this.btnExportTree.Anchor = AnchorStyles.Left | AnchorStyles.Bottom;
             this.btnExportTree.Click += this.BtnExportTree_Click;
 
+            this.btnCopyRandom = new Button();
+            this.btnCopyRandom.Text = "Copy Random";
+            this.btnCopyRandom.Width = 120;
+            this.btnCopyRandom.Left = this.btnExportTree.Right + 8;
+            this.btnCopyRandom.Top = 6;
+            this.btnCopyRandom.Anchor = AnchorStyles.Left | AnchorStyles.Bottom;
+            this.btnCopyRandom.Click += (_, __) =>
+            {
+                try
+                {
+                    if (this.fingerprints == null || this.fingerprints.Count == 0) return;
+                    var rnd = new Random();
+                    int max = Math.Min(16, this.fingerprints.Count);
+                    var indices = new System.Collections.Generic.HashSet<int>();
+                    int attempts = 0;
+                    while (indices.Count < max && attempts < max * 4)
+                    {
+                        indices.Add(rnd.Next(0, this.fingerprints.Count));
+                        attempts++;
+                    }
+
+                    var sb = new System.Text.StringBuilder();
+                    foreach (var idx in indices)
+                    {
+                        var f = this.fingerprints[idx];
+                        sb.AppendLine($"Index: {idx}");
+                        sb.AppendLine($"Timestamp: {f.Timestamp:O}");
+                        sb.AppendLine($"DurationMs: {f.DurationMs}");
+                        sb.AppendLine($"ToneCount: {f.ToneCount}");
+                        sb.AppendLine("Features:");
+                        foreach (var kv in f.Features) sb.AppendLine($"  {kv.Key}: {kv.Value}");
+                        sb.AppendLine();
+                    }
+
+                    Clipboard.SetText(sb.ToString());
+                }
+                catch (Exception ex)
+                {
+                    MessageBox.Show(this, "Failed to copy node info: " + ex.Message, "Copy Random", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                }
+            };
+
             this.btnClose = new Button();
             this.btnClose.Text = "Close";
             this.btnClose.Width = 90;
@@ -294,6 +339,7 @@ namespace LAWS.Voices.Forms
             panel.Controls.Add(this.btnExportZip);
             panel.Controls.Add(this.btnShowTree);
             panel.Controls.Add(this.btnExportTree);
+            panel.Controls.Add(this.btnCopyRandom);
             panel.Controls.Add(this.btnNodePlay);
             panel.Controls.Add(this.btnClose);
 
@@ -348,7 +394,7 @@ namespace LAWS.Voices.Forms
             // Node play button
             this.btnNodePlay.Text = "Play";
             this.btnNodePlay.Width = 80;
-            this.btnNodePlay.Left = this.btnExportTree.Right + 8;
+            this.btnNodePlay.Left = this.btnCopyRandom.Right + 8;
             this.btnNodePlay.Top = 6;
             this.btnNodePlay.Anchor = AnchorStyles.Left | AnchorStyles.Bottom;
             this.btnNodePlay.Enabled = false;
@@ -838,7 +884,7 @@ namespace LAWS.Voices.Forms
                 if (this.fingerprints == null || nodeIndex < 0 || nodeIndex >= this.fingerprints.Count) return;
                 var node = this.fingerprints[nodeIndex];
                 // expand around selected node to form a playback segment
-                var seg = ExpandSegmentAroundIndex(this.fingerprints, nodeIndex, mergeGapMs: 400);
+                var seg = this.ExpandSegmentAroundIndex(this.fingerprints, nodeIndex, mergeGapMs: 400);
                 // Ensure only one node details window exists at a time
                 try { if (this.openNodeDetailsForm != null && !this.openNodeDetailsForm.IsDisposed) this.openNodeDetailsForm.Close(); } catch { }
                 this.openNodeDetailsForm = new NodeDetailsForm(nodeIndex, node, this.sourceAudio, seg.start, seg.end);
@@ -965,9 +1011,12 @@ namespace LAWS.Voices.Forms
 
                 int sr = this.sourceAudio.SampleRate > 0 ? this.sourceAudio.SampleRate : 44100;
                 int ch = this.sourceAudio.Channels > 0 ? this.sourceAudio.Channels : 1;
-                long startSample = (long)Math.Max(0, Math.Floor((node.Timestamp - this.sourceAudio.CreatedAt).TotalSeconds * sr) * ch);
-                long lenSamples = (long)Math.Max(1, Math.Ceiling(node.DurationMs / 1000.0 * sr) * ch);
-                long endSample = Math.Min(this.sourceAudio.Data.Length, startSample + lenSamples);
+                // compute frame positions robustly (use rounding and ensure at least one sample)
+                double startFrame = (node.Timestamp - this.sourceAudio.CreatedAt).TotalSeconds * sr;
+                double durationFrames = Math.Max(1.0, (node.DurationMs / 1000.0) * sr);
+                double endFrame = startFrame + durationFrames;
+                long startSample = (long)Math.Max(0, Math.Round(startFrame)) * ch;
+                long endSample = (long)Math.Min(this.sourceAudio.Data.Length, Math.Max(startSample + 1, (long)Math.Round(endFrame) * ch));
                 if (endSample <= startSample) { MessageBox.Show(this, "Node audio segment is empty.", "Play Node", MessageBoxButtons.OK, MessageBoxIcon.Information); return; }
 
                 int len = (int)(endSample - startSample);
