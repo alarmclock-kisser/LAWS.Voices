@@ -31,6 +31,7 @@ namespace LAWS.Voices.Multimodal.Audio.Processors
             public float CurrentDominantFreq { get; set; }
             public int MissedFrames { get; set; } = 0;
             public List<(int FrameIndex, float[] AudioFrame)> ActiveFrames { get; } = new List<(int, float[])>();
+            public float[] StereoVector { get; set; } = new float[2]; // [L, R] stereo vector
         }
 
         private readonly CancellationToken _cancellationToken;
@@ -42,15 +43,48 @@ namespace LAWS.Voices.Multimodal.Audio.Processors
 
         private const int ShortTermMemoryLimit = 50;
 
-        // HARTE GRENZE: Wie viele Frames darf der Vogel schweigen, bevor der Satz zerschnitten wird?
-        // 35 Frames * ~23ms = ~800 Millisekunden Erholungs-Pause innerhalb eines Satzes erlaubt.
-        private const int TrackMaxSilenceFrames = 35;
-        private const float FrequencyTrackingTolerance = 400f; // Etwas strikter (400 Hz), um Vögel nicht zu vermischen
+        // =========================================================================
+        // KONFIGURIERBARE BSS PARAMETER (Keine Magic Numbers mehr)
+        // =========================================================================
+        private readonly int _trackMaxSilenceFrames;
+        private readonly float _frequencyTrackingTolerance;
+        private readonly float _minProminenceThreshold;
+        private readonly int _maxPeakCount;
+        private readonly float _noiseFloorMultiplier;
+        private readonly float _minVocalDurationMs;
+        private readonly float _silenceThreshold;
+        private readonly float _vocalBandwidthHz;
+        private readonly int _windowSize;
+        private readonly int _hopSize;
 
-        public FingerprintingProcessor(string? audioFilePath = null, IProgress<double>? progress = null, CancellationToken cancellationToken = default)
+        public FingerprintingProcessor(
+            string? audioFilePath = null, 
+            IProgress<double>? progress = null, 
+            CancellationToken cancellationToken = default,
+            int trackMaxSilenceFrames = 35,      // Erlaubte Pause (Frames) im selben Track
+            float frequencyTrackingTolerance = 400f, // Wie weit darf der Vogel in Hz "springen"?
+            float minProminenceThreshold = 3.0f, // Wie stark muss der Peak aus dem Rauschen stechen?
+            int maxPeakCount = 3,                // Max simultane Stimmen pro Frame
+            float noiseFloorMultiplier = 2.0f,   // Aggressivität der Rauschunterdrückung
+            float minVocalDurationMs = 100.0f,   // Mindestlänge für einen validen Track
+            float silenceThreshold = 0.005f,     // Trim-Schwelle für absolute Stille am Rand
+            float vocalBandwidthHz = 300f,       // Frequenzbreite der Gauß-Maske (Sigma)
+            int windowSize = 2048,               // FFT Window Size
+            int hopSize = 1024)                  // FFT Hop Size (hier 50% Overlap)
         {
             this._cancellationToken = cancellationToken;
             this._progress = progress;
+            
+            this._trackMaxSilenceFrames = trackMaxSilenceFrames;
+            this._frequencyTrackingTolerance = frequencyTrackingTolerance;
+            this._minProminenceThreshold = minProminenceThreshold;
+            this._maxPeakCount = maxPeakCount;
+            this._noiseFloorMultiplier = noiseFloorMultiplier;
+            this._minVocalDurationMs = minVocalDurationMs;
+            this._silenceThreshold = silenceThreshold;
+            this._vocalBandwidthHz = vocalBandwidthHz;
+            this._windowSize = windowSize;
+            this._hopSize = hopSize;
         }
 
         public async Task ProcessAudioObjectAsync(AudioObj audio)
@@ -59,19 +93,18 @@ namespace LAWS.Voices.Multimodal.Audio.Processors
 
             StaticLogger.Log($"[CASA BSS Engine] Starting High-End Blind Source Separation for: '{audio.Name}'");
 
-            float[] pcmSamples = audio.Channels > 1 ? this.ConvertToMono(audio.Data, audio.Channels) : audio.Data;
+            bool isStereo = audio.Channels > 1;
+            float[] pcmSamples = isStereo ? this.ConvertToMono(audio.Data, audio.Channels) : audio.Data;
             int sampleRate = audio.SampleRate > 0 ? audio.SampleRate : 44100;
 
-            int windowSize = 2048;
-            int hopSize = 1024; // 50% Overlap
-            double frameDurationMs = (windowSize / (double) sampleRate) * 1000.0;
-            float hzPerBin = (float) sampleRate / windowSize;
+            double frameDurationMs = (_windowSize / (double) sampleRate) * 1000.0;
+            float hzPerBin = (float) sampleRate / _windowSize;
 
-            int maxFrames = (pcmSamples.Length - windowSize) / hopSize;
+            int maxFrames = (pcmSamples.Length - _windowSize) / _hopSize;
             if (maxFrames <= 0) return;
 
-            float[] sineWindow = Enumerable.Range(0, windowSize)
-                .Select(i => (float) Math.Sin(Math.PI * i / windowSize)).ToArray();
+            float[] sineWindow = Enumerable.Range(0, _windowSize)
+                .Select(i => (float) Math.Sin(Math.PI * i / _windowSize)).ToArray();
 
             var spectra = new Complex[maxFrames][];
             var magnitudes = new float[maxFrames][];
@@ -81,9 +114,9 @@ namespace LAWS.Voices.Multimodal.Audio.Processors
             {
                 Parallel.For(0, maxFrames, new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount, CancellationToken = _cancellationToken }, f =>
                 {
-                    float[] windowBuffer = new float[windowSize];
-                    Array.Copy(pcmSamples, f * hopSize, windowBuffer, 0, windowSize);
-                    for (int i = 0; i < windowSize; i++) windowBuffer[i] *= sineWindow[i];
+                    float[] windowBuffer = new float[_windowSize];
+                    Array.Copy(pcmSamples, f * _hopSize, windowBuffer, 0, _windowSize);
+                    for (int i = 0; i < _windowSize; i++) windowBuffer[i] *= sineWindow[i];
 
                     Complex[] fft = this.ExecuteForwardFFT(windowBuffer);
                     spectra[f] = fft;
@@ -91,7 +124,6 @@ namespace LAWS.Voices.Multimodal.Audio.Processors
                 });
             }, _cancellationToken);
 
-            // NEU: Dynamic Spectral Noise Subtraction (Berechnet das konstante Grundrauschen)
             StaticLogger.Log("[CASA BSS Engine] Phase 1.5: Computing Adaptive Noise Floor Profile...");
             float[] noiseFloor = this.ComputeNoiseFloor(magnitudes);
 
@@ -102,23 +134,19 @@ namespace LAWS.Voices.Multimodal.Audio.Processors
             for (int f = 0; f < maxFrames; f++)
             {
                 if (_cancellationToken.IsCancellationRequested) break;
-                // report progress periodically if a progress reporter was provided
-                if ((f & 0x3F) == 0) // every 64 frames
+                if ((f & 0x3F) == 0) 
                 {
                     try { _progress?.Report((double)f / Math.Max(1, maxFrames)); } catch { }
                 }
 
-                // Erhöhe den Totmann-Schalter für alle aktiven Vögel
                 foreach (var track in activeTracks) track.MissedFrames++;
 
-                // NEU: Übergebe das Noise-Profile, um nur ECHTE Vogel-Peaks zu finden
-                var peaks = this.ExtractSyrinxVoicePeaks(magnitudes[f], hzPerBin, noiseFloor, peakCount: 3);
+                var peaks = this.ExtractSyrinxVoicePeaks(magnitudes[f], hzPerBin, noiseFloor, _maxPeakCount);
 
                 foreach (var peak in peaks)
                 {
-                    // Suche eine aktive Spur, die in der Nähe dieser Frequenz liegt
                     var matchedTrack = activeTracks
-                        .Where(t => Math.Abs(t.CurrentDominantFreq - peak.Frequency) < FrequencyTrackingTolerance)
+                        .Where(t => Math.Abs(t.CurrentDominantFreq - peak.Frequency) < _frequencyTrackingTolerance)
                         .OrderBy(t => Math.Abs(t.CurrentDominantFreq - peak.Frequency))
                         .FirstOrDefault();
 
@@ -128,23 +156,24 @@ namespace LAWS.Voices.Multimodal.Audio.Processors
                         activeTracks.Add(matchedTrack);
                     }
 
-                    // Vogel singt wieder! Reset des Totmann-Schalters und anpassen der Leitfrequenz
                     matchedTrack.MissedFrames = 0;
-                    matchedTrack.CurrentDominantFreq = (matchedTrack.CurrentDominantFreq * 0.7f) + (peak.Frequency * 0.3f); // Smoothed Tracking
+                    matchedTrack.CurrentDominantFreq = (matchedTrack.CurrentDominantFreq * 0.7f) + (peak.Frequency * 0.3f); 
 
-                    // Isoliere das Audio
+                    if (isStereo)
+                    {
+                        this.UpdateStereoVector(matchedTrack, audio, f, _hopSize, _windowSize);
+                    }
+
                     Complex[] maskedSpectrum = this.ApplySoftGaussianMask(spectra[f], peak.Frequency, hzPerBin);
                     float[] isolatedAudioFrame = this.ExecuteInverseFFT(maskedSpectrum);
 
-                    for (int i = 0; i < windowSize; i++) isolatedAudioFrame[i] *= sineWindow[i];
+                    for (int i = 0; i < _windowSize; i++) isolatedAudioFrame[i] *= sineWindow[i];
 
                     matchedTrack.ActiveFrames.Add((f, isolatedAudioFrame));
 
-                    // Baue Fingerprint mit neuen, mächtigen Akustik-Features
                     var fp = new Fingerprint
                     {
-                        Timestamp = audio.CreatedAt.AddMilliseconds(f * (hopSize / (double) sampleRate) * 1000.0),
-                        // Use frameDurationMs as base but allow downstream merging to determine actual segment lengths
+                        Timestamp = audio.CreatedAt.AddMilliseconds(f * (_hopSize / (double) sampleRate) * 1000.0),
                         DurationMs = (long)Math.Max(1, Math.Round(frameDurationMs)),
                         ToneCount = peaks.Count
                     };
@@ -157,12 +186,11 @@ namespace LAWS.Voices.Multimodal.Audio.Processors
                     _memoryPool.Add(fp);
                 }
 
-                // GRENZE ÜBERSCHRITTEN: Vogel hat länger als 800ms nicht gesungen -> Spur eiskalt durchtrennen!
-                var deadTracks = activeTracks.Where(t => t.MissedFrames > TrackMaxSilenceFrames).ToList();
+                var deadTracks = activeTracks.Where(t => t.MissedFrames > _trackMaxSilenceFrames).ToList();
                 foreach (var dt in deadTracks)
                 {
                     activeTracks.Remove(dt);
-                    if (dt.ActiveFrames.Count > 5) completedTracks.Add(dt); // Nur Sätze übernehmen, die >100ms lang sind
+                    if (dt.ActiveFrames.Count > 5) completedTracks.Add(dt);
                 }
             }
             completedTracks.AddRange(activeTracks.Where(t => t.ActiveFrames.Count > 5));
@@ -176,27 +204,34 @@ namespace LAWS.Voices.Multimodal.Audio.Processors
                     int firstFrameIndex = track.ActiveFrames.First().FrameIndex;
                     int lastFrameIndex = track.ActiveFrames.Last().FrameIndex;
 
-                    // Exakte Länge, kein sinnloses Padding vom Anfang der Datei!
-                    int exactLength = (lastFrameIndex - firstFrameIndex) * hopSize + windowSize;
+                    int exactLength = (lastFrameIndex - firstFrameIndex) * _hopSize + _windowSize;
                     float[] reconstructedPcm = new float[exactLength];
 
-                    // OLA (Overlap-Add) Rekonstruktion
                     foreach (var frameData in track.ActiveFrames)
                     {
-                        int localOffset = (frameData.FrameIndex - firstFrameIndex) * hopSize;
-                        for (int j = 0; j < windowSize; j++)
+                        int localOffset = (frameData.FrameIndex - firstFrameIndex) * _hopSize;
+                        for (int j = 0; j < _windowSize; j++)
                         {
                             reconstructedPcm[localOffset + j] += frameData.AudioFrame[j];
                         }
                     }
 
-                    // Entferne absolute Reststille an den äußeren Kanten
-                    float[] trimmedPcm = this.TrimSilence(reconstructedPcm, 0.005f);
+                    float[] trimmedPcm = this.TrimSilence(reconstructedPcm, _silenceThreshold);
 
-                    if (trimmedPcm.Length > sampleRate * 0.1) // Muss mind. 100ms lang sein
+                    if (trimmedPcm.Length > sampleRate * (_minVocalDurationMs / 1000.0)) 
                     {
                         string id = track.TrackId.ToString().Substring(0, 4);
-                        var isolatedAudio = new AudioObj(trimmedPcm, sampleRate, 1, 16, $"{audio.Name}_Bird_{id}_{track.CurrentDominantFreq:F0}Hz");
+                        string stereoInfo = "";
+                        if (isStereo && track.StereoVector != null)
+                        {
+                            // Normalize vector for naming (0.0 to 1.0 distribution)
+                            float totalLR = track.StereoVector[0] + track.StereoVector[1];
+                            float lRatio = totalLR > 0 ? track.StereoVector[0] / totalLR : 0.5f;
+                            float rRatio = totalLR > 0 ? track.StereoVector[1] / totalLR : 0.5f;
+                            stereoInfo = $"_L{lRatio:F2}_R{rRatio:F2}";
+                        }
+                        
+                        var isolatedAudio = new AudioObj(trimmedPcm, sampleRate, 1, 16, $"{audio.Name}_Bird_{id}_{track.CurrentDominantFreq:F0}Hz{stereoInfo}");
 
                         lock (IsolatedBirdSamples)
                         {
@@ -211,20 +246,15 @@ namespace LAWS.Voices.Multimodal.Audio.Processors
         }
 
         // =========================================================================
-        // NEU: CASA BSS KERN-ALGORITHMEN
+        // CASA BSS KERN-ALGORITHMEN
         // =========================================================================
 
-        /// <summary>
-        /// Sucht die leisesten Frames (Bodenrauschen) der Aufnahme und erstellt einen globalen Störgeräusch-Abdruck.
-        /// </summary>
         private float[] ComputeNoiseFloor(float[][] magnitudes)
         {
             int bins = magnitudes[0].Length;
             float[] noiseFloor = new float[bins];
 
-            // Nimm die 5% der leisesten Frames (wo garantiert kein Vogel singt)
             var quietestFrames = magnitudes.OrderBy(m => m.Sum()).Take(Math.Max(10, magnitudes.Length / 20)).ToList();
-
             if (quietestFrames.Count == 0) return noiseFloor;
 
             for (int i = 0; i < bins; i++)
@@ -242,21 +272,15 @@ namespace LAWS.Voices.Multimodal.Audio.Processors
             public float Centroid { get; set; }
         }
 
-        /// <summary>
-        /// Sucht nach Peaks mit echter Prominence (Schärfe). Ignoriert konstantes Rauschen komplett.
-        /// </summary>
         private List<PeakNode> ExtractSyrinxVoicePeaks(float[] spectrum, float hzPerBin, float[] noiseFloor, int peakCount)
         {
             var peaks = new List<PeakNode>();
             int binCount = spectrum.Length;
             float[] cleanSpectrum = new float[binCount];
 
-            // 1. Spectral Subtraction (Ziehe das Rauschen vom Frame ab)
-            float totalEnergy = 0f;
             for (int i = 0; i < binCount; i++)
             {
-                cleanSpectrum[i] = Math.Max(0, spectrum[i] - (noiseFloor[i] * 2.0f)); // 2x Multiplikator killt Rauschen sicher
-                totalEnergy += cleanSpectrum[i];
+                cleanSpectrum[i] = Math.Max(0, spectrum[i] - (noiseFloor[i] * _noiseFloorMultiplier)); 
             }
 
             for (int p = 0; p < peakCount; p++)
@@ -267,7 +291,6 @@ namespace LAWS.Voices.Multimodal.Audio.Processors
                 int minBin = (int) (500 / hzPerBin);
                 int maxBin = Math.Min(binCount - 1, (int) (9000 / hzPerBin));
 
-                // 2. Finde den stärksten Peak
                 for (int b = minBin; b <= maxBin; b++)
                 {
                     if (cleanSpectrum[b] > maxVal)
@@ -279,7 +302,6 @@ namespace LAWS.Voices.Multimodal.Audio.Processors
 
                 if (maxIdx == -1 || maxVal < 0.01f) break;
 
-                // 3. Prominence-Prüfung (Ist es ein scharfer Ton oder nur ein breiter Rausch-Buckel?)
                 int neighborhood = (int) (200 / hzPerBin);
                 float localAvg = 0;
                 int count = 0;
@@ -289,15 +311,13 @@ namespace LAWS.Voices.Multimodal.Audio.Processors
                 }
                 localAvg /= Math.Max(1, count);
 
-                // Wenn der Ton nicht mindestens 3-mal lauter ist als seine direkte Umgebung, ist es KEIN Vogel!
                 float prominence = maxVal / Math.Max(0.001f, localAvg);
-                if (prominence < 3.0f)
+                if (prominence < _minProminenceThreshold)
                 {
-                    cleanSpectrum[maxIdx] = 0f; // Ignorieren und weitersuchen
+                    cleanSpectrum[maxIdx] = 0f; 
                     continue;
                 }
 
-                // 4. Feature Extraction: Spectral Centroid (Schwerpunkt des Tons) berechnen
                 float centroidNumerator = 0f;
                 float centroidDenominator = 0f;
                 for (int j = Math.Max(0, maxIdx - 5); j <= Math.Min(binCount - 1, maxIdx + 5); j++)
@@ -315,7 +335,6 @@ namespace LAWS.Voices.Multimodal.Audio.Processors
                     Centroid = centroid
                 });
 
-                // Peak auslöschen, um den nächsten Vogel zu finden
                 int exclusionRadius = (int) (400f / hzPerBin);
                 for (int m = Math.Max(0, maxIdx - exclusionRadius); m <= Math.Min(binCount - 1, maxIdx + exclusionRadius); m++)
                 {
@@ -329,8 +348,7 @@ namespace LAWS.Voices.Multimodal.Audio.Processors
         private Complex[] ApplySoftGaussianMask(Complex[] originalSpectrum, float targetFreq, float hzPerBin)
         {
             Complex[] masked = new Complex[originalSpectrum.Length];
-            float sigma = 300f; // Frequenz-Breite des Vogels
-            float varianceMultiplier = 2f * sigma * sigma;
+            float varianceMultiplier = 2f * _vocalBandwidthHz * _vocalBandwidthHz;
 
             for (int i = 0; i < originalSpectrum.Length; i++)
             {
@@ -339,7 +357,7 @@ namespace LAWS.Voices.Multimodal.Audio.Processors
                 float diff1 = freq - targetFreq;
                 float mask1 = (float) Math.Exp(-(diff1 * diff1) / varianceMultiplier);
 
-                float diff2 = freq - (targetFreq * 2.0f); // Erste Harmonische (Oberton)
+                float diff2 = freq - (targetFreq * 2.0f); // Harmonische
                 float mask2 = (float) Math.Exp(-(diff2 * diff2) / varianceMultiplier) * 0.4f;
 
                 float totalMask = Math.Min(1.0f, mask1 + mask2);
@@ -347,6 +365,27 @@ namespace LAWS.Voices.Multimodal.Audio.Processors
                 masked[i] = new Complex(originalSpectrum[i].Real * totalMask, originalSpectrum[i].Imaginary * totalMask);
             }
             return masked;
+        }
+
+        private void UpdateStereoVector(SingerTrack track, AudioObj audio, int frameIndex, int hopSize, int windowSize)
+        {
+            if (audio.Data == null || audio.Channels < 2) return;
+
+            int startSample = frameIndex * hopSize * audio.Channels;
+            int length = Math.Min(windowSize * audio.Channels, audio.Data.Length - startSample);
+
+            float sumL = 0f, sumR = 0f;
+            for (int i = 0; i < length; i += 2)
+            {
+                sumL += Math.Abs(audio.Data[startSample + i]);
+                if (startSample + i + 1 < audio.Data.Length)
+                    sumR += Math.Abs(audio.Data[startSample + i + 1]);
+            }
+
+            // Moving Average für stabile Raumortung des Vogels über den gesamten Track
+            int frameCount = track.ActiveFrames.Count;
+            track.StereoVector[0] = ((track.StereoVector[0] * frameCount) + sumL) / (frameCount + 1);
+            track.StereoVector[1] = ((track.StereoVector[1] * frameCount) + sumR) / (frameCount + 1);
         }
 
         private float[] TrimSilence(float[] audio, float threshold)
