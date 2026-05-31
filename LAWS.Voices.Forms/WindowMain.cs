@@ -1005,6 +1005,51 @@ namespace LAWS.Voices.Forms
                                 if (!hasCustomMetrics) sbReport.AppendLine(" No custom metadata parameters exposed.");
 
                                 this.BeginInvoke(new Action(() => this.textBox_result.Text = sbReport.ToString()));
+
+                                // If processor returned an AudioFingerprintProfile, convert to fingerprint nodes and show tree viz
+                                try
+                                {
+                                    var afpType = resultObj.GetType();
+                                    if (afpType.Name.IndexOf("AudioFingerprintProfile", StringComparison.OrdinalIgnoreCase) >= 0)
+                                    {
+                                        // try to cast via known type
+                                        try
+                                        {
+                                            var afp = resultObj as LAWS.Voices.OpenVino.Processors.Wav2Vec2Processor.AudioFingerprintProfile;
+                                            if (afp != null)
+                                            {
+                                                var frames = afp.Frames ?? new System.Collections.Generic.List<LAWS.Voices.OpenVino.Processors.Wav2Vec2Processor.FrameAnalysisResult>();
+                                                var fps = new System.Collections.Generic.List<LAWS.Voices.Multimodal.Audio.Processors.FingerprintingProcessor.Fingerprint>();
+                                                int total = Math.Max(1, frames.Count);
+                                                for (int i = 0; i < frames.Count; i++)
+                                                {
+                                                    var fr = frames[i];
+                                                    var fp = new LAWS.Voices.Multimodal.Audio.Processors.FingerprintingProcessor.Fingerprint();
+                                                    try { fp.Timestamp = aud.CreatedAt.AddMilliseconds((aud.Duration.TotalMilliseconds * i) / (double) total); } catch { fp.Timestamp = DateTime.Now; }
+                                                    fp.DurationMs = (long) Math.Max(1, aud.Duration.TotalMilliseconds / total);
+                                                    fp.ToneCount = 1;
+                                                    fp.Features = new System.Collections.Concurrent.ConcurrentDictionary<string, float>();
+                                                    fp.Features["Confidence"] = (float) fr.Confidence;
+                                                    fp.Features["Entropy"] = (float) fr.Entropy;
+                                                    fps.Add(fp);
+                                                }
+
+                                                // show visualizer on UI thread
+                                                this.BeginInvoke(new Action(() =>
+                                                {
+                                                    try
+                                                    {
+                                                        var viz = new ResultVisualizerForm(null, sbReport.ToString(), null, fps);
+                                                        viz.Show(this);
+                                                    }
+                                                    catch (Exception ex) { StaticLogger.Log("Failed to show fingerprint tree visualizer: " + ex.Message); }
+                                                }));
+                                            }
+                                        }
+                                        catch (Exception ex) { StaticLogger.Log("Error converting AudioFingerprintProfile -> Fingerprint list: " + ex.Message); }
+                                    }
+                                }
+                                catch { }
                             }
                             else
                             {
@@ -2139,6 +2184,27 @@ namespace LAWS.Voices.Forms
                     {
                         StaticLogger.Log("Failed to persist fingerprint output: " + ex.Message);
                         MessageBox.Show("Fingerprinting completed but saving failed: " + ex.Message, "Fingerprinting", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    }
+                    // Show visualizer with produced fingerprints and allow node playback
+                    try
+                    {
+                        var fps = processor.CapturedFingerprints;
+                        // attempt to obtain song blocks from Wav2Vec2 if available (best-effort)
+                        List<Wav2Vec2Processor.BirdSongBlock>? songBlocks = null;
+                        try
+                        {
+                            // if aud has an attached analysis object, try to extract; otherwise leave null
+                            // This is a best-effort integration; if unavailable, visualizer still works for fingerprints
+                            // Note: calling into Wav2Vec2Processor.ClusterEventsIntoSongs is avoided here to not duplicate processing
+                        }
+                        catch { }
+
+                        var rv = new ResultVisualizerForm(null, null, null, fps, aud, songBlocks);
+                        rv.Show(this);
+                    }
+                    catch (Exception ex)
+                    {
+                        StaticLogger.Log("Failed to launch ResultVisualizerForm: " + ex.Message);
                     }
                 }
                 catch (OperationCanceledException)

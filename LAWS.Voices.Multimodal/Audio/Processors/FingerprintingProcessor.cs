@@ -20,13 +20,14 @@ namespace LAWS.Voices.Multimodal.Audio.Processors
             public long DurationMs { get; set; } = 0;
             public int ToneCount { get; set; } = 0;
 
-            public Dictionary<string, float> Features { get; set; } = [];
-            public Dictionary<Fingerprint, float> Deriverates { get; set; } = [];
+            // Use ConcurrentDictionary for thread-safe updates in parallel processing
+            public ConcurrentDictionary<string, float> Features { get; set; } = new ConcurrentDictionary<string, float>();
+            public ConcurrentDictionary<Fingerprint, float> Deriverates { get; set; } = new ConcurrentDictionary<Fingerprint, float>();
         }
 
         private readonly CancellationToken _cancellationToken;
         private readonly IProgress<double>? _progress;
-        private readonly ConcurrentBag<Fingerprint> _memoryPool = [];
+        private readonly ConcurrentBag<Fingerprint> _memoryPool = new ConcurrentBag<Fingerprint>();
         private const int ShortTermMemoryLimit = 50; // Maximum number of historical fingerprints to cross-reference
 
         public List<Fingerprint> CapturedFingerprints => this._memoryPool.OrderBy(f => f.Timestamp).ToList();
@@ -91,90 +92,131 @@ namespace LAWS.Voices.Multimodal.Audio.Processors
                 return;
             }
 
+            // Pre-calculate Hanning window coefficients to eliminate spectral leakage edge anomalies
+            float[] hanningWeights = Enumerable.Range(0, windowSize)
+                .Select(i => (float)(0.5 * (1.0 - Math.Cos(2.0 * Math.PI * i / (windowSize - 1))))).ToArray();
+
+            int processed = 0;
+
+            // Use partitioning for parallel processing of frames
+            var rangePartitioner = System.Collections.Concurrent.Partitioner.Create(0, maxFrames);
+
             await Task.Run(() =>
             {
-                float[] windowBuffer = new float[windowSize];
-                // Pre-calculate Hanning window coefficients to eliminate spectral leakage edge anomalies
-                float[] hanningWeights = Enumerable.Range(0, windowSize)
-                    .Select(i => (float) (0.5 * (1.0 - Math.Cos(2.0 * Math.PI * i / (windowSize - 1))))).ToArray();
+                ParallelOptions po = new ParallelOptions() { CancellationToken = this._cancellationToken, MaxDegreeOfParallelism = Environment.ProcessorCount };
 
-                for (int f = 0; f < maxFrames; f++)
+                Parallel.ForEach(rangePartitioner, po, () =>
                 {
-                    if (this._cancellationToken.IsCancellationRequested)
+                    // thread-local buffers
+                    return new
                     {
-                        StaticLogger.Log("[Fingerprinting Engine] In-loop execution processing aborted by CancellationToken triggers.");
-                        break;
-                    }
-
-                    int sampleOffset = f * hopSize;
-                    Array.Copy(pcmSamples, sampleOffset, windowBuffer, 0, windowSize);
-
-                    // Apply windowing function on-the-fly
-                    for (int i = 0; i < windowSize; i++)
-                    {
-                        windowBuffer[i] *= hanningWeights[i];
-                    }
-
-                    // Compute native fast Fourier transform values
-                    Complex[] fftComplex = this.ExecuteForwardFFT(windowBuffer);
-                    float[] magnitudeSpectrum = this.CalculateMagnitudeSpectrum(fftComplex);
-
-                    // Bioacoustic Threshold Gate: Only analyze frames that contain an active call/chirp signal
-                    float spectralEnergy = magnitudeSpectrum.Sum();
-                    if (spectralEnergy < 0.05f) continue; // Screen out silence or background static hums
-
-                    // 1. EXTRACT SYRINX DUAL INDEPENDENT VOICE BAND TRAITS
-                    var dominantPeaks = this.ExtractSyrinxVoicePeaks(magnitudeSpectrum, sampleRate, windowSize, peakCount: 2);
-
-                    var fingerprint = new Fingerprint
-                    {
-                        Timestamp = audio.CreatedAt.AddMilliseconds(f * (hopSize / (double) sampleRate) * 1000.0),
-                        DurationMs = (long) frameDurationMs,
-                        ToneCount = dominantPeaks.Count
+                        windowBuffer = new float[windowSize]
                     };
-
-                    // 2. COMPILE STRUCTURAL BIOACOUSTIC PHENOMENON METRICS
-                    fingerprint.Features["SpectralEnergy"] = spectralEnergy;
-                    fingerprint.Features["SpectralCentroid"] = this.ComputeSpectralCentroid(magnitudeSpectrum, sampleRate, windowSize);
-                    fingerprint.Features["SpectralFlatness"] = this.ComputeSpectralFlatness(magnitudeSpectrum);
-
-                    if (dominantPeaks.Count > 0)
+                }, (range, loopState, local) =>
+                {
+                    for (int f = range.Item1; f < range.Item2; f++)
                     {
-                        fingerprint.Features["VoiceBandA_Freq"] = dominantPeaks[0].Frequency;
-                        fingerprint.Features["VoiceBandA_Amp"] = dominantPeaks[0].Amplitude;
-                    }
-                    if (dominantPeaks.Count > 1)
-                    {
-                        fingerprint.Features["VoiceBandB_Freq"] = dominantPeaks[1].Frequency;
-                        fingerprint.Features["VoiceBandB_Amp"] = dominantPeaks[1].Amplitude;
+                        if (this._cancellationToken.IsCancellationRequested) { loopState.Stop(); break; }
 
-                        // Capture unique dual independent voice band modulation divergence patterns
-                        fingerprint.Features["SyrinxDeltaFreq"] = Math.Abs(dominantPeaks[0].Frequency - dominantPeaks[1].Frequency);
-                        fingerprint.Features["SyrinxHarmonicInterplay"] = dominantPeaks[1].Amplitude / Math.Max(0.001f, dominantPeaks[0].Amplitude);
-                    }
-                    else
-                    {
-                        fingerprint.Features["VoiceBandB_Freq"] = 0f;
-                        fingerprint.Features["VoiceBandB_Amp"] = 0f;
-                        fingerprint.Features["SyrinxDeltaFreq"] = 0f;
-                        fingerprint.Features["SyrinxHarmonicInterplay"] = 0f;
-                    }
+                        int sampleOffset = f * hopSize;
+                        Array.Copy(pcmSamples, sampleOffset, local.windowBuffer, 0, windowSize);
 
-                    // 3. CROSS-REFERENCE LONG-TERM & SHORT-TERM HISTORICAL EVOLUTION PATTERNS
-                    this.DeriveHistoricalCrossReferences(fingerprint);
+                        // Apply windowing function on-the-fly
+                        for (int i = 0; i < windowSize; i++) local.windowBuffer[i] *= hanningWeights[i];
 
-                    // Store generated node into thread-safe memory matrix
-                    this._memoryPool.Add(fingerprint);
+                        Complex[] fftComplex = this.ExecuteForwardFFT(local.windowBuffer);
+                        float[] magnitudeSpectrum = this.CalculateMagnitudeSpectrum(fftComplex);
 
-                    // Report sequence completion progress metrics safely
-                    if (f % 50 == 0 || f == maxFrames - 1)
-                    {
-                        this._progress?.Report((double) f / maxFrames);
+                        float spectralEnergy = magnitudeSpectrum.Sum();
+                        if (spectralEnergy < 0.05f) continue;
+
+                        var dominantPeaks = this.ExtractSyrinxVoicePeaks(magnitudeSpectrum, sampleRate, windowSize, peakCount: 2);
+
+                        var fingerprint = new Fingerprint
+                        {
+                            Timestamp = audio.CreatedAt.AddMilliseconds(f * (hopSize / (double)sampleRate) * 1000.0),
+                            DurationMs = (long)frameDurationMs,
+                            ToneCount = dominantPeaks.Count
+                        };
+
+                        fingerprint.Features["SpectralEnergy"] = spectralEnergy;
+                        fingerprint.Features["SpectralCentroid"] = this.ComputeSpectralCentroid(magnitudeSpectrum, sampleRate, windowSize);
+                        fingerprint.Features["SpectralFlatness"] = this.ComputeSpectralFlatness(magnitudeSpectrum);
+
+                        if (dominantPeaks.Count > 0)
+                        {
+                            fingerprint.Features["VoiceBandA_Freq"] = dominantPeaks[0].Frequency;
+                            fingerprint.Features["VoiceBandA_Amp"] = dominantPeaks[0].Amplitude;
+                        }
+                        if (dominantPeaks.Count > 1)
+                        {
+                            fingerprint.Features["VoiceBandB_Freq"] = dominantPeaks[1].Frequency;
+                            fingerprint.Features["VoiceBandB_Amp"] = dominantPeaks[1].Amplitude;
+                            fingerprint.Features["SyrinxDeltaFreq"] = Math.Abs(dominantPeaks[0].Frequency - dominantPeaks[1].Frequency);
+                            fingerprint.Features["SyrinxHarmonicInterplay"] = dominantPeaks[1].Amplitude / Math.Max(0.001f, dominantPeaks[0].Amplitude);
+                        }
+                        else
+                        {
+                            fingerprint.Features["VoiceBandB_Freq"] = 0f;
+                            fingerprint.Features["VoiceBandB_Amp"] = 0f;
+                            fingerprint.Features["SyrinxDeltaFreq"] = 0f;
+                            fingerprint.Features["SyrinxHarmonicInterplay"] = 0f;
+                        }
+
+                        // store node
+                        this._memoryPool.Add(fingerprint);
+
+                        int cur = Interlocked.Increment(ref processed);
+                        if (cur % 100 == 0 || cur == maxFrames) this._progress?.Report((double)cur / maxFrames);
                     }
-                }
+                    return local;
+                }, _ => { });
             }, this._cancellationToken);
 
-            StaticLogger.Log($"[Fingerprinting Engine] Process complete. Compiled and vectorized {this._memoryPool.Count} bioacoustic fingerprint nodes.");
+            StaticLogger.Log($"[Fingerprinting Engine] First pass complete. Compiled and vectorized {this._memoryPool.Count} bioacoustic fingerprint nodes (pre-derivation).");
+
+            // Second phase: derive cross-references in parallel using snapshot
+            try
+            {
+                var snapshot = this._memoryPool.OrderBy(f => f.Timestamp).ToList();
+                int total = snapshot.Count;
+                ParallelOptions po2 = new ParallelOptions() { CancellationToken = this._cancellationToken, MaxDegreeOfParallelism = Math.Max(1, Environment.ProcessorCount - 1) };
+                Parallel.ForEach(Partitioner.Create(0, total), po2, range =>
+                {
+                    for (int i = range.Item1; i < range.Item2; i++)
+                    {
+                        var target = snapshot[i];
+                        // perform local comparison with recent history window
+                        int start = Math.Max(0, i - ShortTermMemoryLimit);
+                        for (int j = start; j < i; j++)
+                        {
+                            var pastNode = snapshot[j];
+                            float distance = 0f;
+                            string[] targetKeys = new string[] { "VoiceBandA_Freq", "VoiceBandB_Freq", "SpectralCentroid", "SpectralFlatness" };
+                            foreach (var key in targetKeys)
+                            {
+                                if (target.Features.TryGetValue(key, out float valA) && pastNode.Features.TryGetValue(key, out float valB))
+                                {
+                                    float scalar = key.Contains("Freq") ? 1000f : 1f;
+                                    float delta = (valA - valB) / scalar;
+                                    distance += delta * delta;
+                                }
+                            }
+                            float score = (float)(1.0 / (1.0 + Math.Sqrt(distance)));
+                            if (score > 0.75f)
+                            {
+                                target.Deriverates.TryAdd(pastNode, score);
+                            }
+                        }
+                    }
+                });
+
+                StaticLogger.Log($"[Fingerprinting Engine] Cross-reference pass complete.");
+            }
+            catch (OperationCanceledException)
+            {
+                StaticLogger.Log("Cross-reference pass cancelled.");
+            }
         }
 
         /// <summary>
@@ -292,32 +334,34 @@ namespace LAWS.Voices.Multimodal.Audio.Processors
             var historyPool = this._memoryPool.OrderByDescending(f => f.Timestamp).Take(ShortTermMemoryLimit).ToList();
             if (historyPool.Count == 0) return;
 
-            foreach (var pastNode in historyPool)
+            string[] targetKeys = new string[] { "VoiceBandA_Freq", "VoiceBandB_Freq", "SpectralCentroid", "SpectralFlatness" };
+
+            var po = new ParallelOptions { CancellationToken = this._cancellationToken, MaxDegreeOfParallelism = Math.Max(1, Environment.ProcessorCount / 2) };
+            try
             {
-                // Compute mathematical Euclidean distance similarity vector across matching feature profiles
-                float distance = 0f;
-                string[] targetKeys = ["VoiceBandA_Freq", "VoiceBandB_Freq", "SpectralCentroid", "SpectralFlatness"];
-
-                foreach (var key in targetKeys)
+                Parallel.ForEach(historyPool, po, pastNode =>
                 {
-                    if (target.Features.TryGetValue(key, out float valA) && pastNode.Features.TryGetValue(key, out float valB))
+                    float distance = 0f;
+                    foreach (var key in targetKeys)
                     {
-                        // Normalize scaling delta variances
-                        float scalar = key.Contains("Freq") ? 1000f : 1f;
-                        float delta = (valA - valB) / scalar;
-
-                        // Fixed: Standard high-performance multiplication instead of double-precision Math.Fma
-                        distance += delta * delta;
+                        if (target.Features.TryGetValue(key, out float valA) && pastNode.Features.TryGetValue(key, out float valB))
+                        {
+                            float scalar = key.Contains("Freq") ? 1000f : 1f;
+                            float delta = (valA - valB) / scalar;
+                            distance += delta * delta;
+                        }
                     }
-                }
 
-                float score = (float) (1.0 / (1.0 + Math.Sqrt(distance)));
-
-                // If similarity matches closely or indicates a direct pattern transposition derivative, log link
-                if (score > 0.75f)
-                {
-                    target.Deriverates[pastNode] = score;
-                }
+                    float score = (float)(1.0 / (1.0 + Math.Sqrt(distance)));
+                    if (score > 0.75f)
+                    {
+                        target.Deriverates.TryAdd(pastNode, score);
+                    }
+                });
+            }
+            catch (OperationCanceledException)
+            {
+                StaticLogger.Log("DeriveHistoricalCrossReferences cancelled.");
             }
         }
 
