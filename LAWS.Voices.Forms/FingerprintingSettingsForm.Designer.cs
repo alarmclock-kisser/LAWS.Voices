@@ -91,7 +91,8 @@ namespace LAWS.Voices.Forms
                 "Dawn Chorus (dense)",
                 "Isolated Calls",
                 "Noisy Field Recording",
-                "High Sensitivity"
+                "High Sensitivity",
+                "Binaural Tones (high/quiet)"
             });
             this.comboPreset.SelectedIndex = 0;
             this.comboPreset.SelectedIndexChanged += (s, e) => this.ApplyFingerprintPreset(this.comboPreset.SelectedItem?.ToString());
@@ -172,6 +173,14 @@ namespace LAWS.Voices.Forms
                     Set(this.numSilenceFrames, 4); Set(this.numFreqTol, 150m); Set(this.numStereoTol, 0.40m);
                     Set(this.numPromHigh, 8m); Set(this.numPromLow, 0.05m); Set(this.numMinDensity, 0.12m);
                     Set(this.numMinDuration, 0.04m); Set(this.numTrimMultiplier, 8m);
+                    break;
+                case "Binaural Tones (high/quiet)":
+                    // Tuned for isolating very high, quiet steady tones (e.g. binaural beats):
+                    // tight frequency tracking, low stereo tolerance, and aggressive trimming of
+                    // quiet outliers so faint high tones survive while broadband noise is rejected.
+                    Set(this.numSilenceFrames, 10); Set(this.numFreqTol, 80m); Set(this.numStereoTol, 0.20m);
+                    Set(this.numPromHigh, 4m); Set(this.numPromLow, 0.03m); Set(this.numMinDensity, 0.10m);
+                    Set(this.numMinDuration, 0.25m); Set(this.numTrimMultiplier, 8m);
                     break;
                 default:
                     break;

@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Drawing;
 using System.IO;
 using System.Threading.Tasks;
@@ -11,14 +12,18 @@ namespace LAWS.Voices.Forms
 {
     public class NodeDetailsForm : Form
     {
-        private readonly int nodeIndex;
-        private readonly FingerprintingProcessor.Fingerprint node;
+        private int nodeIndex;
+        private FingerprintingProcessor.Fingerprint node;
         private readonly AudioObj? sourceAudio;
+        private readonly IReadOnlyList<FingerprintingProcessor.Fingerprint>? allNodes;
+        private readonly Func<int, (DateTime start, DateTime end)>? segmentResolver;
 
         private Button btnPlay = new();
         private Button btnPause = new();
         private Button btnStop = new();
         private Button btnExport = new();
+        private Button btnPrev = new();
+        private Button btnNext = new();
         private TextBox txtInfo = new();
 
         private WaveOutEvent? playbackDevice;
@@ -27,13 +32,15 @@ namespace LAWS.Voices.Forms
         private DateTime? segmentStart;
         private DateTime? segmentEnd;
 
-        public NodeDetailsForm(int index, FingerprintingProcessor.Fingerprint node, AudioObj? sourceAudio, DateTime? segmentStart = null, DateTime? segmentEnd = null)
+        public NodeDetailsForm(int index, FingerprintingProcessor.Fingerprint node, AudioObj? sourceAudio, DateTime? segmentStart = null, DateTime? segmentEnd = null, IReadOnlyList<FingerprintingProcessor.Fingerprint>? allNodes = null, Func<int, (DateTime start, DateTime end)>? segmentResolver = null)
         {
             this.nodeIndex = index;
             this.node = node;
             this.sourceAudio = sourceAudio;
             this.segmentStart = segmentStart;
             this.segmentEnd = segmentEnd;
+            this.allNodes = allNodes;
+            this.segmentResolver = segmentResolver;
             this.InitializeComponent();
             this.Load += this.NodeDetailsForm_Load;
         }
@@ -41,7 +48,7 @@ namespace LAWS.Voices.Forms
         private void InitializeComponent()
         {
             this.Text = "Node Details";
-            this.Size = new Size(480, 360);
+            this.Size = new Size(480, 400);
             this.StartPosition = FormStartPosition.CenterParent;
 
             this.txtInfo = new TextBox();
@@ -75,11 +82,60 @@ namespace LAWS.Voices.Forms
             this.btnExport.Width = 90;
             this.btnExport.Click += this.BtnExport_Click;
 
+            // Navigation row below the existing buttons: cycle through nodes with wrap-around
+            this.btnPrev.Text = "Previous";
+            this.btnPrev.Left = 12;
+            this.btnPrev.Top = this.btnPlay.Bottom + 8;
+            this.btnPrev.Width = 90;
+            this.btnPrev.Click += (_, __) => this.NavigateNodes(-1);
+
+            this.btnNext.Text = "Next";
+            this.btnNext.Left = this.btnPrev.Right + 8;
+            this.btnNext.Top = this.btnPrev.Top;
+            this.btnNext.Width = 90;
+            this.btnNext.Click += (_, __) => this.NavigateNodes(1);
+
+            bool canNavigate = this.allNodes != null && this.allNodes.Count > 1;
+            this.btnPrev.Enabled = canNavigate;
+            this.btnNext.Enabled = canNavigate;
+
             this.Controls.Add(this.txtInfo);
             this.Controls.Add(this.btnPlay);
             this.Controls.Add(this.btnPause);
             this.Controls.Add(this.btnStop);
             this.Controls.Add(this.btnExport);
+            this.Controls.Add(this.btnPrev);
+            this.Controls.Add(this.btnNext);
+        }
+
+        private void NavigateNodes(int direction)
+        {
+            try
+            {
+                if (this.allNodes == null || this.allNodes.Count == 0) return;
+
+                int count = this.allNodes.Count;
+                int newIndex = ((this.nodeIndex + direction) % count + count) % count;
+
+                this.Stop();
+                this.nodeIndex = newIndex;
+                this.node = this.allNodes[newIndex];
+
+                if (this.segmentResolver != null)
+                {
+                    var seg = this.segmentResolver(newIndex);
+                    this.segmentStart = seg.start == DateTime.MinValue ? (DateTime?)null : seg.start;
+                    this.segmentEnd = seg.end <= seg.start ? (DateTime?)null : seg.end;
+                }
+                else
+                {
+                    this.segmentStart = null;
+                    this.segmentEnd = null;
+                }
+
+                this.NodeDetailsForm_Load(this, EventArgs.Empty);
+            }
+            catch { }
         }
 
         private async void BtnPlay_Click(object? sender, EventArgs e)

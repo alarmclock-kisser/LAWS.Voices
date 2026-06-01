@@ -25,6 +25,9 @@ namespace LAWS.Voices.Forms
 
         private PictureBox pBox = new();
         private ProgressBar pBar = new();
+        private Label lblElapsed = new();
+        private System.Windows.Forms.Timer? elapsedTimer;
+        private DateTime elapsedStart;
         private Button btnStart = new();
         private Button btnTogglePreview = new();
         private Button btnExport = new();
@@ -91,6 +94,7 @@ namespace LAWS.Voices.Forms
             this.btnStart = new Button { Text = "Start", Width = 90, Height = 28, Margin = new Padding(0, 2, 8, 2) };
             this.btnStart.Click += async (_, __) => await this.RunAsync();
             this.pBar = new ProgressBar { Width = 220, Height = 24, Margin = new Padding(0, 4, 8, 2) };
+            this.lblElapsed = new Label { Text = "00:00", AutoSize = true, Margin = new Padding(0, 8, 8, 2) };
             var lblTrack = new Label { Text = "Track", AutoSize = true, Margin = new Padding(0, 8, 4, 2) };
             this.numericTrack = new NumericUpDown { Width = 60, Minimum = 1, Maximum = 1, Value = 1, Enabled = false, Margin = new Padding(0, 4, 8, 2) };
             this.numericTrack.ValueChanged += async (_, __) =>
@@ -113,7 +117,7 @@ namespace LAWS.Voices.Forms
             this.btnExportAllZip = new Button { Text = "Export All ZIP", Width = 120, Height = 28, Enabled = false, Margin = new Padding(0, 2, 8, 2) };
             this.btnExportAllZip.Click += async (_, __) => await this.ExportAllTracksZipAsync();
 
-            actionsFlow.Controls.AddRange([this.btnStart, this.pBar, lblTrack, this.numericTrack, this.btnTogglePreview, this.btnHear, this.btnExport, this.btnExportAllZip]);
+            actionsFlow.Controls.AddRange([this.btnStart, this.pBar, this.lblElapsed, lblTrack, this.numericTrack, this.btnTogglePreview, this.btnHear, this.btnExport, this.btnExportAllZip]);
             actionsPanel.Controls.Add(actionsFlow);
 
             // ---- Settings grid (TableLayoutPanel: 8 columns -> 4 label/control pairs per row) ----
@@ -181,7 +185,7 @@ namespace LAWS.Voices.Forms
             var lblPreset = MakeLabel("Preset");
             grid.Controls.Add(lblPreset, 4, 3);
             this.comboPreset = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Anchor = AnchorStyles.Left | AnchorStyles.Right, Margin = new Padding(0, 4, 12, 4) };
-            this.comboPreset.Items.AddRange(["Custom", "Bird Song", "Dawn Chorus (dense)", "Single Soloist", "Wide Stereo Field", "Noisy / Urban", "High-Freq Insects"]);
+            this.comboPreset.Items.AddRange(["Custom", "Bird Song", "Dawn Chorus (dense)", "Single Soloist", "Wide Stereo Field", "Noisy / Urban", "High-Freq Insects", "Binaural Tones (high/quiet)"]);
             this.comboPreset.SelectedIndex = 0;
             this.comboPreset.SelectedIndexChanged += (_, __) => this.ApplyBssPreset(this.comboPreset.SelectedItem?.ToString());
             grid.Controls.Add(this.comboPreset, 5, 3);
@@ -256,6 +260,15 @@ namespace LAWS.Voices.Forms
                     Set(this.numStrength, 80); Set(this.numContrast, 85); Set(this.numSuppression, 55);
                     this.comboMasking.SelectedItem = "Soft"; this.chkFrequencyDiversity.Checked = true;
                     break;
+                case "Binaural Tones (high/quiet)":
+                    // Isolates the very high, quiet "binaural" communication channels of bird
+                    // song by aggressively raising the low band-pass edge so rumble, mid-range
+                    // chatter and broadband noise are removed, leaving only the shrill upper tones.
+                    Set(this.numWindow, 2048); Set(this.numHop, 256); Set(this.numAzimuthBins, 24); Set(this.numMaxSources, 10);
+                    Set(this.numMinFrequency, 6000); Set(this.numMaxFrequency, 18000); Set(this.numMinEnergy, 1); Set(this.numDirectionTolerance, 8);
+                    Set(this.numStrength, 90); Set(this.numContrast, 85); Set(this.numSuppression, 70);
+                    this.comboMasking.SelectedItem = "Soft"; this.chkFrequencyDiversity.Checked = true;
+                    break;
                 default:
                     // "Custom": leave current values untouched.
                     break;
@@ -271,6 +284,7 @@ namespace LAWS.Voices.Forms
                 this.processingCts = new CancellationTokenSource();
                 this.btnStart.Enabled = false;
                 this.pBar.Value = 0;
+                this.StartElapsedTimer();
                 var progress = new Progress<int>(value => this.pBar.Value = Math.Clamp(value, 0, 100));
                 var settings = new BssProcessor.Settings
                 {
@@ -313,8 +327,40 @@ namespace LAWS.Voices.Forms
             }
             finally
             {
+                this.StopElapsedTimer();
                 this.btnStart.Enabled = true;
             }
+        }
+
+        private void StartElapsedTimer()
+        {
+            try
+            {
+                this.UseWaitCursor = true;
+                this.elapsedStart = DateTime.UtcNow;
+                this.lblElapsed.Text = "00:00";
+                if (this.elapsedTimer == null)
+                {
+                    this.elapsedTimer = new System.Windows.Forms.Timer { Interval = 500 };
+                    this.elapsedTimer.Tick += (_, __) =>
+                    {
+                        var span = DateTime.UtcNow - this.elapsedStart;
+                        this.lblElapsed.Text = $"{(int)span.TotalMinutes:00}:{span.Seconds:00}";
+                    };
+                }
+                this.elapsedTimer.Start();
+            }
+            catch { }
+        }
+
+        private void StopElapsedTimer()
+        {
+            try
+            {
+                this.elapsedTimer?.Stop();
+                this.UseWaitCursor = false;
+            }
+            catch { }
         }
 
         private async Task RefreshPreviewAsync()
@@ -389,6 +435,7 @@ namespace LAWS.Voices.Forms
             int exported = 0;
             try
             {
+                this.UseWaitCursor = true;
                 int idx = 1;
                 foreach (var track in this.currentResult.Tracks)
                 {
@@ -416,6 +463,7 @@ namespace LAWS.Voices.Forms
             }
             finally
             {
+                this.UseWaitCursor = false;
                 try { Directory.Delete(tempDir, true); } catch { }
             }
         }

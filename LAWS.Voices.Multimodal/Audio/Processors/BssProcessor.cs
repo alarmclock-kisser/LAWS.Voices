@@ -456,7 +456,7 @@ namespace LAWS.Voices.Multimodal.Audio.Processors
                         Audio = new AudioObj(pcm, sampleRate, 1, 32, $"{audio.Name}_BSS_{i + 1:D2}_{azimuth:F0}deg_{centerFrequencyHz:F0}Hz")
                     };
 
-                    var phraseTracks = this.SplitIntoPhraseTracks(fullTrack, phraseSilenceThresholdPercent, phraseMinDurationMs, phraseGapMs);
+                    var phraseTracks = this.SplitIntoPhraseTracks(fullTrack, phraseSilenceThresholdPercent, phraseMinDurationMs, phraseGapMs, left, right);
                     if (phraseTracks.Count > 0)
                     {
                         fullTrack.Dispose();
@@ -620,7 +620,7 @@ namespace LAWS.Voices.Multimodal.Audio.Processors
             return bitmap;
         }
 
-        private List<SourceTrack> SplitIntoPhraseTracks(SourceTrack fullTrack, float silenceThresholdPercent, int minDurationMs, int gapMs)
+        private List<SourceTrack> SplitIntoPhraseTracks(SourceTrack fullTrack, float silenceThresholdPercent, int minDurationMs, int gapMs, float[] originalLeft, float[] originalRight)
         {
             var phrases = new List<SourceTrack>();
             float[] pcm = fullTrack.Audio.Data;
@@ -664,20 +664,20 @@ namespace LAWS.Voices.Multimodal.Audio.Processors
                 }
 
                 int phraseEnd = i - silentRun;
-                this.TryAddPhrase(fullTrack, phraseStart.Value, phraseEnd, minDurationSamples, phrases);
+                this.TryAddPhrase(fullTrack, phraseStart.Value, phraseEnd, minDurationSamples, phrases, originalLeft, originalRight);
                 phraseStart = null;
                 silentRun = 0;
             }
 
             if (phraseStart != null)
             {
-                this.TryAddPhrase(fullTrack, phraseStart.Value, pcm.Length - 1, minDurationSamples, phrases);
+                this.TryAddPhrase(fullTrack, phraseStart.Value, pcm.Length - 1, minDurationSamples, phrases, originalLeft, originalRight);
             }
 
             return phrases;
         }
 
-        private void TryAddPhrase(SourceTrack fullTrack, int startSample, int endSample, int minDurationSamples, List<SourceTrack> phrases)
+        private void TryAddPhrase(SourceTrack fullTrack, int startSample, int endSample, int minDurationSamples, List<SourceTrack> phrases, float[] originalLeft, float[] originalRight)
         {
             if (endSample < startSample)
             {
@@ -694,12 +694,18 @@ namespace LAWS.Voices.Multimodal.Audio.Processors
             var clip = new float[length];
             Array.Copy(fullTrack.Audio.Data, startSample, clip, 0, length);
             int phraseIndex = phrases.Count + 1;
+
+            // Estimate the REAL azimuth of this phrase from the original stereo channels in
+            // the exact phrase time window (interaural level difference). This avoids every
+            // phrase inheriting the same parent azimuth and reflects where each bird sits.
+            double phraseAzimuth = EstimatePhraseAzimuth(originalLeft, originalRight, startSample, endSample, fullTrack.AzimuthDegrees);
+
             phrases.Add(new SourceTrack
             {
                 Index = (fullTrack.ParentTrackIndex * 100) + phraseIndex,
                 ParentTrackIndex = fullTrack.ParentTrackIndex,
                 PhraseIndex = phraseIndex,
-                AzimuthDegrees = fullTrack.AzimuthDegrees,
+                AzimuthDegrees = phraseAzimuth,
                 Confidence = fullTrack.Confidence,
                 FrequencyCenterHz = fullTrack.FrequencyCenterHz,
                 FrequencySpreadHz = fullTrack.FrequencySpreadHz,
@@ -708,6 +714,50 @@ namespace LAWS.Voices.Multimodal.Audio.Processors
                 EndOffset = TimeSpan.FromSeconds((endSample + 1) / (double) sampleRate),
                 Audio = new AudioObj(clip, sampleRate, 1, fullTrack.Audio.BitDepth, $"{fullTrack.Audio.Name}_Phrase_{phraseIndex:D2}")
             });
+        }
+
+        /// <summary>
+        /// Estimates the azimuth (-90..+90 degrees) of a phrase from the original stereo
+        /// channels over the phrase sample range, using the interaural level difference
+        /// (RMS energy ratio between left and right). Falls back to <paramref name="fallbackAzimuth"/>
+        /// when no usable stereo information is available (e.g. mono source).
+        /// </summary>
+        private static double EstimatePhraseAzimuth(float[] left, float[] right, int startSample, int endSample, double fallbackAzimuth)
+        {
+            if (left == null || right == null || left.Length == 0 || right.Length == 0)
+            {
+                return fallbackAzimuth;
+            }
+
+            int from = Math.Clamp(startSample, 0, Math.Min(left.Length, right.Length) - 1);
+            int to = Math.Clamp(endSample, from, Math.Min(left.Length, right.Length) - 1);
+
+            double sumL = 0.0, sumR = 0.0;
+            int count = 0;
+            for (int i = from; i <= to; i++)
+            {
+                sumL += (double) left[i] * left[i];
+                sumR += (double) right[i] * right[i];
+                count++;
+            }
+
+            if (count == 0)
+            {
+                return fallbackAzimuth;
+            }
+
+            double rmsL = Math.Sqrt(sumL / count);
+            double rmsR = Math.Sqrt(sumR / count);
+            if (rmsL + rmsR < 1e-7)
+            {
+                return fallbackAzimuth;
+            }
+
+            // Interaural level difference in dB, mapped to an azimuth angle.
+            double iidDb = 20.0 * Math.Log10((rmsL + 1e-9) / (rmsR + 1e-9));
+            // ~12 dB ILD corresponds roughly to a fully lateralized source.
+            double normalized = Math.Tanh(iidDb / 12.0);
+            return Math.Clamp(normalized * 90.0, -90.0, 90.0);
         }
 
         [SupportedOSPlatform("windows")]

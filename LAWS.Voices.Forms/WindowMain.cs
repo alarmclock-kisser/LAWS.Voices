@@ -59,6 +59,14 @@ namespace LAWS.Voices.Forms
         private bool isInferenceRunning = false;
         private readonly object inferenceLock = new();
 
+        // Self-updating mm:ss elapsed timer shown next to the progress bar while a
+        // non-cancellable load/process is running. It keeps ticking from 0:00, freezes
+        // for 5 seconds once finished, then hides itself.
+        private System.Windows.Forms.Timer? elapsedTimer = null;
+        private DateTime elapsedStart;
+        private bool elapsedFinished = false;
+        private DateTime elapsedFinishedAt;
+
 
         public WindowMain(Appsettings appsettings)
         {
@@ -102,6 +110,69 @@ namespace LAWS.Voices.Forms
         }
 
         private static float Clamp(float v, float lo, float hi) => v < lo ? lo : (v > hi ? hi : v);
+
+        /// <summary>
+        /// Starts the self-updating mm:ss elapsed indicator next to the progress bar.
+        /// Reuses <see cref="label_inferenceElapsed"/> and ticks every 500ms from 0:00.
+        /// Also shows the wait cursor for the duration of the non-cancellable work.
+        /// </summary>
+        private void StartElapsedTimer()
+        {
+            if (this.InvokeRequired)
+            {
+                this.BeginInvoke(new Action(this.StartElapsedTimer));
+                return;
+            }
+
+            this.elapsedStart = DateTime.Now;
+            this.elapsedFinished = false;
+            this.UseWaitCursor = true;
+
+            this.label_inferenceElapsed.Text = "Elapsed: 00:00";
+            this.label_inferenceElapsed.Visible = true;
+
+            if (this.elapsedTimer == null)
+            {
+                this.elapsedTimer = new System.Windows.Forms.Timer { Interval = 500 };
+                this.elapsedTimer.Tick += this.ElapsedTimer_Tick;
+            }
+
+            this.elapsedTimer.Start();
+        }
+
+        /// <summary>
+        /// Marks the elapsed timer as finished: it freezes the displayed time for 5 seconds
+        /// (handled in the tick) and then hides the label. Also restores the default cursor.
+        /// </summary>
+        private void FinishElapsedTimer()
+        {
+            if (this.InvokeRequired)
+            {
+                this.BeginInvoke(new Action(this.FinishElapsedTimer));
+                return;
+            }
+
+            this.elapsedFinished = true;
+            this.elapsedFinishedAt = DateTime.Now;
+            this.UseWaitCursor = false;
+        }
+
+        private void ElapsedTimer_Tick(object? sender, EventArgs e)
+        {
+            if (!this.elapsedFinished)
+            {
+                var span = DateTime.Now - this.elapsedStart;
+                this.label_inferenceElapsed.Text = "Elapsed: " + span.ToString("mm\\:ss");
+                return;
+            }
+
+            // Finished: keep the final elapsed time visible for 5 seconds, then hide.
+            if ((DateTime.Now - this.elapsedFinishedAt).TotalSeconds >= 5.0)
+            {
+                this.elapsedTimer?.Stop();
+                this.label_inferenceElapsed.Visible = false;
+            }
+        }
 
         // Handler for 'Extract Results' button - uses lastInferenceTensors if available or falls back to lastInferenceTensorRaw
         /// <summary>
@@ -626,6 +697,7 @@ namespace LAWS.Voices.Forms
             }
 
             this.InferenceStarted = DateTime.Now;
+            this.StartElapsedTimer();
 
             // If an inference is already running, treat click as a cancel request
             lock (this.inferenceLock)
@@ -1025,78 +1097,18 @@ namespace LAWS.Voices.Forms
                                             if (afp != null)
                                             {
                                                 var frames = afp.Frames ?? new System.Collections.Generic.List<LAWS.Voices.OpenVino.Processors.Wav2Vec2Processor.FrameAnalysisResult>();
-                                                var fps = new System.Collections.Generic.List<LAWS.Voices.Multimodal.Audio.Processors.FingerprintingProcessor.Fingerprint>();
 
-                                                // If there are no frames, skip. Otherwise, compute per-frame duration and merge consecutive frames
-                                                // with the same dominant token into variable-length segments so we don't cut continuous bird phrases.
-                                                if (frames.Count > 0)
-                                                {
-                                                    double totalMs = Math.Max(1.0, aud.Duration.TotalMilliseconds);
-                                                    // Heuristic: Wav2Vec2 typical frame stride is ~20 ms.
-                                                    // If too few frames are reported, avoid over-inflated frame durations.
-                                                    int reportedFrames = Math.Max(1, frames.Count);
-                                                    int minExpectedFrames = (int) Math.Max(1, Math.Round(totalMs / 20.0));
-                                                    int effectiveFrames = Math.Max(reportedFrames, minExpectedFrames);
-                                                    double frameMs = totalMs / effectiveFrames;
-
-                                                    int segStart = 0;
-                                                    string curToken = frames[0].DominantToken ?? string.Empty;
-                                                    double accConf = frames[0].Confidence;
-                                                    int accCount = 1;
-
-                                                    // Merge frames into segments, but avoid merging across unknown tokens or very low confidence frames
-                                                    const double MinConfidenceToMerge = 0.35;
-                                                    for (int i = 1; i < frames.Count; i++)
-                                                    {
-                                                        var fr = frames[i];
-                                                        var token = fr.DominantToken ?? string.Empty;
-
-                                                        bool isUnknown = string.IsNullOrWhiteSpace(token) || token == "<unk>" || token == "[pad]";
-                                                        bool highConfidence = fr.Confidence >= MinConfidenceToMerge;
-
-                                                        // Only merge if token equals current AND the frame is reasonably confident
-                                                        if (!isUnknown && token == curToken && highConfidence)
-                                                        {
-                                                            accConf += fr.Confidence;
-                                                            accCount++;
-                                                            continue;
-                                                        }
-
-                                                        // finalize segment [segStart .. i-1]
-                                                        try
-                                                        {
-                                                            var fp = new LAWS.Voices.Multimodal.Audio.Processors.FingerprintingProcessor.Fingerprint();
-                                                            fp.Timestamp = aud.CreatedAt.AddMilliseconds(segStart * frameMs);
-                                                            fp.DurationMs = (long) Math.Max(1, Math.Round(accCount * frameMs));
-                                                            fp.ToneCount = 1;
-                                                            fp.Features = new System.Collections.Concurrent.ConcurrentDictionary<string, float>();
-                                                            fp.Features["Confidence"] = (float) (accConf / accCount);
-                                                            fp.Features["Entropy"] = (float) frames[segStart].Entropy;
-                                                            fps.Add(fp);
-                                                        }
-                                                        catch { }
-
-                                                        // start new segment at this frame if it's a valid token; otherwise start next valid token as a new segment
-                                                        segStart = i;
-                                                        curToken = isUnknown ? string.Empty : token;
-                                                        accConf = fr.Confidence;
-                                                        accCount = 1;
-                                                    }
-
-                                                    // finalize last segment
-                                                    try
-                                                    {
-                                                        var fp = new LAWS.Voices.Multimodal.Audio.Processors.FingerprintingProcessor.Fingerprint();
-                                                        fp.Timestamp = aud.CreatedAt.AddMilliseconds(segStart * frameMs);
-                                                        fp.DurationMs = (long) Math.Max(1, Math.Round(accCount * frameMs));
-                                                        fp.ToneCount = 1;
-                                                        fp.Features = new System.Collections.Concurrent.ConcurrentDictionary<string, float>();
-                                                        fp.Features["Confidence"] = (float) (accConf / accCount);
-                                                        fp.Features["Entropy"] = (float) frames[segStart].Entropy;
-                                                        fps.Add(fp);
-                                                    }
-                                                    catch { }
-                                                }
+                                                // Convert the Wav2Vec2 frame timeline into variable-length phrase
+                                                // fingerprints. Segmentation is driven by the REAL audio energy
+                                                // envelope (Wav2Vec2 confidence is non-discriminative on bird song),
+                                                // each phrase getting its own TrackId.
+                                                var fps = LAWS.Voices.Forms.Helpers.Wav2VecPhraseSegmenter.BuildPhraseFingerprints(
+                                                    frames,
+                                                    aud.CreatedAt,
+                                                    aud.Duration.TotalMilliseconds,
+                                                    aud.Data,
+                                                    aud.SampleRate,
+                                                    aud.Channels);
 
                                                 // show visualizer on UI thread
                                                 this.BeginInvoke(new Action(() =>
@@ -1452,10 +1464,28 @@ namespace LAWS.Voices.Forms
             {
                 this.Invoke(new Action(() =>
                 {
-                    this.label_inferenceElapsed.Text = "Elapsed: " + (this.InferenceStarted.HasValue ? (DateTime.Now - this.InferenceStarted.Value).ToString("mm\\:ss\\.fff") : "-:--.---");
+                    this.label_inferenceElapsed.Text = "Elapsed: " + (this.InferenceStarted.HasValue ? (DateTime.Now - this.InferenceStarted.Value).ToString("mm\\:ss") : "00:00");
                 }));
+                this.FinishElapsedTimer();
                 this.InferenceStarted = null;
             }
+        }
+
+        // Runtime-configurable segmentation overlay options (fill mode, opacity, labels).
+        private readonly LAWS.Voices.Forms.Segmentation.SegmentationVisualizer.Options segmentationOptions =
+            new LAWS.Voices.Forms.Segmentation.SegmentationVisualizer.Options();
+
+        // Cityscapes / ADAS class labels for semantic-segmentation-adas-0001 (20 classes).
+        private static string AdasSegmentationLabel(int classId)
+        {
+            string[] labels =
+            {
+                "road", "sidewalk", "building", "wall", "fence", "pole",
+                "traffic light", "traffic sign", "vegetation", "terrain", "sky",
+                "person", "rider", "car", "truck", "bus", "train",
+                "motorcycle", "bicycle", "ego-vehicle",
+            };
+            return classId >= 0 && classId < labels.Length ? labels[classId] : $"class {classId}";
         }
 
         private void button_extractResults_Click(object sender, EventArgs e)
@@ -1719,6 +1749,25 @@ namespace LAWS.Voices.Forms
                     sb.AppendLine("Detections:");
                     foreach (var d in er.Detections.Take(5)) sb.AppendLine($" - [{d.X1},{d.Y1},{d.X2},{d.Y2}] score={d.Score} class={d.ClassId}");
                 }
+                if (er.Segmentation != null && er.Segmentation.Pixels.Length > 0)
+                {
+                    // Single-pass class histogram (fast) instead of LINQ Distinct() over millions of pixels.
+                    var seg = er.Segmentation;
+                    int segW = seg.Width, segH = seg.Height;
+                    var histogram = new Dictionary<int, long>();
+                    foreach (int classId in seg.Pixels)
+                        histogram[classId] = histogram.TryGetValue(classId, out var n) ? n + 1 : 1;
+
+                    long totalPixels = (long)segW * segH;
+                    sb.AppendLine($"Semantic segmentation: {segW}x{segH} ({histogram.Count} distinct classes)");
+                    sb.AppendLine("Detected segments (by area):");
+                    foreach (var kv in histogram.OrderByDescending(k => k.Value))
+                    {
+                        double pct = totalPixels > 0 ? (double)kv.Value / totalPixels : 0;
+                        string label = AdasSegmentationLabel(kv.Key);
+                        sb.AppendLine($" - [{kv.Key}] {label}: {pct:P1} ({kv.Value:N0} px)");
+                    }
+                }
                 if (er.RawSummaries.Count > 0 && sb.Length == 0)
                 {
                     sb.AppendLine("Raw summary:");
@@ -1763,6 +1812,39 @@ namespace LAWS.Voices.Forms
                     catch (Exception ex)
                     {
                         StaticLogger.Log("Failed to open visualizer for gaze vector: " + ex.Message);
+                        // fall-through to copy dialog if visualizer fails
+                    }
+                }
+
+                // If a segmentation map was produced, render a colored overlay and open the visualizer.
+                if (er.Segmentation != null && er.Segmentation.Pixels.Length > 0)
+                {
+                    try
+                    {
+                        ImageObj? imgObj = null;
+                        if (resourceIdx >= 0 && resourceIdx < orderedResources.Length && orderedResources[resourceIdx] is ImageObj selImg)
+                        {
+                            imgObj = selImg;
+                        }
+                        else
+                        {
+                            imgObj = WindowMain.currentPreviewResource as ImageObj;
+                        }
+
+                        Bitmap baseBmp = imgObj?.Img != null
+                            ? new Bitmap(imgObj.Img)
+                            : new Bitmap(er.Segmentation.Width, er.Segmentation.Height);
+
+                        Bitmap composed = LAWS.Voices.Forms.Segmentation.SegmentationVisualizer
+                            .ComposeOverlay(baseBmp, er.Segmentation.Pixels, this.segmentationOptions, AdasSegmentationLabel);
+
+                        var segViz = new ResultVisualizerForm(composed, text, null);
+                        segViz.Show(this);
+                        return;
+                    }
+                    catch (Exception ex)
+                    {
+                        StaticLogger.Log("Failed to open visualizer for segmentation: " + ex.Message);
                         // fall-through to copy dialog if visualizer fails
                     }
                 }

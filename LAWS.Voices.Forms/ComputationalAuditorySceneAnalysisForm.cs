@@ -18,6 +18,9 @@ namespace LAWS.Voices.Forms
         private CancellationTokenSource? analysisCts;
         private PictureBox pBox = new();
         private ProgressBar pBar = new();
+        private Label lblElapsed = new();
+        private System.Windows.Forms.Timer? elapsedTimer;
+        private DateTime elapsedStart;
         private Button btnStart = new();
         private ComboBox comboView = new();
         private Button btnOpenVisualizer = new();
@@ -34,6 +37,8 @@ namespace LAWS.Voices.Forms
         private WaveOutEvent? playbackDevice;
         private AudioFileReader? playbackReader;
         private string? playbackTempFile;
+        private int? playingStreamIndex;
+        private bool isStoppingPlayback;
 
         public ComputationalAuditorySceneAnalysisForm(AudioObj sourceAudio)
         {
@@ -73,6 +78,7 @@ namespace LAWS.Voices.Forms
             this.btnStart = new Button { Text = "Start", Width = 90, Height = 28, Margin = new Padding(0, 2, 8, 2) };
             this.btnStart.Click += async (_, __) => await this.RunAsync();
             this.pBar = new ProgressBar { Width = 220, Height = 24, Margin = new Padding(0, 4, 8, 2) };
+            this.lblElapsed = new Label { Text = "00:00", AutoSize = true, Margin = new Padding(0, 8, 8, 2) };
             var lblView = new Label { Text = "View", AutoSize = true, Margin = new Padding(0, 8, 4, 2) };
             this.comboView = new ComboBox { Width = 140, DropDownStyle = ComboBoxStyle.DropDownList, Enabled = false, Margin = new Padding(0, 4, 8, 2) };
             this.comboView.Items.AddRange(["Cochleagram", "Grouping", "Onset", "Harmonicity", "Energy"]);
@@ -85,7 +91,7 @@ namespace LAWS.Voices.Forms
             this.btnOpenVisualizer = new Button { Text = "Open Visualizer", Width = 120, Height = 28, Enabled = false, Margin = new Padding(0, 2, 8, 2) };
             this.btnOpenVisualizer.Click += (_, __) => this.OpenResultVisualizer();
 
-            actionsFlow.Controls.AddRange([this.btnStart, this.pBar, lblView, this.comboView, lblStream, this.numericStream, this.btnHear, this.btnOpenVisualizer]);
+            actionsFlow.Controls.AddRange([this.btnStart, this.pBar, this.lblElapsed, lblView, this.comboView, lblStream, this.numericStream, this.btnHear, this.btnOpenVisualizer]);
             actionsPanel.Controls.Add(actionsFlow);
 
             // ---- Settings grid ----
@@ -196,6 +202,7 @@ namespace LAWS.Voices.Forms
                 this.analysisCts = new CancellationTokenSource();
                 this.btnStart.Enabled = false;
                 this.pBar.Value = 0;
+                this.StartElapsedTimer();
                 var progress = new Progress<int>(value => this.pBar.Value = Math.Clamp(value, 0, 100));
                 var settings = new CasaProcessor.Settings
                 {
@@ -229,8 +236,40 @@ namespace LAWS.Voices.Forms
             }
             finally
             {
+                this.StopElapsedTimer();
                 this.btnStart.Enabled = true;
             }
+        }
+
+        private void StartElapsedTimer()
+        {
+            try
+            {
+                this.UseWaitCursor = true;
+                this.elapsedStart = DateTime.UtcNow;
+                this.lblElapsed.Text = "00:00";
+                if (this.elapsedTimer == null)
+                {
+                    this.elapsedTimer = new System.Windows.Forms.Timer { Interval = 500 };
+                    this.elapsedTimer.Tick += (_, __) =>
+                    {
+                        var span = DateTime.UtcNow - this.elapsedStart;
+                        this.lblElapsed.Text = $"{(int)span.TotalMinutes:00}:{span.Seconds:00}";
+                    };
+                }
+                this.elapsedTimer.Start();
+            }
+            catch { }
+        }
+
+        private void StopElapsedTimer()
+        {
+            try
+            {
+                this.elapsedTimer?.Stop();
+                this.UseWaitCursor = false;
+            }
+            catch { }
         }
 
         private void UpdatePreviewImage()
@@ -291,36 +330,81 @@ namespace LAWS.Voices.Forms
 
             try
             {
-                var stream = this.currentResult.Streams[(int) this.numericStream.Value - 1];
+                int selectedIndex = (int) this.numericStream.Value - 1;
+
+                // Toggle: clicking Hear again while the same stream plays stops playback.
+                if (this.playbackDevice != null && this.playbackReader != null && this.playingStreamIndex == selectedIndex)
+                {
+                    this.StopPlayback();
+                    return;
+                }
+
+                var stream = this.currentResult.Streams[selectedIndex];
                 var previewAudio = this.processor.RenderAudibleStreamPreview(this.sourceAudio, stream);
                 this.StopPlayback();
                 this.playbackTempFile = Path.Combine(Path.GetTempPath(), "LAWS_CASA_Hear_" + Guid.NewGuid().ToString("N") + ".wav");
                 await previewAudio.ExportWavAsync(Path.GetDirectoryName(this.playbackTempFile), Path.GetFileNameWithoutExtension(this.playbackTempFile));
                 this.playbackReader = new AudioFileReader(this.playbackTempFile);
                 this.playbackDevice = new WaveOutEvent();
+                this.playingStreamIndex = selectedIndex;
                 this.playbackDevice.Init(this.playbackReader);
-                this.playbackDevice.PlaybackStopped += (_, __) => this.StopPlayback();
+                this.playbackDevice.PlaybackStopped += this.PlaybackDevice_PlaybackStopped;
+                this.btnHear.Text = "Stop";
                 this.playbackDevice.Play();
             }
             catch (Exception ex)
             {
+                this.StopPlayback();
                 this.txtSummary.Text = "CASA stream playback failed: " + ex.Message;
             }
         }
 
+        private void PlaybackDevice_PlaybackStopped(object? sender, StoppedEventArgs e)
+        {
+            if (this.isStoppingPlayback)
+            {
+                return;
+            }
+
+            this.BeginInvoke(new Action(this.StopPlayback));
+        }
+
         private void StopPlayback()
         {
-            try { this.playbackDevice?.Stop(); } catch { }
-            try { this.playbackReader?.Dispose(); } catch { }
-            try { this.playbackDevice?.Dispose(); } catch { }
-            this.playbackReader = null;
-            this.playbackDevice = null;
+            if (this.isStoppingPlayback)
+            {
+                return;
+            }
+
+            this.isStoppingPlayback = true;
             try
             {
-                if (!string.IsNullOrEmpty(this.playbackTempFile) && File.Exists(this.playbackTempFile)) File.Delete(this.playbackTempFile);
+                if (this.playbackDevice != null)
+                {
+                    this.playbackDevice.PlaybackStopped -= this.PlaybackDevice_PlaybackStopped;
+                    try { this.playbackDevice.Stop(); } catch { }
+                }
+
+                try { this.playbackReader?.Dispose(); } catch { }
+                try { this.playbackDevice?.Dispose(); } catch { }
+                this.playbackReader = null;
+                this.playbackDevice = null;
+                this.playingStreamIndex = null;
+                this.btnHear.Text = "Hear";
+                try
+                {
+                    if (!string.IsNullOrEmpty(this.playbackTempFile) && File.Exists(this.playbackTempFile))
+                    {
+                        File.Delete(this.playbackTempFile);
+                    }
+                }
+                catch { }
+                this.playbackTempFile = null;
             }
-            catch { }
-            this.playbackTempFile = null;
+            finally
+            {
+                this.isStoppingPlayback = false;
+            }
         }
 
         private void ReleaseResources()

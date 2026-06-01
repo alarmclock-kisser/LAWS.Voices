@@ -13,6 +13,7 @@ using System.Diagnostics;
 using System.Windows.Forms;
 using LAWS.Voices.Shared;
 using System.ComponentModel;
+using LAWS.Voices.Forms.Helpers;
 
 namespace LAWS.Voices.Forms
 {
@@ -70,6 +71,9 @@ namespace LAWS.Voices.Forms
         private int? selectedNodeIndex = null;
         // Keep a single NodeDetailsForm instance to avoid multiple open windows
         private NodeDetailsForm? openNodeDetailsForm = null;
+        // When sorted by duration, hold per-node authoritative durations so the tree can
+        // space nodes horizontally in linear proportion to their duration (short left, long right).
+        private Dictionary<FingerprintingProcessor.Fingerprint, double>? durationLayout = null;
 
         public string ReportText { get; private set; } = string.Empty;
 
@@ -104,6 +108,8 @@ namespace LAWS.Voices.Forms
             try
             {
                 if (this.fingerprints == null || this.fingerprints.Count == 0) return;
+                // Linear duration layout only applies to the duration sort; clear it for any other order.
+                if (key != "duration") this.durationLayout = null;
                 switch (key)
                 {
                     case "index":
@@ -146,15 +152,33 @@ namespace LAWS.Voices.Forms
         private void SortByAuthoritativeDuration()
         {
             if (this.fingerprints == null || this.fingerprints.Count == 0) return;
-            // Precompute authoritative segment duration per node, then sort shortest -> longest.
-            var durations = new Dictionary<FingerprintingProcessor.Fingerprint, double>();
-            for (int i = 0; i < this.fingerprints.Count; i++)
+
+            // Compute each node's authoritative segment duration once.
+            // For Guid.Empty nodes the duration is simply the node's own length (O(1)).
+            // For real tracks we group fingerprints by TrackId up front so we don't filter
+            // the whole list per node (which would be O(N^2) and freeze the UI on large sets).
+            var byTrack = this.fingerprints
+                .Where(f => f.TrackId != Guid.Empty)
+                .GroupBy(f => f.TrackId)
+                .ToDictionary(g => g.Key, g => g.OrderBy(f => f.Timestamp).ToList());
+
+            var durations = new Dictionary<FingerprintingProcessor.Fingerprint, double>(this.fingerprints.Count);
+            foreach (var fp in this.fingerprints)
             {
-                var seg = this.GetAuthoritativeSegmentAroundIndex(i, mergeGapMs: 220, maxSegmentMs: 12000);
-                double ms = (seg.start == DateTime.MinValue || seg.end <= seg.start)
-                    ? Math.Max(1, this.fingerprints[i].DurationMs)
-                    : (seg.end - seg.start).TotalMilliseconds;
-                durations[this.fingerprints[i]] = ms;
+                double ms;
+                if (fp.TrackId == Guid.Empty || !byTrack.TryGetValue(fp.TrackId, out var related))
+                {
+                    ms = Math.Max(1, fp.DurationMs);
+                }
+                else
+                {
+                    var seg = FingerprintSegmentMath.ExpandInList(related, fp, mergeGapMs: 220, maxSegmentMs: 12000);
+                    ms = (seg.start == DateTime.MinValue || seg.end <= seg.start)
+                        ? Math.Max(1, fp.DurationMs)
+                        : (seg.end - seg.start).TotalMilliseconds;
+                }
+
+                durations[fp] = ms;
             }
 
             this.fingerprints.Sort((a, b) =>
@@ -163,6 +187,10 @@ namespace LAWS.Voices.Forms
                 durations.TryGetValue(b, out double db);
                 return da.CompareTo(db);
             });
+
+            // Remember the durations so the tree renderer can place nodes horizontally in
+            // linear proportion to their length (short blocks left, long blocks right).
+            this.durationLayout = durations;
         }
 
         private async Task ExportSongSamplesAsync()
@@ -217,6 +245,7 @@ namespace LAWS.Voices.Forms
                 if (sfd.ShowDialog(this) != DialogResult.OK) return;
                 string zipPath = sfd.FileName;
 
+                this.UseWaitCursor = true;
                 // create temp dir for wavs
                 string tempDir = Path.Combine(Path.GetTempPath(), "LAWS_Voices_SongExport_" + Guid.NewGuid().ToString("N"));
                 Directory.CreateDirectory(tempDir);
@@ -266,6 +295,10 @@ namespace LAWS.Voices.Forms
             {
                 StaticLogger.Log("ExportSongSamplesAsync failed: " + ex.Message);
                 MessageBox.Show(this, "Export failed: " + ex.Message, "Export Songs", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+            finally
+            {
+                this.UseWaitCursor = false;
             }
         }
 
@@ -769,9 +802,40 @@ namespace LAWS.Voices.Forms
 
                 // Spread nodes a bit more horizontally and add a small jitter based on centroid to reduce overlap
                 float spreadFactor = Math.Min(2.0f, 1.0f + (float)Math.Log10(Math.Max(1, n)));
+
+                // When a duration layout is active (Sort by Duration), map each node's X position
+                // linearly to its authoritative duration so short blocks sit on the left and long
+                // blocks on the right, with horizontal gaps proportional to duration differences.
+                var durLayout = this.durationLayout;
+                double durMin = 0, durRange = 0;
+                bool useDurationX = durLayout != null && durLayout.Count > 0;
+                if (useDurationX)
+                {
+                    durMin = double.MaxValue;
+                    double durMax = double.MinValue;
+                    for (int i = 0; i < n; i++)
+                    {
+                        if (durLayout!.TryGetValue(fps[i], out double d))
+                        {
+                            durMin = Math.Min(durMin, d);
+                            durMax = Math.Max(durMax, d);
+                        }
+                    }
+                    durRange = durMax - durMin;
+                    if (durRange <= 1e-6) useDurationX = false;
+                }
+
                 for (int i = 0; i < n; i++)
                 {
-                    float x = margin + (float)(i * usableW / Math.Max(1, n - 1)) * spreadFactor;
+                    float x;
+                    if (useDurationX && durLayout!.TryGetValue(fps[i], out double d))
+                    {
+                        x = margin + (float)((d - durMin) / durRange) * usableW;
+                    }
+                    else
+                    {
+                        x = margin + (float)(i * usableW / Math.Max(1, n - 1)) * spreadFactor;
+                    }
                     float y;
                     if (haveCent && !double.IsNaN(centroids[i]))
                     {
@@ -998,7 +1062,7 @@ namespace LAWS.Voices.Forms
                 var seg = this.GetAuthoritativeSegmentAroundIndex(nodeIndex, mergeGapMs: 220, maxSegmentMs: 12000);
                 // Ensure only one node details window exists at a time
                 try { if (this.openNodeDetailsForm != null && !this.openNodeDetailsForm.IsDisposed) this.openNodeDetailsForm.Close(); } catch { }
-                this.openNodeDetailsForm = new NodeDetailsForm(nodeIndex, node, this.sourceAudio, seg.start, seg.end);
+                this.openNodeDetailsForm = new NodeDetailsForm(nodeIndex, node, this.sourceAudio, seg.start, seg.end, this.fingerprints, idx => this.GetAuthoritativeSegmentAroundIndex(idx, mergeGapMs: 220, maxSegmentMs: 12000));
                 this.openNodeDetailsForm.FormClosed += (_, __) => { try { this.openNodeDetailsForm = null; } catch { } };
                 this.openNodeDetailsForm.Show(this);
             }
@@ -1042,53 +1106,7 @@ namespace LAWS.Voices.Forms
 
         private (DateTime start, DateTime end) ExpandSegmentAroundIndex(List<FingerprintingProcessor.Fingerprint> fps, int index, int mergeGapMs = 220, int maxSegmentMs = 12000)
         {
-            if (fps == null || fps.Count == 0) return (DateTime.MinValue, DateTime.MinValue);
-            if (index < 0) index = 0;
-            if (index >= fps.Count) index = fps.Count - 1;
-            var target = fps[index];
-            var related = (target.TrackId != Guid.Empty ? fps.Where(f => f.TrackId == target.TrackId) : fps)
-                .OrderBy(f => f.Timestamp)
-                .ToList();
-
-            int i = related.FindIndex(f => f.Id == target.Id && f.Timestamp == target.Timestamp);
-            if (i < 0) i = related.FindIndex(f => f.Timestamp == target.Timestamp);
-            if (i < 0) i = 0;
-
-            DateTime start = related[i].Timestamp;
-            DateTime end = start.AddMilliseconds(Math.Max(20, related[i].DurationMs));
-
-            for (int L = i - 1; L >= 0; L--)
-            {
-                var prev = related[L];
-                var prevEnd = prev.Timestamp.AddMilliseconds(Math.Max(20, prev.DurationMs));
-                var gap = (start - prevEnd).TotalMilliseconds;
-                if (gap <= mergeGapMs)
-                {
-                    start = prev.Timestamp;
-                }
-                else break;
-            }
-            for (int R = i + 1; R < related.Count; R++)
-            {
-                var next = related[R];
-                var gap = (next.Timestamp - end).TotalMilliseconds;
-                if (gap <= mergeGapMs)
-                {
-                    end = next.Timestamp.AddMilliseconds(Math.Max(20, next.DurationMs));
-                    if ((end - start).TotalMilliseconds >= maxSegmentMs)
-                    {
-                        end = start.AddMilliseconds(maxSegmentMs);
-                        break;
-                    }
-                }
-                else break;
-            }
-
-            if ((end - start).TotalMilliseconds > maxSegmentMs)
-            {
-                end = start.AddMilliseconds(maxSegmentMs);
-            }
-            return (start, end);
+            return FingerprintSegmentMath.ExpandAroundIndex(fps, index, mergeGapMs, maxSegmentMs);
         }
 
         private async Task PlayNodeAudioAsync(int nodeIndex)
@@ -1111,13 +1129,10 @@ namespace LAWS.Voices.Forms
                 var seg = this.GetAuthoritativeSegmentAroundIndex(nodeIndex, mergeGapMs: 220, maxSegmentMs: 12000);
                 DateTime sdt = seg.start == DateTime.MinValue ? node.Timestamp : seg.start;
                 DateTime edt = seg.end <= sdt ? node.Timestamp.AddMilliseconds(Math.Max(1, node.DurationMs)) : seg.end;
-                sdt = sdt.AddMilliseconds(-40);
-                edt = edt.AddMilliseconds(40);
-                double startFrame = (sdt - this.sourceAudio.CreatedAt).TotalSeconds * sr;
-                double endFrame = (edt - this.sourceAudio.CreatedAt).TotalSeconds * sr;
-                long startSample = (long)Math.Max(0, Math.Round(startFrame)) * ch;
-                long endSample = (long)Math.Min(this.sourceAudio.Data.Length, Math.Max(startSample + 1, (long)Math.Round(endFrame) * ch));
-                if (endSample <= startSample) { MessageBox.Show(this, "Node audio segment is empty.", "Play Node", MessageBoxButtons.OK, MessageBoxIcon.Information); return; }
+                if (!FingerprintSegmentMath.TryGetSampleRange(sdt, edt, this.sourceAudio.CreatedAt, sr, ch, this.sourceAudio.Data.Length, paddingMs: 40, out long startSample, out long endSample))
+                {
+                    MessageBox.Show(this, "Node audio segment is empty.", "Play Node", MessageBoxButtons.OK, MessageBoxIcon.Information); return;
+                }
 
                 int len = (int)(endSample - startSample);
                 var buf = new float[len];

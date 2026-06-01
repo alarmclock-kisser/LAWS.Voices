@@ -103,23 +103,95 @@ namespace LAWS.Voices.OpenVino.Processors
                 Tensor audioTensor = inputTensor0;
                 Tensor? metaTensor = inputTensor1; // may be null for single-input models
 
-                // Dynamically swap pointers if Port 0 is allocated for metadata sizing thresholds
+                static long TryGetLastShapeDim(Tensor? tensor)
+                {
+                    if (tensor == null)
+                    {
+                        return -1;
+                    }
+
+                    try
+                    {
+                        var shapeProp = tensor.GetType().GetProperty("shape");
+                        if (shapeProp != null)
+                        {
+                            var rawShape = shapeProp.GetValue(tensor);
+                            if (rawShape is System.Collections.IEnumerable enumShape)
+                            {
+                                long last = -1;
+                                foreach (var it in enumShape)
+                                {
+                                    try { last = Convert.ToInt64(it); } catch { }
+                                }
+                                return last;
+                            }
+                        }
+                    }
+                    catch { }
+
+                    return -1;
+                }
+
+                // Route by declared input shape first (metadata port ends with dim=3), then fallback to
+                // runtime size probing only if shape data is unavailable.
                 try
                 {
-                    if (inputTensor0.size == 3 && inputTensor1 != null)
+                    if (inputTensor1 != null)
                     {
-                        metaTensor = inputTensor0;
-                        audioTensor = inputTensor1;
-                        StaticLogger.Log("[BirdNET Layout] Routed Port 0 as Metadata and Port 1 as Audio Payload.");
+                        long dim0 = TryGetLastShapeDim(inputTensor0);
+                        long dim1 = TryGetLastShapeDim(inputTensor1);
+                        bool input0IsMetadata = dim0 == 3;
+                        bool input1IsMetadata = dim1 == 3;
+
+                        if (input0IsMetadata && !input1IsMetadata)
+                        {
+                            audioTensor = inputTensor1;
+                            metaTensor = inputTensor0;
+                            StaticLogger.Log($"[BirdNET Layout] Routed by shape -> Audio=Port1 (lastDim={dim1}), Metadata=Port0 (lastDim={dim0}).");
+                        }
+                        else if (input1IsMetadata && !input0IsMetadata)
+                        {
+                            audioTensor = inputTensor0;
+                            metaTensor = inputTensor1;
+                            StaticLogger.Log($"[BirdNET Layout] Routed by shape -> Audio=Port0 (lastDim={dim0}), Metadata=Port1 (lastDim={dim1}).");
+                        }
+                        else
+                        {
+                        ulong size0 = 0UL;
+                        ulong size1 = 0UL;
+                        try { size0 = inputTensor0.size; } catch { }
+                        try { size1 = inputTensor1.size; } catch { }
+
+                            if (size0 > size1)
+                            {
+                                audioTensor = inputTensor0;
+                                metaTensor = inputTensor1;
+                                StaticLogger.Log($"[BirdNET Layout] Routed by capacity fallback -> Audio=Port0 (size={size0}), Metadata=Port1 (size={size1}), shapeDims=({dim0},{dim1}).");
+                            }
+                            else if (size1 > size0)
+                            {
+                                audioTensor = inputTensor1;
+                                metaTensor = inputTensor0;
+                                StaticLogger.Log($"[BirdNET Layout] Routed by capacity fallback -> Audio=Port1 (size={size1}), Metadata=Port0 (size={size0}), shapeDims=({dim0},{dim1}).");
+                            }
+                            else
+                            {
+                                // When both are dynamic and size=0, keep the common BirdNET layout default:
+                                // Port0 audio, Port1 metadata.
+                                audioTensor = inputTensor0;
+                                metaTensor = inputTensor1;
+                                StaticLogger.Log($"[BirdNET Layout] Capacity tie fallback -> Audio=Port0 (size={size0}), Metadata=Port1 (size={size1}), shapeDims=({dim0},{dim1}).");
+                            }
+                        }
                     }
                     else
                     {
-                        StaticLogger.Log(inputTensor1 == null
-                            ? "[BirdNET Layout] Single-input model detected; Metadata port absent."
-                            : "[BirdNET Layout] Routed Port 0 as Audio Payload and Port 1 as Metadata.");
+                        audioTensor = inputTensor0;
+                        metaTensor = null;
+                        StaticLogger.Log("[BirdNET Layout] Single-input model detected; Metadata port absent.");
                     }
                 }
-                catch { /* ignore size probe errors */ }
+                catch { /* ignore route probe errors */ }
 
                 // Initialize metadata parameters once (-1.0f commands BirdNET to skip location-specific filtering metrics)
                 float[] dummyMeta = new float[] { -1.0f, -1.0f, -1.0f };
@@ -162,6 +234,47 @@ namespace LAWS.Voices.OpenVino.Processors
                     // Feed raw PCM sample values straight into the locked memory block address
                     try
                     {
+                        // CRITICAL FIX: BirdNET exposes a DYNAMIC input tensor whose initial shape is
+                        // Shape(0, 3) => capacity 0. Writing 144,000 floats into a zero-capacity buffer
+                        // throws the native "Input data is too large" ArgumentException. We must set the
+                        // concrete shape [1, SamplesPerChunk] on the tensor BEFORE calling set_data so the
+                        // native buffer is allocated to the correct size.
+                        try
+                        {
+                            if (audioTensor != null)
+                            {
+                                var desiredShape = new Shape(new long[] { 1, SamplesPerChunk });
+
+                                // CRITICAL FIX: Use the set_shape(...) METHOD, not the 'shape' property setter.
+                                // The property setter maps to a strict native reshape that validates the new dims
+                                // against the port's declared partial shape ({0-?, 3}) and throws
+                                // "ParameterMismatch: Can not clone with new dims. ... {0 - ?, 3} is incompatible
+                                // with provided dimensions: {1, 144000}". The set_shape(...) method instead
+                                // re-allocates the dynamic tensor to the requested shape (verified in the live
+                                // debugger: tensor.size went 0 -> 144000 and set_data then succeeded).
+                                var setShapeMethod = audioTensor.GetType().GetMethod(
+                                    "set_shape", new[] { typeof(Shape) });
+                                if (setShapeMethod != null)
+                                {
+                                    setShapeMethod.Invoke(audioTensor, new object[] { desiredShape });
+                                }
+                                else
+                                {
+                                    // Fallback for API variants that only expose the property setter.
+                                    audioTensor.shape = desiredShape;
+                                }
+                            }
+                        }
+                        catch (TargetInvocationException shapeTie)
+                        {
+                            var inner = shapeTie.InnerException ?? shapeTie;
+                            StaticLogger.Log($"[BirdNET] set_shape([1,{SamplesPerChunk}]) failed: {inner.Message}");
+                        }
+                        catch (Exception shapeEx)
+                        {
+                            StaticLogger.Log($"[BirdNET] Failed to set audio tensor shape to [1,{SamplesPerChunk}]: {shapeEx.Message}");
+                        }
+
                         // Determine whether native tensor.size is reported as bytes or element count.
                         ulong rawTensorSize = 0UL;
                         try { rawTensorSize = audioTensor?.size ?? 0UL; } catch { }
