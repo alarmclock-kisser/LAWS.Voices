@@ -289,11 +289,19 @@ namespace LAWS.Voices.Multimodal.Audio.Processors
             // Restliche aktive Tracks am Ende schließen
             completedTracks.AddRange(activeTracks.Where(t => t.ActiveFrames.Count > 2));
 
-            StaticLogger.Log($"[CASA BSS Engine] Phase 3: Assembly & Aggressive Trim. Tracks: {completedTracks.Count}");
+            double hopDurationMs = (_hopSize / (double) sampleRate) * 1000.0;
+            double phraseGapMs = Math.Max(frameDurationMs * 2.0, Math.Min(220.0, trackMaxSilenceFrames * hopDurationMs));
+            double maxPhraseDurationMs = 3000.0;
+            var phraseTracks = completedTracks
+                .SelectMany(track => this.SplitTrackIntoPhrases(track, phraseGapMs, maxPhraseDurationMs))
+                .Where(track => track.ActiveFrames.Count > 2)
+                .ToList();
+
+            StaticLogger.Log($"[CASA BSS Engine] Phase 3: Assembly & Aggressive Trim. Tracks: {completedTracks.Count}, phrases: {phraseTracks.Count}");
 
             await Task.Run(() =>
             {
-                Parallel.ForEach(completedTracks, new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount }, track =>
+                Parallel.ForEach(phraseTracks, new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount }, track =>
                 {
                     if (!track.ActiveFrames.Any()) return;
 
@@ -327,37 +335,49 @@ namespace LAWS.Voices.Multimodal.Audio.Processors
                     // AGGRESSIVES TRIMMEN LOGIK
                     if (density < minSampleDensity)
                     {
-                        // Das Array ist voller Lücken/Rauschen. Standard-Threshold reicht nicht.
-                        // Wir setzen den Threshold relativ zum LOUDTESTEN Punkt im Track.
-                        // Beispiel: MaxPeak ist 0.5. Wir nehmen alles weg, was leiser als 5% davon ist (0.025).
-                        currentThreshold = Math.Max(_silenceThreshold, maxPeakInTrack * 0.05f);
+                        float peakFactor = Math.Min(0.25f, 0.02f * trimThresholdMultiplier);
+                        currentThreshold = Math.Max(_silenceThreshold, maxPeakInTrack * peakFactor);
 
-                        // Falls immer noch zu viel Rauschen, noch härter werden
-                        if (density < 0.05f) currentThreshold = Math.Max(currentThreshold, maxPeakInTrack * 0.10f);
+                        if (density < 0.05f)
+                        {
+                            currentThreshold = Math.Max(currentThreshold, maxPeakInTrack * Math.Min(0.35f, peakFactor * 1.5f));
+                        }
                     }
 
                     finalPcm = this.TrimSilence(reconstructedPcm, currentThreshold);
-
-                    // Mindestlänge prüfen
-                    if (finalPcm.Length > 0 && finalPcm.Length >= (sampleRate * minDurationSeconds))
+                    if (finalPcm.Length == 0)
                     {
+                        return;
+                    }
+
+                    int minSilenceGapSamples = Math.Max(_hopSize, (int) Math.Round(sampleRate * 0.12));
+                    var clipSegments = this.SplitBySilence(finalPcm, currentThreshold, minSilenceGapSamples);
+                    if (clipSegments.Count == 0)
+                    {
+                        clipSegments.Add(finalPcm);
+                    }
+
+                    int clipIndex = 1;
+                    foreach (var clipPcm in clipSegments)
+                    {
+                        if (clipPcm.Length < (sampleRate * minDurationSeconds))
+                        {
+                            continue;
+                        }
+
                         string id = track.TrackId.ToString().Substring(0, 4);
-                        double actualDurationSec = finalPcm.Length / (double) sampleRate;
+                        double actualDurationSec = clipPcm.Length / (double) sampleRate;
 
-                        // Name enthält Dauer zur Kontrolle
-                        string fileName = $"{audio.Name}_Bird_{id}_{track.CurrentDominantFreq:F0}Hz_Dur{actualDurationSec:F2}s";
+                        string fileName = $"{audio.Name}_Bird_{id}_{clipIndex:D2}_{track.CurrentDominantFreq:F0}Hz_Dur{actualDurationSec:F2}s";
 
-                        var isolatedAudio = new AudioObj(finalPcm, sampleRate, 1, 16, fileName);
+                        var isolatedAudio = new AudioObj(clipPcm, sampleRate, 1, 16, fileName);
 
                         lock (IsolatedBirdSamples)
                         {
                             IsolatedBirdSamples.Add(isolatedAudio);
                         }
-                    }
-                    else
-                    {
-                        // Debug: Warum verworfen?
-                        // StaticLogger.Log($"Discarded: Len={finalPcm.Length}, Density={density:F2}");
+
+                        clipIndex++;
                     }
                 });
             }, _cancellationToken);
@@ -856,6 +876,138 @@ namespace LAWS.Voices.Multimodal.Audio.Processors
             float[] trimmed = new float[end - start + 1];
             Array.Copy(audio, start, trimmed, 0, trimmed.Length);
             return trimmed;
+        }
+
+        private List<SingerTrack> SplitTrackIntoPhrases(SingerTrack track, double maxGapMs, double maxPhraseDurationMs)
+        {
+            var phrases = new List<SingerTrack>();
+            if (track.Nodes.Count == 0 || track.ActiveFrames.Count == 0)
+            {
+                return phrases;
+            }
+
+            if (track.Nodes.Count != track.ActiveFrames.Count)
+            {
+                phrases.Add(track);
+                return phrases;
+            }
+
+            var orderedPairs = track.Nodes
+                .Zip(track.ActiveFrames, (node, frame) => new { Node = node, Frame = frame })
+                .OrderBy(pair => pair.Frame.FrameIndex)
+                .ThenBy(pair => pair.Node.Timestamp)
+                .ToList();
+
+            SingerTrack? currentPhrase = null;
+            DateTime phraseStart = DateTime.MinValue;
+            DateTime lastTimestamp = DateTime.MinValue;
+
+            foreach (var pair in orderedPairs)
+            {
+                bool shouldSplit = false;
+                if (currentPhrase != null)
+                {
+                    double timeGapMs = lastTimestamp == DateTime.MinValue ? 0.0 : (pair.Node.Timestamp - lastTimestamp).TotalMilliseconds;
+                    double phraseDurationMs = phraseStart == DateTime.MinValue ? 0.0 : (pair.Node.Timestamp - phraseStart).TotalMilliseconds;
+                    shouldSplit = timeGapMs > maxGapMs || phraseDurationMs > maxPhraseDurationMs;
+                }
+
+                if (shouldSplit && currentPhrase != null)
+                {
+                    if (currentPhrase.ActiveFrames.Count > 2)
+                    {
+                        phrases.Add(currentPhrase);
+                    }
+
+                    currentPhrase = null;
+                }
+
+                if (currentPhrase == null)
+                {
+                    currentPhrase = new SingerTrack
+                    {
+                        CurrentDominantFreq = track.CurrentDominantFreq,
+                        MissedFrames = 0,
+                        StereoVector = (float[]) track.StereoVector.Clone(),
+                        AzimuthDegrees = track.AzimuthDegrees
+                    };
+                    phraseStart = pair.Node.Timestamp;
+                }
+
+                pair.Node.TrackId = currentPhrase.TrackId;
+                currentPhrase.Nodes.Add(pair.Node);
+                currentPhrase.ActiveFrames.Add(pair.Frame);
+                lastTimestamp = pair.Node.Timestamp;
+            }
+
+            if (currentPhrase != null && currentPhrase.ActiveFrames.Count > 2)
+            {
+                phrases.Add(currentPhrase);
+            }
+
+            return phrases;
+        }
+
+        private List<float[]> SplitBySilence(float[] audio, float threshold, int minSilenceGapSamples)
+        {
+            var clips = new List<float[]>();
+            if (audio == null || audio.Length == 0)
+            {
+                return clips;
+            }
+
+            int segmentStart = -1;
+            int silentRun = 0;
+
+            for (int i = 0; i < audio.Length; i++)
+            {
+                bool isSilent = Math.Abs(audio[i]) < threshold;
+                if (!isSilent)
+                {
+                    if (segmentStart < 0)
+                    {
+                        segmentStart = i;
+                    }
+
+                    silentRun = 0;
+                    continue;
+                }
+
+                if (segmentStart < 0)
+                {
+                    continue;
+                }
+
+                silentRun++;
+                if (silentRun < minSilenceGapSamples)
+                {
+                    continue;
+                }
+
+                int segmentEnd = i - silentRun;
+                if (segmentEnd >= segmentStart)
+                {
+                    float[] clip = new float[segmentEnd - segmentStart + 1];
+                    Array.Copy(audio, segmentStart, clip, 0, clip.Length);
+                    clips.Add(clip);
+                }
+
+                segmentStart = -1;
+                silentRun = 0;
+            }
+
+            if (segmentStart >= 0)
+            {
+                int segmentEnd = audio.Length - silentRun - 1;
+                if (segmentEnd >= segmentStart)
+                {
+                    float[] clip = new float[segmentEnd - segmentStart + 1];
+                    Array.Copy(audio, segmentStart, clip, 0, clip.Length);
+                    clips.Add(clip);
+                }
+            }
+
+            return clips;
         }
 
         private float[] ConvertToMono(float[] stereoData, int channelCount)

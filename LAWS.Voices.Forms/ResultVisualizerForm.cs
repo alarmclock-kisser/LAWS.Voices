@@ -309,9 +309,12 @@ namespace LAWS.Voices.Forms
                     foreach (var idx in indices)
                     {
                         var f = this.fingerprints[idx];
+                        var seg = this.GetAuthoritativeSegmentAroundIndex(idx, mergeGapMs: 220, maxSegmentMs: 12000);
+                        long segmentMs = Math.Max(1L, (long)Math.Round((seg.end - seg.start).TotalMilliseconds));
                         sb.AppendLine($"Index: {idx}");
                         sb.AppendLine($"Timestamp: {f.Timestamp:O}");
-                        sb.AppendLine($"DurationMs: {f.DurationMs}");
+                        sb.AppendLine($"SegmentDurationMs: {segmentMs}");
+                        sb.AppendLine($"FrameDurationMs: {f.DurationMs}");
                         sb.AppendLine($"ToneCount: {f.ToneCount}");
                         sb.AppendLine("Features:");
                         foreach (var kv in f.Features) sb.AppendLine($"  {kv.Key}: {kv.Value}");
@@ -326,13 +329,7 @@ namespace LAWS.Voices.Forms
                 }
             };
 
-            this.btnClose = new Button();
-            this.btnClose.Text = "Close";
-            this.btnClose.Width = 90;
-            this.btnClose.Left = panel.Width - this.btnClose.Width - 12;
-            this.btnClose.Top = 6;
-            this.btnClose.Anchor = AnchorStyles.Right | AnchorStyles.Bottom;
-            this.btnClose.Click += (s, e) => this.Close();
+            // Close button removed per user request
 
             panel.Controls.Add(this.btnCopy);
             panel.Controls.Add(this.btnSave);
@@ -341,7 +338,6 @@ namespace LAWS.Voices.Forms
             panel.Controls.Add(this.btnExportTree);
             panel.Controls.Add(this.btnCopyRandom);
             panel.Controls.Add(this.btnNodePlay);
-            panel.Controls.Add(this.btnClose);
 
             // picturePanel wraps pictureBox to allow scrolling / panning when zoomed
             this.picturePanel = new NoWheelScrollPanel();
@@ -884,7 +880,7 @@ namespace LAWS.Voices.Forms
                 if (this.fingerprints == null || nodeIndex < 0 || nodeIndex >= this.fingerprints.Count) return;
                 var node = this.fingerprints[nodeIndex];
                 // expand around selected node to form a playback segment
-                var seg = this.ExpandSegmentAroundIndex(this.fingerprints, nodeIndex, mergeGapMs: 400);
+                var seg = this.GetAuthoritativeSegmentAroundIndex(nodeIndex, mergeGapMs: 220, maxSegmentMs: 12000);
                 // Ensure only one node details window exists at a time
                 try { if (this.openNodeDetailsForm != null && !this.openNodeDetailsForm.IsDisposed) this.openNodeDetailsForm.Close(); } catch { }
                 this.openNodeDetailsForm = new NodeDetailsForm(nodeIndex, node, this.sourceAudio, seg.start, seg.end);
@@ -898,98 +894,84 @@ namespace LAWS.Voices.Forms
         {
             var result = new List<(DateTime start, DateTime end)>();
             if (fps == null || fps.Count == 0) return result;
-            var ordered = fps.OrderBy(f => f.Timestamp).ToList();
-            DateTime curStart = ordered[0].Timestamp;
-            DateTime curEnd = ordered[0].Timestamp.AddMilliseconds(Math.Max(1, ordered[0].DurationMs));
-            for (int i = 1; i < ordered.Count; i++)
+            foreach (var trackGroup in fps.GroupBy(f => f.TrackId == Guid.Empty ? f.Id : f.TrackId))
             {
-                var f = ordered[i];
-                var fStart = f.Timestamp;
-                var fEnd = f.Timestamp.AddMilliseconds(Math.Max(1, f.DurationMs));
-                if (fStart <= curEnd.AddMilliseconds(mergeGapMs))
+                var ordered = trackGroup.OrderBy(f => f.Timestamp).ToList();
+                DateTime curStart = ordered[0].Timestamp;
+                DateTime curEnd = ordered[0].Timestamp.AddMilliseconds(Math.Max(1, ordered[0].DurationMs));
+                for (int i = 1; i < ordered.Count; i++)
                 {
-                    // extend
-                    if (fEnd > curEnd) curEnd = fEnd;
+                    var f = ordered[i];
+                    var fStart = f.Timestamp;
+                    var fEnd = f.Timestamp.AddMilliseconds(Math.Max(1, f.DurationMs));
+                    if (fStart <= curEnd.AddMilliseconds(mergeGapMs))
+                    {
+                        if (fEnd > curEnd) curEnd = fEnd;
+                    }
+                    else
+                    {
+                        if ((curEnd - curStart).TotalMilliseconds >= minSegmentMs) result.Add((curStart, curEnd));
+                        curStart = fStart;
+                        curEnd = fEnd;
+                    }
                 }
-                else
-                {
-                    // finalize current
-                    if ((curEnd - curStart).TotalMilliseconds >= minSegmentMs) result.Add((curStart, curEnd));
-                    curStart = fStart; curEnd = fEnd;
-                }
+                if ((curEnd - curStart).TotalMilliseconds >= minSegmentMs) result.Add((curStart, curEnd));
             }
-            if ((curEnd - curStart).TotalMilliseconds >= minSegmentMs) result.Add((curStart, curEnd));
-            return result;
+            return result.OrderBy(segment => segment.start).ToList();
         }
 
-        private (DateTime start, DateTime end) ExpandSegmentAroundIndex(List<FingerprintingProcessor.Fingerprint> fps, int index, int mergeGapMs = 400)
+        private (DateTime start, DateTime end) GetAuthoritativeSegmentAroundIndex(int index, int mergeGapMs = 220, int maxSegmentMs = 12000)
+        {
+            return this.ExpandSegmentAroundIndex(this.fingerprints ?? new List<FingerprintingProcessor.Fingerprint>(), index, mergeGapMs, maxSegmentMs);
+        }
+
+        private (DateTime start, DateTime end) ExpandSegmentAroundIndex(List<FingerprintingProcessor.Fingerprint> fps, int index, int mergeGapMs = 220, int maxSegmentMs = 12000)
         {
             if (fps == null || fps.Count == 0) return (DateTime.MinValue, DateTime.MinValue);
-            var ordered = fps.OrderBy(f => f.Timestamp).ToList();
             if (index < 0) index = 0;
-            if (index >= ordered.Count) index = ordered.Count - 1;
-            // find the fingerprint reference in ordered list by matching timestamp and id
+            if (index >= fps.Count) index = fps.Count - 1;
             var target = fps[index];
-            int i = ordered.FindIndex(f => f.Id == target.Id && f.Timestamp == target.Timestamp);
-            if (i < 0) i = ordered.FindIndex(f => f.Timestamp == target.Timestamp);
+            var related = (target.TrackId != Guid.Empty ? fps.Where(f => f.TrackId == target.TrackId) : fps)
+                .OrderBy(f => f.Timestamp)
+                .ToList();
+
+            int i = related.FindIndex(f => f.Id == target.Id && f.Timestamp == target.Timestamp);
+            if (i < 0) i = related.FindIndex(f => f.Timestamp == target.Timestamp);
             if (i < 0) i = 0;
 
-            DateTime start = ordered[i].Timestamp;
-            // Compute an initial end that is based on neighbor midpoints rather than trusting DurationMs
-            DateTime end;
-            if (ordered.Count == 1)
-            {
-                // single node: use a sensible default (1s) or clamp to source audio duration if available
-                double defaultMs = 1000.0;
-                if (this.sourceAudio != null) defaultMs = Math.Min(defaultMs, Math.Max(100.0, this.sourceAudio.Duration.TotalMilliseconds / 10.0));
-                end = start.AddMilliseconds(defaultMs);
-            }
-            else if (i < ordered.Count - 1 && i > 0)
-            {
-                // middle node: use midpoint between previous and next timestamp
-                var prev = ordered[i - 1].Timestamp;
-                var next = ordered[i + 1].Timestamp;
-                long midTicks = (prev.Ticks + next.Ticks) / 2;
-                end = new DateTime(midTicks);
-                // ensure end is at least start + 1ms
-                if (end <= start) end = start.AddMilliseconds(1);
-            }
-            else if (i == 0)
-            {
-                // first node: use midpoint to next
-                var next = ordered[Math.Min(i + 1, ordered.Count - 1)].Timestamp;
-                long midTicks = (start.Ticks + next.Ticks) / 2;
-                end = new DateTime(Math.Max(start.Ticks + 1, midTicks));
-            }
-            else
-            {
-                // last node: use midpoint from previous
-                var prev = ordered[Math.Max(0, i - 1)].Timestamp;
-                long midTicks = (prev.Ticks + start.Ticks) / 2;
-                end = new DateTime(Math.Max(start.Ticks + 1, midTicks));
-            }
+            DateTime start = related[i].Timestamp;
+            DateTime end = start.AddMilliseconds(Math.Max(20, related[i].DurationMs));
 
-            // expand left
             for (int L = i - 1; L >= 0; L--)
             {
-                var prev = ordered[L];
-                var gap = (start - prev.Timestamp).TotalMilliseconds;
+                var prev = related[L];
+                var prevEnd = prev.Timestamp.AddMilliseconds(Math.Max(20, prev.DurationMs));
+                var gap = (start - prevEnd).TotalMilliseconds;
                 if (gap <= mergeGapMs)
                 {
                     start = prev.Timestamp;
                 }
                 else break;
             }
-            // expand right
-            for (int R = i + 1; R < ordered.Count; R++)
+            for (int R = i + 1; R < related.Count; R++)
             {
-                var next = ordered[R];
+                var next = related[R];
                 var gap = (next.Timestamp - end).TotalMilliseconds;
                 if (gap <= mergeGapMs)
                 {
-                    end = next.Timestamp.AddMilliseconds(Math.Max(1, next.DurationMs));
+                    end = next.Timestamp.AddMilliseconds(Math.Max(20, next.DurationMs));
+                    if ((end - start).TotalMilliseconds >= maxSegmentMs)
+                    {
+                        end = start.AddMilliseconds(maxSegmentMs);
+                        break;
+                    }
                 }
                 else break;
+            }
+
+            if ((end - start).TotalMilliseconds > maxSegmentMs)
+            {
+                end = start.AddMilliseconds(maxSegmentMs);
             }
             return (start, end);
         }
@@ -1011,10 +993,13 @@ namespace LAWS.Voices.Forms
 
                 int sr = this.sourceAudio.SampleRate > 0 ? this.sourceAudio.SampleRate : 44100;
                 int ch = this.sourceAudio.Channels > 0 ? this.sourceAudio.Channels : 1;
-                // compute frame positions robustly (use rounding and ensure at least one sample)
-                double startFrame = (node.Timestamp - this.sourceAudio.CreatedAt).TotalSeconds * sr;
-                double durationFrames = Math.Max(1.0, (node.DurationMs / 1000.0) * sr);
-                double endFrame = startFrame + durationFrames;
+                var seg = this.GetAuthoritativeSegmentAroundIndex(nodeIndex, mergeGapMs: 220, maxSegmentMs: 12000);
+                DateTime sdt = seg.start == DateTime.MinValue ? node.Timestamp : seg.start;
+                DateTime edt = seg.end <= sdt ? node.Timestamp.AddMilliseconds(Math.Max(1, node.DurationMs)) : seg.end;
+                sdt = sdt.AddMilliseconds(-40);
+                edt = edt.AddMilliseconds(40);
+                double startFrame = (sdt - this.sourceAudio.CreatedAt).TotalSeconds * sr;
+                double endFrame = (edt - this.sourceAudio.CreatedAt).TotalSeconds * sr;
                 long startSample = (long)Math.Max(0, Math.Round(startFrame)) * ch;
                 long endSample = (long)Math.Min(this.sourceAudio.Data.Length, Math.Max(startSample + 1, (long)Math.Round(endFrame) * ch));
                 if (endSample <= startSample) { MessageBox.Show(this, "Node audio segment is empty.", "Play Node", MessageBoxButtons.OK, MessageBoxIcon.Information); return; }

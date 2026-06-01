@@ -1061,11 +1061,11 @@ namespace LAWS.Voices.Forms
                                                         {
                                                             var fp = new LAWS.Voices.Multimodal.Audio.Processors.FingerprintingProcessor.Fingerprint();
                                                             fp.Timestamp = aud.CreatedAt.AddMilliseconds(segStart * frameMs);
-                                                            fp.DurationMs = (long)Math.Max(1, Math.Round(accCount * frameMs));
+                                                            fp.DurationMs = (long) Math.Max(1, Math.Round(accCount * frameMs));
                                                             fp.ToneCount = 1;
                                                             fp.Features = new System.Collections.Concurrent.ConcurrentDictionary<string, float>();
-                                                            fp.Features["Confidence"] = (float)(accConf / accCount);
-                                                            fp.Features["Entropy"] = (float)frames[segStart].Entropy;
+                                                            fp.Features["Confidence"] = (float) (accConf / accCount);
+                                                            fp.Features["Entropy"] = (float) frames[segStart].Entropy;
                                                             fps.Add(fp);
                                                         }
                                                         catch { }
@@ -1085,8 +1085,8 @@ namespace LAWS.Voices.Forms
                                                         fp.DurationMs = (long) Math.Max(1, Math.Round(accCount * frameMs));
                                                         fp.ToneCount = 1;
                                                         fp.Features = new System.Collections.Concurrent.ConcurrentDictionary<string, float>();
-                                                        fp.Features["Confidence"] = (float)(accConf / accCount);
-                                                        fp.Features["Entropy"] = (float)frames[segStart].Entropy;
+                                                        fp.Features["Confidence"] = (float) (accConf / accCount);
+                                                        fp.Features["Entropy"] = (float) frames[segStart].Entropy;
                                                         fps.Add(fp);
                                                     }
                                                     catch { }
@@ -1097,7 +1097,7 @@ namespace LAWS.Voices.Forms
                                                 {
                                                     try
                                                     {
-                                                        var viz = new ResultVisualizerForm(null, sbReport.ToString(), null, fps);
+                                                        var viz = new ResultVisualizerForm(null, sbReport.ToString(), null, fps, aud, null);
                                                         viz.Show(this);
                                                     }
                                                     catch (Exception ex) { StaticLogger.Log("Failed to show fingerprint tree visualizer: " + ex.Message); }
@@ -2608,6 +2608,46 @@ namespace LAWS.Voices.Forms
                 {
                     this.contextMenuStrip_log.Show(Cursor.Position);
                 }
+            }
+        }
+
+        private void button_bss_Click(object sender, EventArgs e)
+        {
+            try
+            {
+                var audio = WindowMain.currentPreviewResource as AudioObj;
+                if (audio == null)
+                {
+                    MessageBox.Show(this, "Blind source separation requires the current preview resource to be an audio object.", "BSS", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    return;
+                }
+
+                var form = new BlindSourceSeparationForm(audio);
+                form.Show(this);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(this, "Failed to open blind source separation: " + ex.Message, "BSS", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        private void button_casa_Click(object sender, EventArgs e)
+        {
+            try
+            {
+                var audio = WindowMain.currentPreviewResource as AudioObj;
+                if (audio == null)
+                {
+                    MessageBox.Show(this, "Computational auditory scene analysis requires the current preview resource to be an audio object.", "CASA", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    return;
+                }
+
+                var form = new ComputationalAuditorySceneAnalysisForm(audio);
+                form.Show(this);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(this, "Failed to open computational auditory scene analysis: " + ex.Message, "CASA", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
         }
     }

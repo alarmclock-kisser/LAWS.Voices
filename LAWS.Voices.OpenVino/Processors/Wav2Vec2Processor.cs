@@ -426,7 +426,7 @@ namespace LAWS.Voices.OpenVino.Processors
         /// </summary>
         /// <param name="microEvents">The raw flat list of events returned from ExtractActivityTimeline.</param>
         /// <param name="maxPauseSeconds">The maximum gap of padding allowed before a song sequence is considered terminated.</param>
-        public static List<BirdSongBlock> ClusterEventsIntoSongs(List<BirdActivityEvent> microEvents, double maxPauseSeconds = 1.2, double maxSongSeconds = 1.0)
+        public static List<BirdSongBlock> ClusterEventsIntoSongs(List<BirdActivityEvent> microEvents, double maxPauseSeconds = 0.35, double maxSongSeconds = 8.0, double minSongSeconds = 0.06)
         {
             var songs = new List<BirdSongBlock>();
             if (microEvents == null || microEvents.Count == 0)
@@ -455,7 +455,7 @@ namespace LAWS.Voices.OpenVino.Processors
                 // If adding this event would exceed the maximum allowed song length, finalize current and start new
                 if (prospectiveDuration > maxSongSeconds)
                 {
-                    songs.Add(FinalizeSongBlock(currentChunk));
+                    TryAddSongBlock(songs, currentChunk, minSongSeconds);
                     currentChunk = new List<BirdActivityEvent> { currentEvent };
                     continue;
                 }
@@ -468,17 +468,31 @@ namespace LAWS.Voices.OpenVino.Processors
                 else
                 {
                     // Gap threshold exceeded. Close out the active song node and start a fresh sequence
-                    songs.Add(FinalizeSongBlock(currentChunk));
+                    TryAddSongBlock(songs, currentChunk, minSongSeconds);
                     currentChunk = new List<BirdActivityEvent> { currentEvent };
                 }
             }
 
             if (currentChunk.Count > 0)
             {
-                songs.Add(FinalizeSongBlock(currentChunk));
+                TryAddSongBlock(songs, currentChunk, minSongSeconds);
             }
 
             return songs;
+        }
+
+        private static void TryAddSongBlock(List<BirdSongBlock> songs, List<BirdActivityEvent> frameCluster, double minSongSeconds)
+        {
+            if (frameCluster == null || frameCluster.Count == 0)
+            {
+                return;
+            }
+
+            var block = FinalizeSongBlock(frameCluster);
+            if (block.Duration.TotalSeconds >= minSongSeconds || frameCluster.Count >= 2 || block.PeakIntensity >= 0.45)
+            {
+                songs.Add(block);
+            }
         }
 
         private static BirdSongBlock FinalizeSongBlock(List<BirdActivityEvent> frameCluster)
@@ -505,7 +519,7 @@ namespace LAWS.Voices.OpenVino.Processors
             return new BirdSongBlock
             {
                 StartTime = first.Timestamp,
-                EndTime = last.Timestamp,
+                EndTime = last.Timestamp.Add(TimeSpan.FromMilliseconds(20)),
                 TotalFrameTriggers = frameCluster.Count,
                 PeakIntensity = frameCluster.Max(f => f.Intensity),
                 AverageIntensity = frameCluster.Average(f => f.Intensity),

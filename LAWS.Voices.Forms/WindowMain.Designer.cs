@@ -57,6 +57,8 @@
             this.button_saveTxt = new Button();
             this.button_openCuda = new Button();
             this.button_fingerprinting = new Button();
+            this.button_bss = new Button();
+            this.button_casa = new Button();
             this.panel_view.SuspendLayout();
             ((System.ComponentModel.ISupportInitialize) this.pictureBox_view).BeginInit();
             this.contextMenuStrip_result.SuspendLayout();
@@ -330,11 +332,35 @@
             this.button_fingerprinting.UseVisualStyleBackColor = false;
             this.button_fingerprinting.Click += this.button_fingerprinting_Click;
             // 
+            // button_bss
+            // 
+            this.button_bss.BackColor = Color.FromArgb(  255,   192,   255);
+            this.button_bss.Location = new Point(573, 348);
+            this.button_bss.Name = "button_bss";
+            this.button_bss.Size = new Size(55, 23);
+            this.button_bss.TabIndex = 21;
+            this.button_bss.Text = "BSS";
+            this.button_bss.UseVisualStyleBackColor = false;
+            this.button_bss.Click += this.button_bss_Click;
+            // 
+            // button_casa
+            // 
+            this.button_casa.BackColor = Color.FromArgb(  192,   255,   255);
+            this.button_casa.Location = new Point(637, 348);
+            this.button_casa.Name = "button_casa";
+            this.button_casa.Size = new Size(55, 23);
+            this.button_casa.TabIndex = 22;
+            this.button_casa.Text = "CASA";
+            this.button_casa.UseVisualStyleBackColor = false;
+            this.button_casa.Click += this.button_casa_Click;
+            // 
             // WindowMain
             // 
             this.AutoScaleDimensions = new SizeF(7F, 15F);
             this.AutoScaleMode = AutoScaleMode.Font;
             this.ClientSize = new Size(704, 581);
+            this.Controls.Add(this.button_casa);
+            this.Controls.Add(this.button_bss);
             this.Controls.Add(this.button_fingerprinting);
             this.Controls.Add(this.button_openCuda);
             this.Controls.Add(this.button_saveTxt);
@@ -399,5 +425,7 @@
         private Button button_openCuda;
         private ToolStripMenuItem toggleCollapseExpandLogToolStripMenuItem;
         private Button button_fingerprinting;
+        private Button button_bss;
+        private Button button_casa;
     }
 }

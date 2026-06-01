@@ -7,14 +7,14 @@ namespace LAWS.Voices.Forms
     partial class FingerprintingSettingsForm
     {
         // persisted defaults for instance-long lifetime
-        private static decimal s_lastSilenceFrames = 15;
-        private static decimal s_lastFreqTol = 400m;
+        private static decimal s_lastSilenceFrames = 8;
+        private static decimal s_lastFreqTol = 250m;
         private static decimal s_lastStereoTol = 0.40m;
         private static decimal s_lastPromHigh = 5m;
         private static decimal s_lastPromLow = 0.10m;
-        private static decimal s_lastMinDensity = 0.10m;
-        private static decimal s_lastMinDuration = 0.05m;
-        private static decimal s_lastTrimMultiplier = 2m;
+        private static decimal s_lastMinDensity = 0.20m;
+        private static decimal s_lastMinDuration = 0.08m;
+        private static decimal s_lastTrimMultiplier = 5m;
 
         private System.ComponentModel.IContainer components = null;
         private NumericUpDown numSilenceFrames;
@@ -109,14 +109,14 @@ namespace LAWS.Voices.Forms
 
             // Tooltips (xml-doc explanations shown as tooltips)
             var tt = new ToolTip();
-            tt.SetToolTip(this.numSilenceFrames, "Number of consecutive frames without a matching signal before a track is finalized. Lower = shorter segments. Default=15");
-            tt.SetToolTip(this.numFreqTol, "Max allowed frequency jump (Hz) between frames to consider them the same track. Increase for wide pitch sweeps. Default=400");
+            tt.SetToolTip(this.numSilenceFrames, "Number of consecutive frames without a matching signal before a track is finalized. Lower = shorter phrase-like segments. Default=8");
+            tt.SetToolTip(this.numFreqTol, "Max allowed frequency jump (Hz) between frames to consider them the same track. Lower values separate nearby birds more aggressively. Default=250");
             tt.SetToolTip(this.numStereoTol, "Allowed deviation (0..1) in L/R energy ratio for stereo matching. Higher tolerates movement. Default=0.40");
             tt.SetToolTip(this.numPromHigh, "Reject peaks significantly louder than historical average (factor). Default=5.0");
             tt.SetToolTip(this.numPromLow, "Reject peaks significantly quieter than historical average (factor). Default=0.1");
-            tt.SetToolTip(this.numMinDensity, "Minimum ratio of non-silent samples in reconstructed array (0..1). Low density triggers aggressive trimming. Default=0.10");
-            tt.SetToolTip(this.numMinDuration, "Minimum length (seconds) of reconstructed sample to save. Default=0.05s");
-            tt.SetToolTip(this.numTrimMultiplier, "Multiplier applied to base silence threshold when density is low to trim more aggressively. Default=2.0");
+            tt.SetToolTip(this.numMinDensity, "Minimum ratio of non-silent samples in reconstructed array (0..1). Low density triggers aggressive trimming. Default=0.20");
+            tt.SetToolTip(this.numMinDuration, "Minimum length (seconds) of reconstructed sample to save. Default=0.08s");
+            tt.SetToolTip(this.numTrimMultiplier, "Multiplier applied to the low-density trim threshold for more aggressive phrase cutting. Default=5.0");
         }
     }
 }
