@@ -72,6 +72,14 @@ namespace LAWS.Voices.OpenVino.Processors
                 var runnerType = typeof(OpenVinoService.OpenVinoModelRunner);
                 var inferRequest = (InferRequest) runnerType.GetField("InferRequest", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(runner)!;
 
+                // CRITICAL FIX: read the STATIC model input port partial shapes from the compiled Model.
+                // The runtime InferRequest tensors report a degenerate shape (empty/[0]) for dynamic ports,
+                // so they cannot be used to identify the metadata port ({0-?, 3}). The declared partial
+                // shapes are only known on the Model object.
+                object? modelObj = null;
+                try { modelObj = runnerType.GetField("Model", BindingFlags.NonPublic | BindingFlags.Instance)?.GetValue(runner); }
+                catch (Exception ex) { StaticLogger.Log($"[BirdNET] Could not access runner Model field: {ex.Message}"); }
+
                 StaticLogger.Log("[BirdNET Architecture] Resolving multi-input execution tensor layout ports...");
 
                 // Enumerate available input tensors for diagnostic purposes
@@ -103,103 +111,143 @@ namespace LAWS.Voices.OpenVino.Processors
                 Tensor audioTensor = inputTensor0;
                 Tensor? metaTensor = inputTensor1; // may be null for single-input models
 
-                static long TryGetLastShapeDim(Tensor? tensor)
+                // CRITICAL FIX: read the declared (static) partial shape of input port [portIndex] from the
+                // compiled Model. Returns the list of dimensions as strings, where dynamic dims are "?"/"-1".
+                // This is the only reliable source for the BirdNET metadata port {0-?, 3}, because the runtime
+                // InferRequest tensor reports a degenerate shape for dynamic ports.
+                static (long lastFixedDim, string described) GetModelPortShape(object? model, int portIndex)
                 {
-                    if (tensor == null)
+                    if (model == null)
                     {
-                        return -1;
+                        return (-1, "<no-model>");
                     }
 
                     try
                     {
-                        var shapeProp = tensor.GetType().GetProperty("shape");
-                        if (shapeProp != null)
+                        var inputsMethod = model.GetType().GetMethod("get_inputs", Type.EmptyTypes)
+                                           ?? model.GetType().GetMethod("inputs", Type.EmptyTypes);
+                        if (inputsMethod == null)
                         {
-                            var rawShape = shapeProp.GetValue(tensor);
-                            if (rawShape is System.Collections.IEnumerable enumShape)
+                            return (-1, "<no-get_inputs>");
+                        }
+
+                        if (inputsMethod.Invoke(model, null) is not System.Collections.IList inputs || portIndex >= inputs.Count)
+                        {
+                            return (-1, "<port-missing>");
+                        }
+
+                        var port = inputs[portIndex];
+                        if (port == null)
+                        {
+                            return (-1, "<port-null>");
+                        }
+
+                        // Output<Node> -> get_partial_shape()
+                        var partialShapeMethod = port.GetType().GetMethod("get_partial_shape", Type.EmptyTypes);
+                        var partialShape = partialShapeMethod?.Invoke(port, null);
+                        if (partialShape == null)
+                        {
+                            return (-1, "<no-partial-shape>");
+                        }
+
+                        // PartialShape exposes get_dimensions()/to_string(); fall back to ToString().
+                        string described = partialShape.ToString() ?? "<ps>";
+                        long lastFixed = -1;
+                        try
+                        {
+                            var getDims = partialShape.GetType().GetMethod("get_dimensions", Type.EmptyTypes);
+                            if (getDims?.Invoke(partialShape, null) is System.Collections.IEnumerable dimEnum)
                             {
-                                long last = -1;
-                                foreach (var it in enumShape)
+                                var parts = new List<string>();
+                                foreach (var dim in dimEnum)
                                 {
-                                    try { last = Convert.ToInt64(it); } catch { }
+                                    string dimStr = dim?.ToString() ?? "?";
+                                    parts.Add(dimStr);
+                                    // A fixed dimension parses to a positive integer; dynamic ones do not.
+                                    if (long.TryParse(dimStr, out var v) && v > 0)
+                                    {
+                                        lastFixed = v;
+                                    }
+                                    else
+                                    {
+                                        lastFixed = -1; // reset: only trailing fixed dim matters
+                                    }
                                 }
-                                return last;
+                                described = "[" + string.Join(',', parts) + "]";
                             }
                         }
-                    }
-                    catch { }
+                        catch { }
 
-                    return -1;
+                        return (lastFixed, described);
+                    }
+                    catch (Exception ex)
+                    {
+                        return (-1, "<err:" + ex.Message + ">");
+                    }
                 }
 
-                // Route by declared input shape first (metadata port ends with dim=3), then fallback to
-                // runtime size probing only if shape data is unavailable.
-                try
+                // Route by DECLARED model input shape. The metadata port has a trailing fixed dim = 3.
+                // Audio port has a large/dynamic trailing dim (the sample count). We must not swallow
+                // routing failures, because misrouting writes audio into the {0-?, 3} metadata port.
+                if (inputTensor1 != null)
                 {
-                    if (inputTensor1 != null)
+                    var port0 = GetModelPortShape(modelObj, 0);
+                    var port1 = GetModelPortShape(modelObj, 1);
+                    bool input0IsMetadata = port0.lastFixedDim == 3;
+                    bool input1IsMetadata = port1.lastFixedDim == 3;
+                    StaticLogger.Log($"[BirdNET Layout] Declared model port shapes -> Port0={port0.described}, Port1={port1.described}.");
+
+                    if (input0IsMetadata && !input1IsMetadata)
                     {
-                        long dim0 = TryGetLastShapeDim(inputTensor0);
-                        long dim1 = TryGetLastShapeDim(inputTensor1);
-                        bool input0IsMetadata = dim0 == 3;
-                        bool input1IsMetadata = dim1 == 3;
-
-                        if (input0IsMetadata && !input1IsMetadata)
-                        {
-                            audioTensor = inputTensor1;
-                            metaTensor = inputTensor0;
-                            StaticLogger.Log($"[BirdNET Layout] Routed by shape -> Audio=Port1 (lastDim={dim1}), Metadata=Port0 (lastDim={dim0}).");
-                        }
-                        else if (input1IsMetadata && !input0IsMetadata)
-                        {
-                            audioTensor = inputTensor0;
-                            metaTensor = inputTensor1;
-                            StaticLogger.Log($"[BirdNET Layout] Routed by shape -> Audio=Port0 (lastDim={dim0}), Metadata=Port1 (lastDim={dim1}).");
-                        }
-                        else
-                        {
-                        ulong size0 = 0UL;
-                        ulong size1 = 0UL;
-                        try { size0 = inputTensor0.size; } catch { }
-                        try { size1 = inputTensor1.size; } catch { }
-
-                            if (size0 > size1)
-                            {
-                                audioTensor = inputTensor0;
-                                metaTensor = inputTensor1;
-                                StaticLogger.Log($"[BirdNET Layout] Routed by capacity fallback -> Audio=Port0 (size={size0}), Metadata=Port1 (size={size1}), shapeDims=({dim0},{dim1}).");
-                            }
-                            else if (size1 > size0)
-                            {
-                                audioTensor = inputTensor1;
-                                metaTensor = inputTensor0;
-                                StaticLogger.Log($"[BirdNET Layout] Routed by capacity fallback -> Audio=Port1 (size={size1}), Metadata=Port0 (size={size0}), shapeDims=({dim0},{dim1}).");
-                            }
-                            else
-                            {
-                                // When both are dynamic and size=0, keep the common BirdNET layout default:
-                                // Port0 audio, Port1 metadata.
-                                audioTensor = inputTensor0;
-                                metaTensor = inputTensor1;
-                                StaticLogger.Log($"[BirdNET Layout] Capacity tie fallback -> Audio=Port0 (size={size0}), Metadata=Port1 (size={size1}), shapeDims=({dim0},{dim1}).");
-                            }
-                        }
+                        audioTensor = inputTensor1;
+                        metaTensor = inputTensor0;
+                        StaticLogger.Log($"[BirdNET Layout] Routed -> Audio=Port1, Metadata=Port0 (trailing dim 3).");
+                    }
+                    else if (input1IsMetadata && !input0IsMetadata)
+                    {
+                        audioTensor = inputTensor0;
+                        metaTensor = inputTensor1;
+                        StaticLogger.Log($"[BirdNET Layout] Routed -> Audio=Port0, Metadata=Port1 (trailing dim 3).");
                     }
                     else
                     {
-                        audioTensor = inputTensor0;
-                        metaTensor = null;
-                        StaticLogger.Log("[BirdNET Layout] Single-input model detected; Metadata port absent.");
+                        throw new InvalidOperationException(
+                            $"[BirdNET Layout] Could not unambiguously identify the metadata port (expected exactly one " +
+                            $"input with declared trailing dim=3). Port0={port0.described}, Port1={port1.described}.");
                     }
                 }
-                catch { /* ignore route probe errors */ }
+                else
+                {
+                    audioTensor = inputTensor0;
+                    metaTensor = null;
+                    StaticLogger.Log("[BirdNET Layout] Single-input model detected; Metadata port absent.");
+                }
 
-                // Initialize metadata parameters once (-1.0f commands BirdNET to skip location-specific filtering metrics)
+                // Initialize metadata parameters once (-1.0f commands BirdNET to skip location-specific filtering metrics).
+                // The metadata port is dynamic ({0-?, 3}); set its concrete shape [1, 3] before writing data.
                 float[] dummyMeta = new float[] { -1.0f, -1.0f, -1.0f };
                 if (metaTensor != null)
                 {
                     try
                     {
+                        var metaShape = new Shape(new long[] { 1, 3 });
+                        var metaSetShape = metaTensor.GetType().GetMethod("set_shape", new[] { typeof(Shape) });
+                        if (metaSetShape != null)
+                        {
+                            metaSetShape.Invoke(metaTensor, new object[] { metaShape });
+                        }
+                        else
+                        {
+                            metaTensor.shape = metaShape;
+                        }
+
                         metaTensor.set_data(dummyMeta);
+                    }
+                    catch (TargetInvocationException tie)
+                    {
+                        var inner = tie.InnerException ?? tie;
+                        StaticLogger.Log($"[BirdNET] Failed to set metadata tensor: {inner.Message}");
+                        throw new InvalidOperationException("[BirdNET] Failed to initialize metadata tensor [1,3].", inner);
                     }
                     catch (Exception ex)
                     {
@@ -243,6 +291,18 @@ namespace LAWS.Voices.OpenVino.Processors
                         {
                             if (audioTensor != null)
                             {
+                                // Validate routing against the DECLARED model port shape, not the runtime tensor
+                                // (dynamic ports report a degenerate runtime shape). The audio port must NOT be
+                                // the metadata port (declared trailing dim = 3).
+                                int audioPortIndex = ReferenceEquals(audioTensor, inputTensor0) ? 0 : 1;
+                                var audioPortShape = GetModelPortShape(modelObj, audioPortIndex);
+                                if (audioPortShape.lastFixedDim == 3)
+                                {
+                                    throw new InvalidOperationException(
+                                        $"[BirdNET] Audio tensor routing is invalid: selected port {audioPortIndex} " +
+                                        $"has declared metadata shape {audioPortShape.described} (trailing dim=3).");
+                                }
+
                                 var desiredShape = new Shape(new long[] { 1, SamplesPerChunk });
 
                                 // CRITICAL FIX: Use the set_shape(...) METHOD, not the 'shape' property setter.
@@ -269,10 +329,13 @@ namespace LAWS.Voices.OpenVino.Processors
                         {
                             var inner = shapeTie.InnerException ?? shapeTie;
                             StaticLogger.Log($"[BirdNET] set_shape([1,{SamplesPerChunk}]) failed: {inner.Message}");
+                            throw new InvalidOperationException(
+                                $"[BirdNET] Failed to set audio tensor shape to [1,{SamplesPerChunk}].", inner);
                         }
                         catch (Exception shapeEx)
                         {
                             StaticLogger.Log($"[BirdNET] Failed to set audio tensor shape to [1,{SamplesPerChunk}]: {shapeEx.Message}");
+                            throw;
                         }
 
                         // Determine whether native tensor.size is reported as bytes or element count.
