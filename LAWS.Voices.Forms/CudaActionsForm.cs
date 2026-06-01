@@ -17,7 +17,7 @@ namespace LAWS.Voices.Forms
 {
     public partial class CudaActionsForm : Form
     {
-        internal readonly CudaWrapper Cuda = new CudaWrapper();
+        internal readonly CudaWrapper Cuda = new();
         private object? currentResource = null;
 
         private int lastChunkSize = 8192;

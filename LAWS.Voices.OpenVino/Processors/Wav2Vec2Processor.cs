@@ -50,8 +50,6 @@ namespace LAWS.Voices.OpenVino.Processors
             var rawTokensBuilder = new StringBuilder();
             var ctcTokensList = new List<string>();
 
-            double totalEntropySum = 0;
-
             if (flattenedLogits == null || flattenedLogits.Length == 0)
             {
                 StaticLogger.Log("[Wav2Vec2] ParseTensorOutput: empty logits provided.");

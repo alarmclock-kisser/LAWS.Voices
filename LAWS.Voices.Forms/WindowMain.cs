@@ -57,7 +57,7 @@ namespace LAWS.Voices.Forms
         private System.Threading.CancellationTokenSource? inferenceCancellation = null;
         private Task? currentInferenceTask = null;
         private bool isInferenceRunning = false;
-        private readonly object inferenceLock = new object();
+        private readonly object inferenceLock = new();
 
 
         public WindowMain(Appsettings appsettings)
@@ -819,6 +819,12 @@ namespace LAWS.Voices.Forms
                             {
                                 StaticLogger.Log($"[Reflection Engine] Architecture Match Found! Executing specialized processor: {processorType.FullName}");
 
+                                if (model == null)
+                                {
+                                    this.BeginInvoke(new Action(() => this.textBox_result.Text = $"Error: Selected model information could not be resolved for execution."));
+                                    return;
+                                }
+
                                 object? resultObj = null;
                                 var ps = executeMethod.GetParameters();
                                 if (ps.Length == 6)
@@ -1113,7 +1119,13 @@ namespace LAWS.Voices.Forms
                             {
                                 StaticLogger.Log($"[Reflection Engine] No dedicated processor module matches '{model?.Id}Processor'. Dropping back to standard AudioModelRunner.");
 
-                                bool isWav2Vec = !string.IsNullOrEmpty(model?.Id) && model.Id.IndexOf("wav2vec2", StringComparison.OrdinalIgnoreCase) >= 0;
+                                if (model == null)
+                                {
+                                    this.BeginInvoke(new Action(() => this.textBox_result.Text = $"Error: Selected model information could not be resolved for execution."));
+                                    return;
+                                }
+
+                                bool isWav2Vec = !string.IsNullOrEmpty(model.Id) && model.Id.IndexOf("wav2vec2", StringComparison.OrdinalIgnoreCase) >= 0;
                                 ulong[] shape = new ulong[] { 1, (ulong) pcmToUse.Length };
 
                                 using var runner = this.Vino.CreateAudioRunner(model, quantEnum, this.appsettings.ModelsDirectory);
@@ -1742,7 +1754,7 @@ namespace LAWS.Voices.Forms
 
                         if (imgObj != null && imgObj.Img != null)
                         {
-                            Bitmap copyBmp = new Bitmap(imgObj.Img);
+                            Bitmap copyBmp = new(imgObj.Img);
                             var viz = new ResultVisualizerForm(copyBmp, text, er.GazeVector);
                             viz.Show(this);
                             return;
@@ -2422,7 +2434,7 @@ namespace LAWS.Voices.Forms
 
             if (toSave != null)
             {
-                using (SaveFileDialog saveFileDialog = new SaveFileDialog())
+                using (SaveFileDialog saveFileDialog = new())
                 {
                     saveFileDialog.Filter = "JSON files (*.json)|*.json|All files (*.*)|*.*";
                     saveFileDialog.DefaultExt = "json";
@@ -2468,7 +2480,7 @@ namespace LAWS.Voices.Forms
                 return;
             }
 
-            using (SaveFileDialog saveFileDialog = new SaveFileDialog())
+            using (SaveFileDialog saveFileDialog = new())
             {
                 saveFileDialog.Filter = "Text files (*.txt)|*.txt|All files (*.*)|*.*";
                 saveFileDialog.DefaultExt = "txt";
@@ -2491,7 +2503,7 @@ namespace LAWS.Voices.Forms
 
         private void loadResultFromJSONToolStripMenuItem_Click(object sender, EventArgs e)
         {
-            using (OpenFileDialog openFileDialog = new OpenFileDialog())
+            using (OpenFileDialog openFileDialog = new())
             {
                 openFileDialog.Filter = "JSON files (*.json)|*.json|All files (*.*)|*.*";
                 openFileDialog.InitialDirectory = SpecialDirectories.MyDocuments;
@@ -2519,7 +2531,7 @@ namespace LAWS.Voices.Forms
         private void loadResultFromTXTToolStripMenuItem_Click(object sender, EventArgs e)
         {
             // OFD at MyDocuments with filter for text files
-            using (OpenFileDialog openFileDialog = new OpenFileDialog())
+            using (OpenFileDialog openFileDialog = new())
             {
                 openFileDialog.Filter = "Text files (*.txt)|*.txt|All files (*.*)|*.*";
                 openFileDialog.InitialDirectory = SpecialDirectories.MyDocuments;

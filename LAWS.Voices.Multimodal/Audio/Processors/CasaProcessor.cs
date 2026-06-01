@@ -42,6 +42,7 @@ namespace LAWS.Voices.Multimodal.Audio.Processors
             public required List<SourceStream> Streams { get; init; }
             public string SummaryText { get; init; } = string.Empty;
 
+            [SupportedOSPlatform("windows")]
             public void Dispose()
             {
                 this.CochleagramBitmap.Dispose();
@@ -50,6 +51,7 @@ namespace LAWS.Voices.Multimodal.Audio.Processors
             }
         }
 
+        [SupportedOSPlatform("windows")]
         public async Task<Result> AnalyzeAsync(AudioObj audio, Settings settings, IProgress<int>? progress = null, CancellationToken cancellationToken = default)
         {
             ArgumentNullException.ThrowIfNull(audio);

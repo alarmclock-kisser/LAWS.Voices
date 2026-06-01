@@ -15,14 +15,13 @@ namespace LAWS.Voices.Forms
         private readonly FingerprintingProcessor.Fingerprint node;
         private readonly AudioObj? sourceAudio;
 
-        private Button btnPlay = new Button();
-        private Button btnPause = new Button();
-        private Button btnStop = new Button();
-        private Button btnExport = new Button();
-        private TextBox txtInfo = new TextBox();
+        private Button btnPlay = new();
+        private Button btnPause = new();
+        private Button btnStop = new();
+        private Button btnExport = new();
+        private TextBox txtInfo = new();
 
         private WaveOutEvent? playbackDevice;
-        private BufferedWaveProvider? bufferedProvider;
         private MemoryStream? playbackStream = null;
 
         private DateTime? segmentStart;

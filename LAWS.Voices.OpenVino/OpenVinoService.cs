@@ -1045,7 +1045,7 @@ namespace LAWS.Voices.OpenVino
                     {
                         try
                         {
-                            tensor?.set_data(data);
+                            tensor?.set_data(data ?? []);
                             FlushSummary($"action=direct expectedTooLarge={expectedCount} result=ok");
                             return;
                         }
@@ -1102,7 +1102,7 @@ namespace LAWS.Voices.OpenVino
                         catch (Exception ex) { StaticLogger.Log($"[SetTensorSafely] unexpected exception on set_data: {ex.Message}"); throw; }
                     }
 
-                    if (exp > data.Length)
+                    if (exp > data?.Length)
                     {
                         var padded = new float[exp];
                         Array.Copy(data, 0, padded, 0, data.Length);
@@ -1128,7 +1128,7 @@ namespace LAWS.Voices.OpenVino
                         }
                     }
 
-                    if (exp < data.Length)
+                    if (exp < data?.Length)
                     {
                         var trimmed = new float[exp];
                         Array.Copy(data, 0, trimmed, 0, trimmed.Length);
@@ -1145,7 +1145,7 @@ namespace LAWS.Voices.OpenVino
                         }
                     }
 
-                    tensor?.set_data(data);
+                    tensor?.set_data(data ?? []);
                     FlushSummary("action=set_data(final) result=ok");
                 }
                 catch

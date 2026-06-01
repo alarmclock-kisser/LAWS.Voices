@@ -17,7 +17,7 @@ namespace LAWS.Voices.Multimodal.Image
     /// </summary>
     public class ImageCollection
     {
-        public readonly ConcurrentDictionary<Guid, ImageObj> Images = new ConcurrentDictionary<Guid, ImageObj>();
+        public readonly ConcurrentDictionary<Guid, ImageObj> Images = new();
         public readonly BindingList<ImageObj> ImagesBindingList = [];
 
         public int Count => this.Images.Count;

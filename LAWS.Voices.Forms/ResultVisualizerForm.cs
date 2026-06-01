@@ -58,15 +58,14 @@ namespace LAWS.Voices.Forms
         // Async render control
         private CancellationTokenSource? renderCts = null;
         private Task? renderTask = null;
-        private readonly object renderLockObj = new object();
+        private readonly object renderLockObj = new();
         private System.Threading.Timer? zoomDebounceTimer = null;
-        private readonly object zoomLock = new object();
-        private PointF? lastZoomAnchor = null;
+        private readonly object zoomLock = new();
         private WaveOutEvent? playbackDevice = null;
         private AudioFileReader? playbackReader = null;
         private string? playbackTempFile = null;
-        private Button btnNodePlay = new Button();
-        private Button btnCopyRandom = new Button();
+        private Button btnNodePlay = new();
+        private Button btnCopyRandom = new();
         private int? selectedNodeIndex = null;
         // Keep a single NodeDetailsForm instance to avoid multiple open windows
         private NodeDetailsForm? openNodeDetailsForm = null;
@@ -739,7 +738,7 @@ namespace LAWS.Voices.Forms
                 {
                     int targetW = (int)Math.Max(200, baseW * this.imageZoom);
                     int targetH = (int)Math.Max(120, baseH * this.imageZoom);
-                    var bmp = this.RenderFingerprintTreeBitmap(this.fingerprints, targetW, targetH);
+                    var bmp = this.RenderFingerprintTreeBitmap(this.fingerprints ?? [], targetW, targetH);
                     if (token.IsCancellationRequested) { try { bmp.Dispose(); } catch { } return; }
                     // marshal back to UI
                     if (!this.IsDisposed && !this.Disposing)

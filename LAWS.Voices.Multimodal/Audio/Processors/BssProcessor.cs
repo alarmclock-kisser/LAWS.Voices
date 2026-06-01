@@ -59,6 +59,7 @@ namespace LAWS.Voices.Multimodal.Audio.Processors
             public required Bitmap AzimuthHistogramBitmap { get; init; }
             public string SummaryText { get; init; } = string.Empty;
 
+            [SupportedOSPlatform("windows")]
             public void Dispose()
             {
                 foreach (var track in this.Tracks)
@@ -71,6 +72,7 @@ namespace LAWS.Voices.Multimodal.Audio.Processors
             }
         }
 
+        [SupportedOSPlatform("windows")]
         public async Task<Result> ProcessAsync(AudioObj audio, Settings settings, IProgress<int>? progress = null, CancellationToken cancellationToken = default)
         {
             ArgumentNullException.ThrowIfNull(audio);

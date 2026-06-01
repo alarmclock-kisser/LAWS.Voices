@@ -118,7 +118,7 @@ namespace LAWS.Voices.Cuda13
                         {
                             // Ensure a dedicated worker thread exists for this service so all CUDA ops run on the same thread/context
                             var q = this._serviceQueues.GetOrAdd(service, _ => new BlockingCollection<Action>(new ConcurrentQueue<Action>()));
-                            this._serviceWorkers.GetOrAdd(service, svc => Task.Factory.StartNew(() =>
+                            await this._serviceWorkers.GetOrAdd(service, svc => Task.Factory.StartNew(() =>
                             {
                                 foreach (var act in q.GetConsumingEnumerable())
                                 {
@@ -269,7 +269,7 @@ namespace LAWS.Voices.Cuda13
                         try
                         {
                             var q = this._serviceQueues.GetOrAdd(service, _ => new BlockingCollection<Action>(new ConcurrentQueue<Action>()));
-                            this._serviceWorkers.GetOrAdd(service, svc => Task.Factory.StartNew(() =>
+                            await this._serviceWorkers.GetOrAdd(service, svc => Task.Factory.StartNew(() =>
                             {
                                 foreach (var act in q.GetConsumingEnumerable())
                                 {

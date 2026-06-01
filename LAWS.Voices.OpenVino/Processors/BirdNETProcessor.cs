@@ -288,6 +288,11 @@ namespace LAWS.Voices.OpenVino.Processors
 
                                 try
                                 {
+                                    if (audioTensor == null)
+                                    {
+                                        throw new InvalidOperationException("Audio tensor is null. Cannot set data for inference.");
+                                    }
+
                                     // Invoke the helper which will resize/pad/trim as needed for native tensor capacity.
                                     setMethod.Invoke(null, new object[] { audioTensor, chunkBuffer, shape });
                                 }

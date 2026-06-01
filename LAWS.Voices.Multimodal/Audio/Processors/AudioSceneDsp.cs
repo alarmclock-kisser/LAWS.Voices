@@ -187,7 +187,7 @@ namespace LAWS.Voices.Multimodal.Audio.Processors
             for (int len = 2; len <= n; len <<= 1)
             {
                 double angle = (inverse ? 2.0 : -2.0) * Math.PI / len;
-                Complex wLen = new Complex(Math.Cos(angle), Math.Sin(angle));
+                Complex wLen = new(Math.Cos(angle), Math.Sin(angle));
                 for (int i = 0; i < n; i += len)
                 {
                     Complex w = Complex.One;

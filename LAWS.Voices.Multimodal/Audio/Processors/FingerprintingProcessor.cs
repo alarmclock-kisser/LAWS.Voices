@@ -68,7 +68,7 @@ namespace LAWS.Voices.Multimodal.Audio.Processors
 
         private readonly CancellationToken _cancellationToken;
         private readonly IProgress<double>? _progress;
-        private readonly ConcurrentBag<Fingerprint> _memoryPool = new ConcurrentBag<Fingerprint>();
+        private readonly ConcurrentBag<Fingerprint> _memoryPool = new();
 
         public List<Fingerprint> CapturedFingerprints => this._memoryPool.OrderBy(f => f.Timestamp).ToList();
         public List<AudioObj> IsolatedBirdSamples { get; } = new List<AudioObj>();
@@ -1040,10 +1040,10 @@ namespace LAWS.Voices.Multimodal.Audio.Processors
             for (int len = 2; len <= n; len <<= 1)
             {
                 double angle = -2.0 * Math.PI / len;
-                Complex wlen = new Complex(Math.Cos(angle), Math.Sin(angle));
+                Complex wlen = new(Math.Cos(angle), Math.Sin(angle));
                 for (int i = 0; i < n; i += len)
                 {
-                    Complex w = new Complex(1.0, 0.0);
+                    Complex w = new(1.0, 0.0);
                     for (int j = 0; j < len / 2; j++)
                     {
                         Complex u = complexBuffer[i + j];
@@ -1075,10 +1075,10 @@ namespace LAWS.Voices.Multimodal.Audio.Processors
             for (int len = 2; len <= n; len <<= 1)
             {
                 double angle = -2.0 * Math.PI / len;
-                Complex wlen = new Complex(Math.Cos(angle), Math.Sin(angle));
+                Complex wlen = new(Math.Cos(angle), Math.Sin(angle));
                 for (int i = 0; i < n; i += len)
                 {
-                    Complex w = new Complex(1.0, 0.0);
+                    Complex w = new(1.0, 0.0);
                     for (int j = 0; j < len / 2; j++)
                     {
                         Complex u = complexBuffer[i + j];
