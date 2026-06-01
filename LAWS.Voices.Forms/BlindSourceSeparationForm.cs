@@ -1,5 +1,6 @@
 using LAWS.Voices.Multimodal.Audio;
 using LAWS.Voices.Multimodal.Audio.Processors;
+using LAWS.Voices.Shared;
 using System;
 using System.Collections.Generic;
 using System.Drawing;
@@ -27,7 +28,9 @@ namespace LAWS.Voices.Forms
         private Button btnStart = new();
         private Button btnTogglePreview = new();
         private Button btnExport = new();
+        private Button btnExportAllZip = new();
         private Button btnHear = new();
+        private ComboBox comboPreset = new();
         private NumericUpDown numericTrack = new();
         private NumericUpDown numWindow = new();
         private NumericUpDown numHop = new();
@@ -61,11 +64,12 @@ namespace LAWS.Voices.Forms
         {
             this.Text = "Blind Source Separation";
             this.StartPosition = FormStartPosition.CenterParent;
-            this.ClientSize = new Size(1180, 720);
+            this.ClientSize = new Size(1200, 760);
+            this.MinimumSize = new Size(1000, 640);
 
-            var settingsPanel = new Panel { Dock = DockStyle.Top, Height = 184 };
+            var settingsPanel = new Panel { Dock = DockStyle.Top, Height = 238, Padding = new Padding(10, 8, 10, 8) };
+            var actionsPanel = new Panel { Dock = DockStyle.Top, Height = 48, Padding = new Padding(8, 8, 8, 4) };
             var previewPanel = new Panel { Dock = DockStyle.Bottom, Height = 280, Padding = new Padding(8) };
-            var actionsPanel = new Panel { Dock = DockStyle.Top, Height = 42 };
             var toolTip = new ToolTip { AutoPopDelay = 20000, InitialDelay = 250, ReshowDelay = 150, ShowAlways = true };
 
             this.pBox = new PictureBox { Dock = DockStyle.Fill, BackColor = Color.Black, SizeMode = PictureBoxSizeMode.Zoom };
@@ -81,16 +85,20 @@ namespace LAWS.Voices.Forms
                 Text = "Ready for blind source separation."
             };
 
-            this.btnStart = new Button { Text = "Start", Width = 100, Left = 8, Top = 8 };
+            // ---- Actions row (flow layout for even spacing) ----
+            var actionsFlow = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.LeftToRight, WrapContents = false, AutoSize = false };
+
+            this.btnStart = new Button { Text = "Start", Width = 90, Height = 28, Margin = new Padding(0, 2, 8, 2) };
             this.btnStart.Click += async (_, __) => await this.RunAsync();
-            this.pBar = new ProgressBar { Left = 116, Top = 12, Width = 250, Height = 20 };
-            this.numericTrack = new NumericUpDown { Left = 374, Top = 9, Width = 60, Minimum = 1, Maximum = 1, Value = 1, Enabled = false };
+            this.pBar = new ProgressBar { Width = 220, Height = 24, Margin = new Padding(0, 4, 8, 2) };
+            var lblTrack = new Label { Text = "Track", AutoSize = true, Margin = new Padding(0, 8, 4, 2) };
+            this.numericTrack = new NumericUpDown { Width = 60, Minimum = 1, Maximum = 1, Value = 1, Enabled = false, Margin = new Padding(0, 4, 8, 2) };
             this.numericTrack.ValueChanged += async (_, __) =>
             {
                 this.StopPlayback();
                 await this.RefreshPreviewAsync();
             };
-            this.btnTogglePreview = new Button { Text = "Spectrogram", Left = 442, Top = 8, Width = 110, Enabled = false };
+            this.btnTogglePreview = new Button { Text = "Spectrogram", Width = 110, Height = 28, Enabled = false, Margin = new Padding(0, 2, 8, 2) };
             this.btnTogglePreview.Click += async (_, __) =>
             {
                 this.StopPlayback();
@@ -98,95 +106,160 @@ namespace LAWS.Voices.Forms
                 this.btnTogglePreview.Text = this.showSpectrogram ? "Waveform" : "Spectrogram";
                 await this.RefreshPreviewAsync();
             };
-            this.btnHear = new Button { Text = "Hear", Left = 560, Top = 8, Width = 90, Enabled = false };
+            this.btnHear = new Button { Text = "Hear", Width = 80, Height = 28, Enabled = false, Margin = new Padding(0, 2, 8, 2) };
             this.btnHear.Click += async (_, __) => await this.HearCurrentTrackAsync();
-            this.btnExport = new Button { Text = "Save As WAV...", Left = 658, Top = 8, Width = 116, Enabled = false };
+            this.btnExport = new Button { Text = "Save As WAV...", Width = 120, Height = 28, Enabled = false, Margin = new Padding(0, 2, 8, 2) };
             this.btnExport.Click += async (_, __) => await this.ExportCurrentTrackAsync();
-            actionsPanel.Controls.AddRange([this.btnStart, this.pBar, this.numericTrack, this.btnTogglePreview, this.btnHear, this.btnExport]);
+            this.btnExportAllZip = new Button { Text = "Export All ZIP", Width = 120, Height = 28, Enabled = false, Margin = new Padding(0, 2, 8, 2) };
+            this.btnExportAllZip.Click += async (_, __) => await this.ExportAllTracksZipAsync();
 
-            int row1 = 12;
-            int row2 = 48;
-            int row3 = 84;
-            int row4 = 120;
-            int left1 = 8;
-            int left2 = 220;
-            int left3 = 432;
-            int left4 = 644;
-            int left5 = 856;
-            settingsPanel.Controls.Add(new Label { Text = "Window Size", Left = left1, Top = row1 + 4, Width = 80 });
-            this.numWindow = new NumericUpDown { Left = left1 + 92, Top = row1, Width = 78, Minimum = 256, Maximum = 8192, Increment = 256, Value = 2048 };
-            settingsPanel.Controls.Add(this.numWindow);
-            toolTip.SetToolTip(this.numWindow, "FFT analysis window size in samples. Larger values improve frequency resolution and help separate close bird tones, but make time response slower. Typical bird work: 1024 to 4096.");
-            settingsPanel.Controls.Add(new Label { Text = "Hop Size", Left = left2, Top = row1 + 4, Width = 70 });
-            this.numHop = new NumericUpDown { Left = left2 + 78, Top = row1, Width = 78, Minimum = 64, Maximum = 4096, Increment = 64, Value = 512 };
-            settingsPanel.Controls.Add(this.numHop);
-            toolTip.SetToolTip(this.numHop, "STFT hop size in samples. Lower values increase overlap and make source tracking smoother, but cost more CPU and memory. Typical bird work: 128 to 1024.");
-            settingsPanel.Controls.Add(new Label { Text = "Azimuth Bins", Left = left3, Top = row1 + 4, Width = 84 });
-            this.numAzimuthBins = new NumericUpDown { Left = left3 + 92, Top = row1, Width = 78, Minimum = 2, Maximum = 64, Increment = 1, Value = 12 };
-            settingsPanel.Controls.Add(this.numAzimuthBins);
-            toolTip.SetToolTip(this.numAzimuthBins, "How finely the stereo direction histogram is split. More bins can separate close source directions, but may fragment weak sources. Typical range: 8 to 24.");
-            settingsPanel.Controls.Add(new Label { Text = "Masking", Left = left4, Top = row1 + 4, Width = 60 });
-            this.comboMasking = new ComboBox { Left = left4 + 68, Top = row1, Width = 120, DropDownStyle = ComboBoxStyle.DropDownList };
+            actionsFlow.Controls.AddRange([this.btnStart, this.pBar, lblTrack, this.numericTrack, this.btnTogglePreview, this.btnHear, this.btnExport, this.btnExportAllZip]);
+            actionsPanel.Controls.Add(actionsFlow);
+
+            // ---- Settings grid (TableLayoutPanel: 8 columns -> 4 label/control pairs per row) ----
+            var grid = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                ColumnCount = 8,
+                RowCount = 6,
+                AutoSize = false
+            };
+            for (int c = 0; c < 8; c++)
+            {
+                grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, c % 2 == 0 ? 13f : 12f));
+            }
+            for (int r = 0; r < 6; r++)
+            {
+                grid.RowStyles.Add(new RowStyle(SizeType.Absolute, 32f));
+            }
+
+            Label MakeLabel(string text) => new Label { Text = text, Anchor = AnchorStyles.Left, AutoSize = true, Margin = new Padding(3, 8, 6, 0) };
+            void AddPair(int col, int row, string label, Control control, string tip)
+            {
+                control.Anchor = AnchorStyles.Left | AnchorStyles.Right;
+                control.Margin = new Padding(0, 4, 12, 4);
+                grid.Controls.Add(MakeLabel(label), col, row);
+                grid.Controls.Add(control, col + 1, row);
+                toolTip.SetToolTip(control, tip);
+            }
+
+            this.numWindow = new NumericUpDown { Minimum = 256, Maximum = 8192, Increment = 256, Value = 2048 };
+            AddPair(0, 0, "Window Size", this.numWindow, "FFT analysis window size in samples. Larger values improve frequency resolution and help separate close bird tones, but make time response slower. Typical bird work: 1024 to 4096.");
+            this.numHop = new NumericUpDown { Minimum = 64, Maximum = 4096, Increment = 64, Value = 512 };
+            AddPair(2, 0, "Hop Size", this.numHop, "STFT hop size in samples. Lower values increase overlap and make source tracking smoother, but cost more CPU and memory. Typical bird work: 128 to 1024.");
+            this.numAzimuthBins = new NumericUpDown { Minimum = 2, Maximum = 64, Increment = 1, Value = 12 };
+            AddPair(4, 0, "Azimuth Bins", this.numAzimuthBins, "How finely the stereo direction histogram is split. More bins can separate close source directions, but may fragment weak sources. Typical range: 8 to 24.");
+            this.numMaxSources = new NumericUpDown { Minimum = 1, Maximum = 16, Increment = 1, Value = 6 };
+            AddPair(6, 0, "Max Sources", this.numMaxSources, "Maximum number of separated sources to keep. Higher values can reveal weaker birds, but may also create duplicate or noisy tracks. Typical range: 4 to 10.");
+
+            this.numMinFrequency = new NumericUpDown { Minimum = 40, Maximum = 20000, Increment = 50, Value = 600 };
+            AddPair(0, 1, "Min Frequency", this.numMinFrequency, "Lower band-pass edge in Hz. Raise this to ignore wind, handling noise, traffic rumble, and low drones. Bird-focused work often starts around 800 Hz to 2000 Hz.");
+            this.numMaxFrequency = new NumericUpDown { Minimum = 200, Maximum = 24000, Increment = 100, Value = 9000 };
+            AddPair(2, 1, "Max Frequency", this.numMaxFrequency, "Upper band-pass edge in Hz. Lower this to focus on mid-band calls, raise it to include bright chirps and harmonics. Typical bird work: 6000 Hz to 12000 Hz.");
+            this.numMinEnergy = new NumericUpDown { Minimum = 1, Maximum = 100, Increment = 1, Value = 4 };
+            AddPair(4, 1, "Min Energy %", this.numMinEnergy, "Minimum share of histogram energy required for a source seed. Lower values expose weaker birds, higher values remove small clusters and keep only dominant singers.");
+            this.numDirectionTolerance = new NumericUpDown { Minimum = 2, Maximum = 60, Increment = 1, Value = 14 };
+            AddPair(6, 1, "Direction Tol.", this.numDirectionTolerance, "Minimum azimuth separation in degrees between source seeds. Lower values split nearby birds more aggressively, higher values merge them into broader ensembles.");
+
+            this.numStrength = new NumericUpDown { Minimum = 5, Maximum = 100, Increment = 5, Value = 80 };
+            AddPair(0, 2, "Separation", this.numStrength, "Overall mask intensity. Higher values isolate sources harder, lower values keep more ambience and overlap. Typical range: 60 to 90.");
+            this.numContrast = new NumericUpDown { Minimum = 0, Maximum = 100, Increment = 5, Value = 65 };
+            AddPair(2, 2, "Spectral Contrast", this.numContrast, "Biases clusters to separate by spectral band as well as direction. Higher values help split overlapping birds with different pitch ranges, but can over-fragment wideband calls.");
+            this.numSuppression = new NumericUpDown { Minimum = 0, Maximum = 100, Increment = 5, Value = 55 };
+            AddPair(4, 2, "Suppression", this.numSuppression, "Subtracts residual energy from competing tracks. Higher values isolate a source more strongly, but can introduce hollow artefacts. Typical range: 30 to 70.");
+            this.comboMasking = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList };
             this.comboMasking.Items.AddRange(["Soft", "Hard"]);
             this.comboMasking.SelectedIndex = 0;
-            settingsPanel.Controls.Add(this.comboMasking);
-            toolTip.SetToolTip(this.comboMasking, "Soft masking blends ambiguous bins and usually sounds cleaner. Hard masking is harsher but can isolate stronger birds more aggressively.");
-            settingsPanel.Controls.Add(new Label { Text = "Max Sources", Left = left5, Top = row1 + 4, Width = 82 });
-            this.numMaxSources = new NumericUpDown { Left = left5 + 86, Top = row1, Width = 78, Minimum = 1, Maximum = 16, Increment = 1, Value = 6 };
-            settingsPanel.Controls.Add(this.numMaxSources);
-            toolTip.SetToolTip(this.numMaxSources, "Maximum number of separated sources to keep. Higher values can reveal weaker birds, but may also create duplicate or noisy tracks. Typical range: 4 to 10.");
+            AddPair(6, 2, "Masking", this.comboMasking, "Soft masking blends ambiguous bins and usually sounds cleaner. Hard masking is harsher but can isolate stronger birds more aggressively.");
 
-            settingsPanel.Controls.Add(new Label { Text = "Min Frequency", Left = left1, Top = row2 + 4, Width = 86 });
-            this.numMinFrequency = new NumericUpDown { Left = left1 + 92, Top = row2, Width = 78, Minimum = 40, Maximum = 20000, Increment = 50, Value = 600 };
-            settingsPanel.Controls.Add(this.numMinFrequency);
-            toolTip.SetToolTip(this.numMinFrequency, "Lower band-pass edge in Hz. Raise this to ignore wind, handling noise, traffic rumble, and low drones. Bird-focused work often starts around 800 Hz to 2000 Hz.");
-
-            settingsPanel.Controls.Add(new Label { Text = "Max Frequency", Left = left2, Top = row2 + 4, Width = 86 });
-            this.numMaxFrequency = new NumericUpDown { Left = left2 + 92, Top = row2, Width = 78, Minimum = 200, Maximum = 24000, Increment = 100, Value = 9000 };
-            settingsPanel.Controls.Add(this.numMaxFrequency);
-            toolTip.SetToolTip(this.numMaxFrequency, "Upper band-pass edge in Hz. Lower this to focus on mid-band calls, raise it to include bright chirps and harmonics. Typical bird work: 6000 Hz to 12000 Hz.");
-
-            settingsPanel.Controls.Add(new Label { Text = "Min Energy %", Left = left3, Top = row2 + 4, Width = 82 });
-            this.numMinEnergy = new NumericUpDown { Left = left3 + 92, Top = row2, Width = 78, Minimum = 1, Maximum = 100, Increment = 1, Value = 4 };
-            settingsPanel.Controls.Add(this.numMinEnergy);
-            toolTip.SetToolTip(this.numMinEnergy, "Minimum share of histogram energy required for a source seed. Lower values expose weaker birds, higher values remove small clusters and keep only dominant singers.");
-
-            settingsPanel.Controls.Add(new Label { Text = "Direction Tol.", Left = left4, Top = row2 + 4, Width = 80 });
-            this.numDirectionTolerance = new NumericUpDown { Left = left4 + 84, Top = row2, Width = 78, Minimum = 2, Maximum = 60, Increment = 1, Value = 14 };
-            settingsPanel.Controls.Add(this.numDirectionTolerance);
-            toolTip.SetToolTip(this.numDirectionTolerance, "Minimum azimuth separation in degrees between source seeds. Lower values split nearby birds more aggressively, higher values merge them into broader ensembles.");
-
-            settingsPanel.Controls.Add(new Label { Text = "Separation", Left = left5, Top = row2 + 4, Width = 72 });
-            this.numStrength = new NumericUpDown { Left = left5 + 76, Top = row2, Width = 78, Minimum = 5, Maximum = 100, Increment = 5, Value = 80 };
-            settingsPanel.Controls.Add(this.numStrength);
-            toolTip.SetToolTip(this.numStrength, "Overall mask intensity. Higher values isolate sources harder, lower values keep more ambience and overlap. Typical range: 60 to 90.");
-
-            settingsPanel.Controls.Add(new Label { Text = "Spectral Contrast", Left = left1, Top = row3 + 4, Width = 96 });
-            this.numContrast = new NumericUpDown { Left = left1 + 100, Top = row3, Width = 78, Minimum = 0, Maximum = 100, Increment = 5, Value = 65 };
-            settingsPanel.Controls.Add(this.numContrast);
-            toolTip.SetToolTip(this.numContrast, "Biases clusters to separate by spectral band as well as direction. Higher values help split overlapping birds with different pitch ranges, but can over-fragment wideband calls.");
-
-            settingsPanel.Controls.Add(new Label { Text = "Suppression", Left = left2, Top = row3 + 4, Width = 74 });
-            this.numSuppression = new NumericUpDown { Left = left2 + 78, Top = row3, Width = 78, Minimum = 0, Maximum = 100, Increment = 5, Value = 55 };
-            settingsPanel.Controls.Add(this.numSuppression);
-            toolTip.SetToolTip(this.numSuppression, "Subtracts residual energy from competing tracks. Higher values isolate a source more strongly, but can introduce hollow artefacts. Typical range: 30 to 70.");
-
-            this.chkFrequencyDiversity = new CheckBox { Left = left3, Top = row3 + 2, Width = 220, Text = "Enable Frequency Diversity", Checked = true };
-            settingsPanel.Controls.Add(this.chkFrequencyDiversity);
+            this.chkFrequencyDiversity = new CheckBox { Text = "Enable Frequency Diversity", Checked = true, Anchor = AnchorStyles.Left, AutoSize = true, Margin = new Padding(0, 6, 0, 0) };
+            grid.Controls.Add(this.chkFrequencyDiversity, 0, 3);
+            grid.SetColumnSpan(this.chkFrequencyDiversity, 4);
             toolTip.SetToolTip(this.chkFrequencyDiversity, "Adds frequency-band diversity to the source seeding step. Useful when multiple birds share similar stereo position but sing in different pitch bands.");
 
-            settingsPanel.Controls.Add(new Label { Text = "Track Browser", Left = left1, Top = row4 + 4, Width = 90 });
-            settingsPanel.Controls.Add(new Label { Text = "Use the numeric selector after processing to browse generated tracks and compare waveform or spectrogram previews.", Left = left1 + 94, Top = row4 + 4, Width = 860 });
+            // ---- Preset row ----
+            var lblPreset = MakeLabel("Preset");
+            grid.Controls.Add(lblPreset, 4, 3);
+            this.comboPreset = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Anchor = AnchorStyles.Left | AnchorStyles.Right, Margin = new Padding(0, 4, 12, 4) };
+            this.comboPreset.Items.AddRange(["Custom", "Bird Song", "Dawn Chorus (dense)", "Single Soloist", "Wide Stereo Field", "Noisy / Urban", "High-Freq Insects"]);
+            this.comboPreset.SelectedIndex = 0;
+            this.comboPreset.SelectedIndexChanged += (_, __) => this.ApplyBssPreset(this.comboPreset.SelectedItem?.ToString());
+            grid.Controls.Add(this.comboPreset, 5, 3);
+            grid.SetColumnSpan(this.comboPreset, 3);
+            toolTip.SetToolTip(this.comboPreset, "Choose a parameter preset tuned for a specific scenario. Selecting one fills in all numeric/checkbox values; pick 'Custom' to tweak freely.");
+
+            var lblHint = new Label
+            {
+                Text = "Browse generated tracks with the Track selector after processing. Use 'Export All ZIP' to bundle every separated track into a ZIP (saved from your Music folder).",
+                Anchor = AnchorStyles.Left | AnchorStyles.Right,
+                AutoSize = false,
+                Margin = new Padding(3, 6, 6, 0)
+            };
+            grid.Controls.Add(lblHint, 0, 4);
+            grid.SetColumnSpan(lblHint, 8);
+
+            settingsPanel.Controls.Add(grid);
+
             toolTip.SetToolTip(this.numericTrack, "Browse separated tracks after processing. Use this to inspect each candidate bird or source individually.");
             toolTip.SetToolTip(this.btnTogglePreview, "Switch between waveform and spectrogram preview for the currently selected separated track.");
             toolTip.SetToolTip(this.btnHear, "Listen to the currently selected BSS phrase or separated track.");
             toolTip.SetToolTip(this.btnExport, "Save the currently selected BSS phrase or separated track to a WAV file using a Save File dialog.");
+            toolTip.SetToolTip(this.btnExportAllZip, "Export every separated track as WAV files bundled into a single ZIP archive (Save dialog starts in your Music folder).");
             toolTip.SetToolTip(this.btnStart, "Start the blind source separation pass with the current parameters.");
 
             this.Controls.Add(this.txtSummary);
             this.Controls.Add(previewPanel);
             this.Controls.Add(actionsPanel);
             this.Controls.Add(settingsPanel);
+        }
+
+        private void ApplyBssPreset(string? preset)
+        {
+            // Helper to clamp a value to a numeric's allowed range before assigning.
+            void Set(NumericUpDown n, decimal v) => n.Value = Math.Clamp(v, n.Minimum, n.Maximum);
+
+            switch (preset)
+            {
+                case "Bird Song":
+                    Set(this.numWindow, 2048); Set(this.numHop, 256); Set(this.numAzimuthBins, 16); Set(this.numMaxSources, 8);
+                    Set(this.numMinFrequency, 1500); Set(this.numMaxFrequency, 11000); Set(this.numMinEnergy, 3); Set(this.numDirectionTolerance, 10);
+                    Set(this.numStrength, 85); Set(this.numContrast, 70); Set(this.numSuppression, 60);
+                    this.comboMasking.SelectedItem = "Soft"; this.chkFrequencyDiversity.Checked = true;
+                    break;
+                case "Dawn Chorus (dense)":
+                    Set(this.numWindow, 4096); Set(this.numHop, 256); Set(this.numAzimuthBins, 24); Set(this.numMaxSources, 12);
+                    Set(this.numMinFrequency, 1200); Set(this.numMaxFrequency, 12000); Set(this.numMinEnergy, 2); Set(this.numDirectionTolerance, 8);
+                    Set(this.numStrength, 80); Set(this.numContrast, 80); Set(this.numSuppression, 65);
+                    this.comboMasking.SelectedItem = "Soft"; this.chkFrequencyDiversity.Checked = true;
+                    break;
+                case "Single Soloist":
+                    Set(this.numWindow, 2048); Set(this.numHop, 512); Set(this.numAzimuthBins, 8); Set(this.numMaxSources, 3);
+                    Set(this.numMinFrequency, 800); Set(this.numMaxFrequency, 9000); Set(this.numMinEnergy, 6); Set(this.numDirectionTolerance, 18);
+                    Set(this.numStrength, 70); Set(this.numContrast, 55); Set(this.numSuppression, 45);
+                    this.comboMasking.SelectedItem = "Soft"; this.chkFrequencyDiversity.Checked = false;
+                    break;
+                case "Wide Stereo Field":
+                    Set(this.numWindow, 2048); Set(this.numHop, 512); Set(this.numAzimuthBins, 32); Set(this.numMaxSources, 10);
+                    Set(this.numMinFrequency, 500); Set(this.numMaxFrequency, 10000); Set(this.numMinEnergy, 3); Set(this.numDirectionTolerance, 6);
+                    Set(this.numStrength, 85); Set(this.numContrast, 60); Set(this.numSuppression, 60);
+                    this.comboMasking.SelectedItem = "Hard"; this.chkFrequencyDiversity.Checked = true;
+                    break;
+                case "Noisy / Urban":
+                    Set(this.numWindow, 4096); Set(this.numHop, 512); Set(this.numAzimuthBins, 12); Set(this.numMaxSources, 6);
+                    Set(this.numMinFrequency, 2000); Set(this.numMaxFrequency, 9000); Set(this.numMinEnergy, 8); Set(this.numDirectionTolerance, 14);
+                    Set(this.numStrength, 90); Set(this.numContrast, 75); Set(this.numSuppression, 70);
+                    this.comboMasking.SelectedItem = "Hard"; this.chkFrequencyDiversity.Checked = true;
+                    break;
+                case "High-Freq Insects":
+                    Set(this.numWindow, 1024); Set(this.numHop, 128); Set(this.numAzimuthBins, 16); Set(this.numMaxSources, 8);
+                    Set(this.numMinFrequency, 4000); Set(this.numMaxFrequency, 16000); Set(this.numMinEnergy, 2); Set(this.numDirectionTolerance, 10);
+                    Set(this.numStrength, 80); Set(this.numContrast, 85); Set(this.numSuppression, 55);
+                    this.comboMasking.SelectedItem = "Soft"; this.chkFrequencyDiversity.Checked = true;
+                    break;
+                default:
+                    // "Custom": leave current values untouched.
+                    break;
+            }
         }
 
         private async Task RunAsync()
@@ -227,6 +300,7 @@ namespace LAWS.Voices.Forms
                 this.btnHear.Enabled = this.currentResult.Tracks.Count > 0;
                 this.btnHear.Text = "Hear";
                 this.btnExport.Enabled = this.currentResult.Tracks.Count > 0;
+                this.btnExportAllZip.Enabled = this.currentResult.Tracks.Count > 0;
                 await this.RefreshPreviewAsync();
             }
             catch (OperationCanceledException)
@@ -289,6 +363,61 @@ namespace LAWS.Voices.Forms
 
             string? saved = await selectedTrack.Audio.ExportWavAsync(Path.GetDirectoryName(sfd.FileName), Path.GetFileNameWithoutExtension(sfd.FileName));
             this.txtSummary.Text = this.currentResult.SummaryText + Environment.NewLine + $"Exported: {saved ?? sfd.FileName}";
+        }
+
+        private async Task ExportAllTracksZipAsync()
+        {
+            if (this.currentResult == null || this.currentResult.Tracks.Count == 0)
+            {
+                return;
+            }
+
+            using var sfd = new SaveFileDialog();
+            sfd.Filter = "ZIP archive (*.zip)|*.zip";
+            sfd.DefaultExt = "zip";
+            sfd.InitialDirectory = Environment.GetFolderPath(Environment.SpecialFolder.MyMusic);
+            sfd.FileName = $"{this.sourceAudio.Name}_bss_tracks_{DateTime.Now:yyyyMMdd_HHmmss}.zip";
+            if (sfd.ShowDialog(this) != DialogResult.OK)
+            {
+                return;
+            }
+
+            string zipPath = sfd.FileName;
+            string tempDir = Path.Combine(Path.GetTempPath(), "LAWS_BSS_AllExport_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(tempDir);
+
+            int exported = 0;
+            try
+            {
+                int idx = 1;
+                foreach (var track in this.currentResult.Tracks)
+                {
+                    string baseName = $"{idx:D3}_{track.Audio.Name}";
+                    try
+                    {
+                        await track.Audio.ExportWavAsync(tempDir, baseName);
+                        exported++;
+                    }
+                    catch (Exception ex)
+                    {
+                        StaticLogger.Log("BSS ExportAll: failed to write track: " + ex.Message);
+                    }
+
+                    idx++;
+                }
+
+                if (File.Exists(zipPath)) { try { File.Delete(zipPath); } catch { } }
+                await Task.Run(() => System.IO.Compression.ZipFile.CreateFromDirectory(tempDir, zipPath));
+                this.txtSummary.Text = this.currentResult.SummaryText + Environment.NewLine + $"Exported {exported} tracks to ZIP: {zipPath}";
+            }
+            catch (Exception ex)
+            {
+                this.txtSummary.Text = "Export All ZIP failed: " + ex.Message;
+            }
+            finally
+            {
+                try { Directory.Delete(tempDir, true); } catch { }
+            }
         }
 
         private async Task HearCurrentTrackAsync()

@@ -18,4 +18,8 @@
     </None>
   </ItemGroup>
 
+  <ItemGroup>
+    <Folder Include="Resources\wav2vec2-base\" />
+  </ItemGroup>
+
 </Project>

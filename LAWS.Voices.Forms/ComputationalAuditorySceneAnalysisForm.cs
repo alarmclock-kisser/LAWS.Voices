@@ -19,9 +19,10 @@ namespace LAWS.Voices.Forms
         private PictureBox pBox = new();
         private ProgressBar pBar = new();
         private Button btnStart = new();
-        private Button btnToggle = new();
+        private ComboBox comboView = new();
         private Button btnOpenVisualizer = new();
         private Button btnHear = new();
+        private ComboBox comboPreset = new();
         private NumericUpDown numericStream = new();
         private NumericUpDown numChannels = new();
         private NumericUpDown numWindow = new();
@@ -30,7 +31,6 @@ namespace LAWS.Voices.Forms
         private NumericUpDown numHarmonicity = new();
         private NumericUpDown numPitch = new();
         private TextBox txtSummary = new();
-        private bool showGrouping;
         private WaveOutEvent? playbackDevice;
         private AudioFileReader? playbackReader;
         private string? playbackTempFile;
@@ -46,10 +46,11 @@ namespace LAWS.Voices.Forms
         {
             this.Text = "Computational Auditory Scene Analysis";
             this.StartPosition = FormStartPosition.CenterParent;
-            this.ClientSize = new Size(1180, 720);
+            this.ClientSize = new Size(1200, 740);
+            this.MinimumSize = new Size(1000, 640);
 
-            var settingsPanel = new Panel { Dock = DockStyle.Top, Height = 176, Padding = new Padding(8, 10, 8, 6) };
-            var actionsPanel = new Panel { Dock = DockStyle.Top, Height = 42 };
+            var settingsPanel = new Panel { Dock = DockStyle.Top, Height = 196, Padding = new Padding(10, 8, 10, 8) };
+            var actionsPanel = new Panel { Dock = DockStyle.Top, Height = 48, Padding = new Padding(8, 8, 8, 4) };
             var previewPanel = new Panel { Dock = DockStyle.Bottom, Height = 280, Padding = new Padding(8) };
             var toolTip = new ToolTip { AutoPopDelay = 20000, InitialDelay = 250, ReshowDelay = 150, ShowAlways = true };
 
@@ -66,60 +67,85 @@ namespace LAWS.Voices.Forms
                 Text = "Ready for CASA analysis."
             };
 
-            this.btnStart = new Button { Text = "Start", Left = 8, Top = 8, Width = 100 };
+            // ---- Actions row ----
+            var actionsFlow = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.LeftToRight, WrapContents = false };
+
+            this.btnStart = new Button { Text = "Start", Width = 90, Height = 28, Margin = new Padding(0, 2, 8, 2) };
             this.btnStart.Click += async (_, __) => await this.RunAsync();
-            this.pBar = new ProgressBar { Left = 116, Top = 12, Width = 260, Height = 20 };
-            this.btnToggle = new Button { Text = "Show Grouping", Left = 384, Top = 8, Width = 120, Enabled = false };
-            this.btnToggle.Click += (_, __) => this.TogglePreview();
-            this.numericStream = new NumericUpDown { Left = 512, Top = 9, Width = 58, Minimum = 1, Maximum = 1, Value = 1, Enabled = false };
-            this.btnHear = new Button { Text = "Hear", Left = 578, Top = 8, Width = 90, Enabled = false };
+            this.pBar = new ProgressBar { Width = 220, Height = 24, Margin = new Padding(0, 4, 8, 2) };
+            var lblView = new Label { Text = "View", AutoSize = true, Margin = new Padding(0, 8, 4, 2) };
+            this.comboView = new ComboBox { Width = 140, DropDownStyle = ComboBoxStyle.DropDownList, Enabled = false, Margin = new Padding(0, 4, 8, 2) };
+            this.comboView.Items.AddRange(["Cochleagram", "Grouping", "Onset", "Harmonicity", "Energy"]);
+            this.comboView.SelectedIndex = 0;
+            this.comboView.SelectedIndexChanged += (_, __) => this.UpdatePreviewImage();
+            var lblStream = new Label { Text = "Stream", AutoSize = true, Margin = new Padding(0, 8, 4, 2) };
+            this.numericStream = new NumericUpDown { Width = 58, Minimum = 1, Maximum = 1, Value = 1, Enabled = false, Margin = new Padding(0, 4, 8, 2) };
+            this.btnHear = new Button { Text = "Hear", Width = 80, Height = 28, Enabled = false, Margin = new Padding(0, 2, 8, 2) };
             this.btnHear.Click += async (_, __) => await this.HearCurrentStreamAsync();
-            this.btnOpenVisualizer = new Button { Text = "Open Visualizer", Left = 676, Top = 8, Width = 120, Enabled = false };
+            this.btnOpenVisualizer = new Button { Text = "Open Visualizer", Width = 120, Height = 28, Enabled = false, Margin = new Padding(0, 2, 8, 2) };
             this.btnOpenVisualizer.Click += (_, __) => this.OpenResultVisualizer();
-            actionsPanel.Controls.AddRange([this.btnStart, this.pBar, this.btnToggle, this.numericStream, this.btnHear, this.btnOpenVisualizer]);
 
-            int row1 = 14;
-            int row2 = 56;
-            int row3 = 102;
-            int left1 = 10;
-            int left2 = 270;
-            int left3 = 530;
-            settingsPanel.Controls.Add(new Label { Text = "Filterbank Channels", Left = left1, Top = row1 + 4, Width = 122 });
-            this.numChannels = new NumericUpDown { Left = left1 + 130, Top = row1, Width = 82, Minimum = 32, Maximum = 128, Increment = 4, Value = 80 };
-            settingsPanel.Controls.Add(this.numChannels);
-            toolTip.SetToolTip(this.numChannels, "Number of auditory filterbank channels. Higher values give finer frequency detail and can separate close bird timbres better, but use more CPU and can become noisier. Typical range: 64 to 112.");
-            settingsPanel.Controls.Add(new Label { Text = "Window Size", Left = left2, Top = row1 + 4, Width = 86 });
-            this.numWindow = new NumericUpDown { Left = left2 + 94, Top = row1, Width = 82, Minimum = 256, Maximum = 8192, Increment = 256, Value = 2048 };
-            settingsPanel.Controls.Add(this.numWindow);
-            toolTip.SetToolTip(this.numWindow, "Analysis window size in samples. Larger windows improve harmonic resolution, smaller windows react faster to short chirps and attack transients.");
-            settingsPanel.Controls.Add(new Label { Text = "Hop Size", Left = left3, Top = row1 + 4, Width = 70 });
-            this.numHop = new NumericUpDown { Left = left3 + 78, Top = row1, Width = 82, Minimum = 64, Maximum = 4096, Increment = 64, Value = 512 };
-            settingsPanel.Controls.Add(this.numHop);
-            toolTip.SetToolTip(this.numHop, "Frame step size in samples. Lower values track timing more tightly and help with short phrases or trills, while higher values are cheaper but coarser.");
-            settingsPanel.Controls.Add(new Label { Text = "Common Onset", Left = left1, Top = row2 + 4, Width = 122 });
-            this.numOnset = new NumericUpDown { Left = left1 + 130, Top = row2, Width = 82, Minimum = 10, Maximum = 200, Increment = 5, Value = 85 };
-            settingsPanel.Controls.Add(this.numOnset);
-            toolTip.SetToolTip(this.numOnset, "Weight for grouping components that begin together. Higher values emphasize shared attacks and can bind simultaneous syllables into one stream. Lower values keep simultaneous birds more separate.");
-            settingsPanel.Controls.Add(new Label { Text = "Harmonicity", Left = left2, Top = row2 + 4, Width = 90 });
-            this.numHarmonicity = new NumericUpDown { Left = left2 + 94, Top = row2, Width = 82, Minimum = 10, Maximum = 200, Increment = 5, Value = 80 };
-            settingsPanel.Controls.Add(this.numHarmonicity);
-            toolTip.SetToolTip(this.numHarmonicity, "Weight for grouping harmonically related frequencies into one stream. Increase this for tonal bird songs, lower it for noisy chirps, clicks, and broad-band calls.");
-            settingsPanel.Controls.Add(new Label { Text = "Pitch Proximity", Left = left3, Top = row2 + 4, Width = 102 });
-            this.numPitch = new NumericUpDown { Left = left3 + 110, Top = row2, Width = 82, Minimum = 10, Maximum = 200, Increment = 5, Value = 75 };
-            settingsPanel.Controls.Add(this.numPitch);
-            toolTip.SetToolTip(this.numPitch, "Weight for linking nearby pitch trajectories over time. Higher values favor continuous melodic lines, lower values let similar birds split more easily when they alternate quickly.");
+            actionsFlow.Controls.AddRange([this.btnStart, this.pBar, lblView, this.comboView, lblStream, this.numericStream, this.btnHear, this.btnOpenVisualizer]);
+            actionsPanel.Controls.Add(actionsFlow);
 
-            settingsPanel.Controls.Add(new Label { Text = "Note", Left = left1, Top = row3, Width = 54, Font = new Font("Segoe UI", 9f, FontStyle.Bold) });
-            settingsPanel.Controls.Add(new Label
+            // ---- Settings grid ----
+            var grid = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 6, RowCount = 5, AutoSize = false };
+            for (int c = 0; c < 6; c++)
             {
-                Text = "Use larger spacing and these tooltips to tune whether the grouping follows one singer, tonal stacks, or short independent chirps.",
-                Left = left1 + 58,
-                Top = row3,
-                Width = 980,
-                Height = 34
-            });
+                grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, c % 2 == 0 ? 18f : 15f));
+            }
+            for (int r = 0; r < 5; r++)
+            {
+                grid.RowStyles.Add(new RowStyle(SizeType.Absolute, 32f));
+            }
+
+            Label MakeLabel(string text) => new Label { Text = text, Anchor = AnchorStyles.Left, AutoSize = true, Margin = new Padding(3, 8, 6, 0) };
+            void AddPair(int col, int row, string label, Control control, string tip)
+            {
+                control.Anchor = AnchorStyles.Left | AnchorStyles.Right;
+                control.Margin = new Padding(0, 4, 12, 4);
+                grid.Controls.Add(MakeLabel(label), col, row);
+                grid.Controls.Add(control, col + 1, row);
+                toolTip.SetToolTip(control, tip);
+            }
+
+            this.numChannels = new NumericUpDown { Minimum = 32, Maximum = 128, Increment = 4, Value = 80 };
+            AddPair(0, 0, "Filterbank Channels", this.numChannels, "Number of auditory filterbank channels. Higher values give finer frequency detail and can separate close bird timbres better, but use more CPU and can become noisier. Typical range: 64 to 112.");
+            this.numWindow = new NumericUpDown { Minimum = 256, Maximum = 8192, Increment = 256, Value = 2048 };
+            AddPair(2, 0, "Window Size", this.numWindow, "Analysis window size in samples. Larger windows improve harmonic resolution, smaller windows react faster to short chirps and attack transients.");
+            this.numHop = new NumericUpDown { Minimum = 64, Maximum = 4096, Increment = 64, Value = 512 };
+            AddPair(4, 0, "Hop Size", this.numHop, "Frame step size in samples. Lower values track timing more tightly and help with short phrases or trills, while higher values are cheaper but coarser.");
+
+            this.numOnset = new NumericUpDown { Minimum = 10, Maximum = 200, Increment = 5, Value = 85 };
+            AddPair(0, 1, "Common Onset", this.numOnset, "Weight for grouping components that begin together. Higher values emphasize shared attacks and can bind simultaneous syllables into one stream. Lower values keep simultaneous birds more separate.");
+            this.numHarmonicity = new NumericUpDown { Minimum = 10, Maximum = 200, Increment = 5, Value = 80 };
+            AddPair(2, 1, "Harmonicity", this.numHarmonicity, "Weight for grouping harmonically related frequencies into one stream. Increase this for tonal bird songs, lower it for noisy chirps, clicks, and broad-band calls.");
+            this.numPitch = new NumericUpDown { Minimum = 10, Maximum = 200, Increment = 5, Value = 75 };
+            AddPair(4, 1, "Pitch Proximity", this.numPitch, "Weight for linking nearby pitch trajectories over time. Higher values favor continuous melodic lines, lower values let similar birds split more easily when they alternate quickly.");
+
+            var lblPreset = MakeLabel("Preset");
+            grid.Controls.Add(lblPreset, 0, 2);
+            this.comboPreset = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Anchor = AnchorStyles.Left | AnchorStyles.Right, Margin = new Padding(0, 4, 12, 4) };
+            this.comboPreset.Items.AddRange(["Custom", "Bird Song", "Dawn Chorus (dense)", "Single Soloist", "Tonal Songbird", "Noisy / Broadband"]);
+            this.comboPreset.SelectedIndex = 0;
+            this.comboPreset.SelectedIndexChanged += (_, __) => this.ApplyCasaPreset(this.comboPreset.SelectedItem?.ToString());
+            grid.Controls.Add(this.comboPreset, 1, 2);
+            toolTip.SetToolTip(this.comboPreset, "Choose a parameter preset tuned for a specific CASA scenario. Selecting one fills in all grouping weights; pick 'Custom' to tweak freely.");
+
+            var lblHint = new Label
+            {
+                Text = "Tune whether grouping follows one singer, tonal stacks, or short independent chirps. Use the View selector after analysis to switch between cochleagram, grouping, onset, harmonicity and energy maps.",
+                Anchor = AnchorStyles.Left | AnchorStyles.Right,
+                AutoSize = false,
+                Margin = new Padding(3, 6, 6, 0)
+            };
+            grid.Controls.Add(lblHint, 0, 3);
+            grid.SetColumnSpan(lblHint, 6);
+
+            settingsPanel.Controls.Add(grid);
+
             toolTip.SetToolTip(this.btnStart, "Start the CASA analysis in the background using the current psychoacoustic grouping weights.");
-            toolTip.SetToolTip(this.btnToggle, "Switch the preview between the cochleagram and the higher-level grouping view.");
+            toolTip.SetToolTip(this.comboView, "Switch the preview between cochleagram, grouping, onset, harmonicity and energy visualizations.");
             toolTip.SetToolTip(this.numericStream, "Choose which detected CASA stream to inspect or listen to.");
             toolTip.SetToolTip(this.btnHear, "Render and play a stream-focused audible preview around the selected CASA stream pitch range.");
             toolTip.SetToolTip(this.btnOpenVisualizer, "Open the current CASA bitmap and summary in the shared result visualizer window.");
@@ -128,6 +154,37 @@ namespace LAWS.Voices.Forms
             this.Controls.Add(previewPanel);
             this.Controls.Add(actionsPanel);
             this.Controls.Add(settingsPanel);
+        }
+
+        private void ApplyCasaPreset(string? preset)
+        {
+            void Set(NumericUpDown n, decimal v) => n.Value = Math.Clamp(v, n.Minimum, n.Maximum);
+
+            switch (preset)
+            {
+                case "Bird Song":
+                    Set(this.numChannels, 96); Set(this.numWindow, 2048); Set(this.numHop, 256);
+                    Set(this.numOnset, 90); Set(this.numHarmonicity, 95); Set(this.numPitch, 85);
+                    break;
+                case "Dawn Chorus (dense)":
+                    Set(this.numChannels, 112); Set(this.numWindow, 4096); Set(this.numHop, 256);
+                    Set(this.numOnset, 70); Set(this.numHarmonicity, 85); Set(this.numPitch, 65);
+                    break;
+                case "Single Soloist":
+                    Set(this.numChannels, 80); Set(this.numWindow, 2048); Set(this.numHop, 512);
+                    Set(this.numOnset, 95); Set(this.numHarmonicity, 90); Set(this.numPitch, 95);
+                    break;
+                case "Tonal Songbird":
+                    Set(this.numChannels, 88); Set(this.numWindow, 4096); Set(this.numHop, 512);
+                    Set(this.numOnset, 80); Set(this.numHarmonicity, 130); Set(this.numPitch, 100);
+                    break;
+                case "Noisy / Broadband":
+                    Set(this.numChannels, 72); Set(this.numWindow, 1024); Set(this.numHop, 256);
+                    Set(this.numOnset, 110); Set(this.numHarmonicity, 50); Set(this.numPitch, 60);
+                    break;
+                default:
+                    break;
+            }
         }
 
         private async Task RunAsync()
@@ -153,10 +210,9 @@ namespace LAWS.Voices.Forms
                 this.currentResult?.Dispose();
                 this.currentResult = await this.processor.AnalyzeAsync(this.sourceAudio, settings, progress, this.analysisCts.Token);
                 this.txtSummary.Text = this.currentResult.SummaryText;
-                this.pBox.Image = this.currentResult.CochleagramBitmap;
-                this.showGrouping = false;
-                this.btnToggle.Text = "Show Grouping";
-                this.btnToggle.Enabled = true;
+                this.comboView.Enabled = true;
+                this.comboView.SelectedIndex = 0;
+                this.UpdatePreviewImage();
                 this.numericStream.Maximum = Math.Max(1, this.currentResult.Streams.Count);
                 this.numericStream.Value = 1;
                 this.numericStream.Enabled = this.currentResult.Streams.Count > 0;
@@ -177,16 +233,35 @@ namespace LAWS.Voices.Forms
             }
         }
 
-        private void TogglePreview()
+        private void UpdatePreviewImage()
         {
             if (this.currentResult == null)
             {
                 return;
             }
 
-            this.showGrouping = !this.showGrouping;
-            this.pBox.Image = this.showGrouping ? this.currentResult.GroupingBitmap : this.currentResult.CochleagramBitmap;
-            this.btnToggle.Text = this.showGrouping ? "Show Cochleagram" : "Show Grouping";
+            Bitmap? selected = this.SelectedViewBitmap();
+            if (selected != null)
+            {
+                this.pBox.Image = selected;
+            }
+        }
+
+        private Bitmap? SelectedViewBitmap()
+        {
+            if (this.currentResult == null)
+            {
+                return null;
+            }
+
+            return (this.comboView.SelectedItem?.ToString()) switch
+            {
+                "Grouping" => this.currentResult.GroupingBitmap,
+                "Onset" => this.currentResult.OnsetBitmap ?? this.currentResult.CochleagramBitmap,
+                "Harmonicity" => this.currentResult.HarmonicityBitmap ?? this.currentResult.CochleagramBitmap,
+                "Energy" => this.currentResult.EnergyBitmap ?? this.currentResult.CochleagramBitmap,
+                _ => this.currentResult.CochleagramBitmap,
+            };
         }
 
         private void OpenResultVisualizer()
@@ -196,7 +271,13 @@ namespace LAWS.Voices.Forms
                 return;
             }
 
-            Bitmap bmp = this.showGrouping ? new Bitmap(this.currentResult.GroupingBitmap) : new Bitmap(this.currentResult.CochleagramBitmap);
+            Bitmap? selected = this.SelectedViewBitmap();
+            if (selected == null)
+            {
+                return;
+            }
+
+            Bitmap bmp = new Bitmap(selected);
             var viz = new ResultVisualizerForm(bmp, this.currentResult.SummaryText);
             viz.Show(this);
         }

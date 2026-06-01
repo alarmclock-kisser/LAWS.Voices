@@ -45,6 +45,7 @@ namespace LAWS.Voices.Forms
         private List<PointF>? lastTreeNodePoints = null;
         private bool isTreeView = false;
         private float imageZoom = 1f;
+        private FormWindowState lastWindowState = FormWindowState.Normal;
         private int treeBaseWidth = 1000;
         private int treeBaseHeight = 600;
         private Point panStartMouse = Point.Empty;
@@ -127,6 +128,9 @@ namespace LAWS.Voices.Forms
                             return ae.CompareTo(be);
                         });
                         break;
+                    case "duration":
+                        this.SortByAuthoritativeDuration();
+                        break;
                 }
 
                 // Re-render tree with new order
@@ -139,52 +143,108 @@ namespace LAWS.Voices.Forms
             catch (Exception ex) { StaticLogger.Log("SortNodesBy failed: " + ex.Message); }
         }
 
+        private void SortByAuthoritativeDuration()
+        {
+            if (this.fingerprints == null || this.fingerprints.Count == 0) return;
+            // Precompute authoritative segment duration per node, then sort shortest -> longest.
+            var durations = new Dictionary<FingerprintingProcessor.Fingerprint, double>();
+            for (int i = 0; i < this.fingerprints.Count; i++)
+            {
+                var seg = this.GetAuthoritativeSegmentAroundIndex(i, mergeGapMs: 220, maxSegmentMs: 12000);
+                double ms = (seg.start == DateTime.MinValue || seg.end <= seg.start)
+                    ? Math.Max(1, this.fingerprints[i].DurationMs)
+                    : (seg.end - seg.start).TotalMilliseconds;
+                durations[this.fingerprints[i]] = ms;
+            }
+
+            this.fingerprints.Sort((a, b) =>
+            {
+                durations.TryGetValue(a, out double da);
+                durations.TryGetValue(b, out double db);
+                return da.CompareTo(db);
+            });
+        }
+
         private async Task ExportSongSamplesAsync()
         {
             try
             {
-                if (this.sourceAudio == null || this.songBlocks == null || this.songBlocks.Count == 0)
+                if (this.sourceAudio == null)
                 {
-                    MessageBox.Show(this, "No song blocks / source audio available for export.", "Export Songs", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    MessageBox.Show(this, "No source audio available for export.", "Export Songs", MessageBoxButtons.OK, MessageBoxIcon.Information);
                     return;
                 }
 
-                var dr = MessageBox.Show(this, $"Export {this.songBlocks.Count} song samples as WAV files into a ZIP in your Music folder?", "Export Songs", MessageBoxButtons.OKCancel, MessageBoxIcon.Question);
-                if (dr != DialogResult.OK) return;
+                // Build the list of (start, end) blocks to export.
+                // Prefer explicit song blocks; otherwise fall back to fingerprint node blocks (grouped per track/segment).
+                var blocks = new List<(TimeSpan start, TimeSpan end, string label)>();
+                if (this.songBlocks != null && this.songBlocks.Count > 0)
+                {
+                    foreach (var sb in this.songBlocks.OrderBy(s => s.StartTime))
+                    {
+                        blocks.Add((sb.StartTime, sb.EndTime, "song"));
+                    }
+                }
+                else if (this.fingerprints != null && this.fingerprints.Count > 0)
+                {
+                    var seen = new HashSet<(long, long)>();
+                    for (int i = 0; i < this.fingerprints.Count; i++)
+                    {
+                        var seg = this.GetAuthoritativeSegmentAroundIndex(i, mergeGapMs: 220, maxSegmentMs: 12000);
+                        if (seg.start == DateTime.MinValue || seg.end <= seg.start) continue;
+                        var startTs = seg.start - this.sourceAudio.CreatedAt;
+                        var endTs = seg.end - this.sourceAudio.CreatedAt;
+                        if (startTs < TimeSpan.Zero) startTs = TimeSpan.Zero;
+                        if (endTs <= startTs) continue;
+                        // dedupe identical segments (many nodes share the same expanded block)
+                        var key = ((long)startTs.TotalMilliseconds, (long)endTs.TotalMilliseconds);
+                        if (!seen.Add(key)) continue;
+                        blocks.Add((startTs, endTs, "block"));
+                    }
+                }
 
-                string music = Environment.GetFolderPath(Environment.SpecialFolder.MyMusic);
-                string exportDir = Path.Combine(music, "LAWS_Voices_Exports");
-                Directory.CreateDirectory(exportDir);
-                string zipPath = Path.Combine(exportDir, $"songs_{DateTime.Now:yyyyMMdd_HHmmss}.zip");
+                if (blocks.Count == 0)
+                {
+                    MessageBox.Show(this, "No song blocks / fingerprint blocks available for export.", "Export Songs", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    return;
+                }
+
+                using var sfd = new SaveFileDialog();
+                sfd.Filter = "ZIP archive (*.zip)|*.zip";
+                sfd.DefaultExt = "zip";
+                sfd.InitialDirectory = Environment.GetFolderPath(Environment.SpecialFolder.MyMusic);
+                sfd.FileName = $"songs_{DateTime.Now:yyyyMMdd_HHmmss}.zip";
+                if (sfd.ShowDialog(this) != DialogResult.OK) return;
+                string zipPath = sfd.FileName;
 
                 // create temp dir for wavs
                 string tempDir = Path.Combine(Path.GetTempPath(), "LAWS_Voices_SongExport_" + Guid.NewGuid().ToString("N"));
                 Directory.CreateDirectory(tempDir);
 
+                int sr = this.sourceAudio.SampleRate > 0 ? this.sourceAudio.SampleRate : 44100;
+                int ch = this.sourceAudio.Channels > 0 ? this.sourceAudio.Channels : 1;
+                int exported = 0;
                 int idx = 1;
-                foreach (var sb in this.songBlocks.OrderBy(s => s.StartTime))
+                foreach (var blk in blocks.OrderBy(b => b.start))
                 {
-                    // calculate sample indices based on source audio sample rate
-                    int sr = this.sourceAudio.SampleRate > 0 ? this.sourceAudio.SampleRate : 44100;
-                    int ch = this.sourceAudio.Channels > 0 ? this.sourceAudio.Channels : 1;
-                    long startSample = (long) Math.Max(0, Math.Floor(sb.StartTime.TotalSeconds * sr) * ch);
-                    long endSample = (long) Math.Min(this.sourceAudio.Data.Length, Math.Ceiling(sb.EndTime.TotalSeconds * sr) * ch);
-                    if (endSample <= startSample) continue;
+                    long startSample = (long) Math.Max(0, Math.Floor(blk.start.TotalSeconds * sr) * ch);
+                    long endSample = (long) Math.Min(this.sourceAudio.Data.Length, Math.Ceiling(blk.end.TotalSeconds * sr) * ch);
+                    if (endSample <= startSample) { idx++; continue; }
 
                     int len = (int) (endSample - startSample);
                     var segment = new float[len];
                     Array.Copy(this.sourceAudio.Data, startSample, segment, 0, len);
 
-                    var tmpAudio = new AudioObj(segment, sr, ch, this.sourceAudio.BitDepth > 0 ? this.sourceAudio.BitDepth : 16, this.sourceAudio.Name + $"_song{idx:D2}");
+                    var tmpAudio = new AudioObj(segment, sr, ch, this.sourceAudio.BitDepth > 0 ? this.sourceAudio.BitDepth : 16, this.sourceAudio.Name + $"_{blk.label}{idx:D3}");
                     string wavFile = Path.Combine(tempDir, tmpAudio.Name + ".wav");
                     try
                     {
-                        // write WAV using NAudio
                         WaveFormat format = tmpAudio.BitDepth == 32 ? WaveFormat.CreateIeeeFloatWaveFormat(tmpAudio.SampleRate, tmpAudio.Channels) : new WaveFormat(tmpAudio.SampleRate, tmpAudio.BitDepth, tmpAudio.Channels);
                         using (var writer = new WaveFileWriter(wavFile, format))
                         {
                             writer.WriteSamples(tmpAudio.Data, 0, tmpAudio.Data.Length);
                         }
+                        exported++;
                     }
                     catch (Exception ex)
                     {
@@ -194,13 +254,13 @@ namespace LAWS.Voices.Forms
                     idx++;
                 }
 
-                // create zip
-                ZipFile.CreateFromDirectory(tempDir, zipPath);
+                if (File.Exists(zipPath)) { try { File.Delete(zipPath); } catch { } }
+                await Task.Run(() => ZipFile.CreateFromDirectory(tempDir, zipPath));
 
                 // cleanup temp
                 try { Directory.Delete(tempDir, true); } catch { }
 
-                MessageBox.Show(this, $"Exported songs to: {zipPath}", "Export Songs", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                MessageBox.Show(this, $"Exported {exported} blocks to: {zipPath}", "Export Songs", MessageBoxButtons.OK, MessageBoxIcon.Information);
             }
             catch (Exception ex)
             {
@@ -363,18 +423,21 @@ namespace LAWS.Voices.Forms
             var miSortTime = new ToolStripMenuItem("Sort by Time");
             var miSortCentroid = new ToolStripMenuItem("Sort by SpectralCentroid");
             var miSortEnergy = new ToolStripMenuItem("Sort by SpectralEnergy");
+            var miSortDuration = new ToolStripMenuItem("Sort by Duration (short -> long)");
             var miExportSongs = new ToolStripMenuItem("Export Song Samples (ZIP in MyMusic)");
 
             miSortIndex.Click += (_, __) => { this.SortNodesBy("index"); };
             miSortTime.Click += (_, __) => { this.SortNodesBy("time"); };
             miSortCentroid.Click += (_, __) => { this.SortNodesBy("centroid"); };
             miSortEnergy.Click += (_, __) => { this.SortNodesBy("energy"); };
+            miSortDuration.Click += (_, __) => { this.SortNodesBy("duration"); };
             miExportSongs.Click += async (_, __) => { await this.ExportSongSamplesAsync(); };
 
             cms.Items.Add(miSortIndex);
             cms.Items.Add(miSortTime);
             cms.Items.Add(miSortCentroid);
             cms.Items.Add(miSortEnergy);
+            cms.Items.Add(miSortDuration);
             cms.Items.Add(new ToolStripSeparator());
             cms.Items.Add(miExportSongs);
 
@@ -415,6 +478,59 @@ namespace LAWS.Voices.Forms
             };
 
             panel.SizeChanged += (s, e) => { this.btnClose.Left = panel.ClientSize.Width - this.btnClose.Width - 12; };
+
+            // Re-zoom/fit content when the window is maximized or restored so the whole image fits the new area.
+            this.lastWindowState = this.WindowState;
+            this.Resize += this.ResultVisualizerForm_Resize;
+        }
+
+        private void ResultVisualizerForm_Resize(object? sender, EventArgs e)
+        {
+            try
+            {
+                if (this.WindowState == this.lastWindowState) return;
+                this.lastWindowState = this.WindowState;
+
+                // Defer until layout settles so picturePanel.ClientSize is final.
+                this.BeginInvoke(new Action(this.FitImageToWindow));
+            }
+            catch { }
+        }
+
+        private void FitImageToWindow()
+        {
+            try
+            {
+                if (this.bmp == null || this.picturePanel == null) return;
+                int viewW = Math.Max(1, this.picturePanel.ClientSize.Width);
+                int viewH = Math.Max(1, this.picturePanel.ClientSize.Height);
+
+                if (this.isTreeView && this.fingerprints != null && this.fingerprints.Count > 0)
+                {
+                    // For tree view, re-render at a zoom that fills the new viewport.
+                    this.treeBaseWidth = Math.Max(800, viewW);
+                    this.treeBaseHeight = Math.Max(400, viewH);
+                    this.imageZoom = 1f;
+                    _ = this.RenderTreeAsync(this.treeBaseWidth, this.treeBaseHeight);
+                    return;
+                }
+
+                // For static images, compute a zoom factor that fits the whole image into the viewport.
+                float zoomX = viewW / (float)Math.Max(1, this.bmp.Width);
+                float zoomY = viewH / (float)Math.Max(1, this.bmp.Height);
+                this.imageZoom = Math.Clamp(Math.Min(zoomX, zoomY), 0.01f, 24f);
+
+                int newW = Math.Max(1, (int)(this.bmp.Width * this.imageZoom));
+                int newH = Math.Max(1, (int)(this.bmp.Height * this.imageZoom));
+                this.pictureBox.Size = new Size(newW, newH);
+
+                // Center the image in the viewport.
+                int scrollX = Math.Max(0, (newW - viewW) / 2);
+                int scrollY = Math.Max(0, (newH - viewH) / 2);
+                this.picturePanelScroll = new Point(scrollX, scrollY);
+                this.pictureBox.Location = new Point(-scrollX, -scrollY);
+            }
+            catch { }
         }
 
         private void BtnShowTree_Click(object? sender, EventArgs e)
@@ -1084,7 +1200,6 @@ namespace LAWS.Voices.Forms
         {
             if (this.bmp == null) return;
             float factor = (float)Math.Pow(1.12f, e.Delta / 120f);
-            try { StaticLogger.Log($"MouseWheel start: Delta={e.Delta}, factor={factor}, imageZoom(before)={this.imageZoom}, AutoScroll={this.picturePanel.AutoScrollPosition}, pictureBox.Left={this.pictureBox.Left}, pictureBox.Size={this.pictureBox.Size}"); } catch { }
             // compute new zoom
             float newZoom = Math.Clamp(this.imageZoom * factor, 0.01f, 24f);
 

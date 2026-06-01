@@ -39,6 +39,9 @@ namespace LAWS.Voices.Multimodal.Audio.Processors
         {
             public required Bitmap CochleagramBitmap { get; init; }
             public required Bitmap GroupingBitmap { get; init; }
+            public Bitmap? OnsetBitmap { get; init; }
+            public Bitmap? HarmonicityBitmap { get; init; }
+            public Bitmap? EnergyBitmap { get; init; }
             public required List<SourceStream> Streams { get; init; }
             public string SummaryText { get; init; } = string.Empty;
 
@@ -47,6 +50,9 @@ namespace LAWS.Voices.Multimodal.Audio.Processors
             {
                 this.CochleagramBitmap.Dispose();
                 this.GroupingBitmap.Dispose();
+                this.OnsetBitmap?.Dispose();
+                this.HarmonicityBitmap?.Dispose();
+                this.EnergyBitmap?.Dispose();
                 this.Streams.Clear();
             }
         }
@@ -185,6 +191,21 @@ namespace LAWS.Voices.Multimodal.Audio.Processors
                 progress?.Report(82);
                 Bitmap cochleagramBitmap = RenderHeatmap(cochleagram, 1200, 260, Color.FromArgb(10, 30, 70), Color.Cyan);
                 Bitmap groupingBitmap = RenderHeatmap(groupingMatrix, 1200, 260, Color.FromArgb(30, 10, 40), Color.Orange);
+                Bitmap onsetBitmap = RenderHeatmap(onsetMatrix, 1200, 260, Color.FromArgb(10, 10, 10), Color.LimeGreen);
+                Bitmap harmonicityBitmap = RenderHeatmap(harmonicityMatrix, 1200, 260, Color.FromArgb(20, 10, 30), Color.Magenta);
+
+                // Build an energy matrix (frame energy broadcast across bands) for an energy-envelope view.
+                var energyMatrix = new float[frames, bands];
+                float maxEnergyVal = frameEnergies.Length > 0 ? Math.Max(1e-6f, frameEnergies.Max()) : 1f;
+                for (int t = 0; t < frames; t++)
+                {
+                    float norm = frameEnergies[t] / maxEnergyVal;
+                    for (int b = 0; b < bands; b++)
+                    {
+                        energyMatrix[t, b] = norm;
+                    }
+                }
+                Bitmap energyBitmap = RenderHeatmap(energyMatrix, 1200, 260, Color.FromArgb(20, 20, 10), Color.Gold);
                 var summary = new StringBuilder();
                 summary.AppendLine("Computational Auditory Scene Analysis");
                 summary.AppendLine($"Source audio: {audio.Name}");
@@ -201,6 +222,9 @@ namespace LAWS.Voices.Multimodal.Audio.Processors
                 {
                     CochleagramBitmap = cochleagramBitmap,
                     GroupingBitmap = groupingBitmap,
+                    OnsetBitmap = onsetBitmap,
+                    HarmonicityBitmap = harmonicityBitmap,
+                    EnergyBitmap = energyBitmap,
                     Streams = streams,
                     SummaryText = summary.ToString()
                 };

@@ -505,19 +505,20 @@ namespace LAWS.Voices.Multimodal.Audio.Processors
         {
             width = Math.Max(320, width);
             height = Math.Max(120, height);
+            int sampleRate = audio.SampleRate > 0 ? audio.SampleRate : 16000;
             return spectrogram
                 ? RenderSpectrogram(AudioSceneDsp.ToMono(audio.Data, audio.Channels), audio.SampleRate, width, height, 2048, 512)
-                : RenderWaveform(AudioSceneDsp.ToMono(audio.Data, audio.Channels), width, height);
+                : RenderWaveform(AudioSceneDsp.ToMono(audio.Data, audio.Channels), width, height, sampleRate);
         }
 
         [SupportedOSPlatform("windows")]
-        public static Bitmap RenderWaveform(float[] mono, int width, int height)
+        public static Bitmap RenderWaveform(float[] mono, int width, int height, int sampleRate = 16000)
         {
             var bitmap = new Bitmap(width, height, PixelFormat.Format32bppArgb);
             using var g = Graphics.FromImage(bitmap);
             g.Clear(Color.FromArgb(18, 18, 24));
             int centerY = height / 2;
-            DrawWaveformTimeMarkers(g, mono.Length, width, height, centerY);
+            DrawWaveformTimeMarkers(g, mono.Length, width, height, centerY, sampleRate);
             using var pen = new Pen(Color.DeepSkyBlue, 1f);
             double samplesPerPixel = Math.Max(1.0, mono.Length / (double) width);
             for (int x = 0; x < width; x++)

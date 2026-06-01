@@ -169,7 +169,10 @@ namespace LAWS.Voices.Multimodal.Audio.Processors
             var spectra = new Complex[maxFrames][];
             var magnitudes = new float[maxFrames][];
 
+            this._progress?.Report(0.0);
+
             // Phase 1: STFT
+            int stftDone = 0;
             await Task.Run(() =>
             {
                 Parallel.For(0, maxFrames, new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount, CancellationToken = _cancellationToken }, f =>
@@ -180,6 +183,13 @@ namespace LAWS.Voices.Multimodal.Audio.Processors
                     Complex[] fft = this.ExecuteForwardFFT(windowBuffer);
                     spectra[f] = fft;
                     magnitudes[f] = this.CalculateMagnitudeSpectrum(fft);
+
+                    int done = Interlocked.Increment(ref stftDone);
+                    if (done == maxFrames || done % Math.Max(1, maxFrames / 100) == 0)
+                    {
+                        // Phase 1 maps to 0% .. 40% of the overall progress.
+                        this._progress?.Report(0.40 * done / maxFrames);
+                    }
                 });
             }, _cancellationToken);
 
@@ -192,6 +202,12 @@ namespace LAWS.Voices.Multimodal.Audio.Processors
             for (int f = 0; f < maxFrames; f++)
             {
                 if (_cancellationToken.IsCancellationRequested) break;
+
+                // Phase 2 maps to 40% .. 75% of overall progress.
+                if (f % Math.Max(1, maxFrames / 100) == 0)
+                {
+                    this._progress?.Report(0.40 + 0.35 * f / maxFrames);
+                }
 
                 // 1. Alle aktiven Tracks altern lassen
                 foreach (var track in activeTracks) track.MissedFrames++;
@@ -299,6 +315,8 @@ namespace LAWS.Voices.Multimodal.Audio.Processors
 
             StaticLogger.Log($"[CASA BSS Engine] Phase 3: Assembly & Aggressive Trim. Tracks: {completedTracks.Count}, phrases: {phraseTracks.Count}");
 
+            int phraseDone = 0;
+            int phraseTotal = Math.Max(1, phraseTracks.Count);
             await Task.Run(() =>
             {
                 Parallel.ForEach(phraseTracks, new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount }, track =>
@@ -379,10 +397,20 @@ namespace LAWS.Voices.Multimodal.Audio.Processors
 
                         clipIndex++;
                     }
+
+                    int pd = Interlocked.Increment(ref phraseDone);
+                    if (pd == phraseTotal || pd % Math.Max(1, phraseTotal / 50) == 0)
+                    {
+                        // Phase 3 maps to 75% .. 95% of overall progress.
+                        this._progress?.Report(0.75 + 0.20 * pd / phraseTotal);
+                    }
                 });
             }, _cancellationToken);
 
+            this._progress?.Report(0.95);
+
             this.DeriveHistoricalCrossReferences();
+            this._progress?.Report(1.0);
             StaticLogger.Log($"[CASA BSS Engine] Complete. Extracted {IsolatedBirdSamples.Count} samples.");
         }
 
