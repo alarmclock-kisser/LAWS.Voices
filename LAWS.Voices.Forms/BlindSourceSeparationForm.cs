@@ -32,6 +32,8 @@ namespace LAWS.Voices.Forms
         private Button btnTogglePreview = new();
         private Button btnExport = new();
         private Button btnExportAllZip = new();
+        private Button btnFingerprint = new();
+        private CheckBox chkAutoPlay = new();
         private Button btnHear = new();
         private ComboBox comboPreset = new();
         private NumericUpDown numericTrack = new();
@@ -60,6 +62,8 @@ namespace LAWS.Voices.Forms
             this.sourceAudio = sourceAudio ?? throw new ArgumentNullException(nameof(sourceAudio));
             this.InitializeComponent();
             this.Load += async (_, __) => await this.RefreshPreviewAsync();
+            this.Shown += (_, __) => this.PositionAutoPlayCheckbox();
+            this.Resize += (_, __) => this.PositionAutoPlayCheckbox();
             this.FormClosed += (_, __) => this.ReleaseResources();
         }
 
@@ -97,11 +101,7 @@ namespace LAWS.Voices.Forms
             this.lblElapsed = new Label { Text = "00:00", AutoSize = true, Margin = new Padding(0, 8, 8, 2) };
             var lblTrack = new Label { Text = "Track", AutoSize = true, Margin = new Padding(0, 8, 4, 2) };
             this.numericTrack = new NumericUpDown { Width = 60, Minimum = 1, Maximum = 1, Value = 1, Enabled = false, Margin = new Padding(0, 4, 8, 2) };
-            this.numericTrack.ValueChanged += async (_, __) =>
-            {
-                this.StopPlayback();
-                await this.RefreshPreviewAsync();
-            };
+            this.numericTrack.ValueChanged += async (_, __) => await this.HandleTrackSelectionChangedAsync();
             this.btnTogglePreview = new Button { Text = "Spectrogram", Width = 110, Height = 28, Enabled = false, Margin = new Padding(0, 2, 8, 2) };
             this.btnTogglePreview.Click += async (_, __) =>
             {
@@ -110,6 +110,9 @@ namespace LAWS.Voices.Forms
                 this.btnTogglePreview.Text = this.showSpectrogram ? "Waveform" : "Spectrogram";
                 await this.RefreshPreviewAsync();
             };
+            this.btnFingerprint = new Button { Text = "Fingerprint...", Width = 115, Height = 28, Enabled = true, Visible = true, Margin = new Padding(0, 2, 8, 2) };
+            this.btnFingerprint.Click += async (_, __) => await this.FingerprintSelectedTrackAsync();
+            this.chkAutoPlay = new CheckBox { Text = "Auto-Play", AutoSize = true, Enabled = false, Margin = new Padding(0, 0, 0, 0) };
             this.btnHear = new Button { Text = "Hear", Width = 80, Height = 28, Enabled = false, Margin = new Padding(0, 2, 8, 2) };
             this.btnHear.Click += async (_, __) => await this.HearCurrentTrackAsync();
             this.btnExport = new Button { Text = "Save As WAV...", Width = 120, Height = 28, Enabled = false, Margin = new Padding(0, 2, 8, 2) };
@@ -117,7 +120,7 @@ namespace LAWS.Voices.Forms
             this.btnExportAllZip = new Button { Text = "Export All ZIP", Width = 120, Height = 28, Enabled = false, Margin = new Padding(0, 2, 8, 2) };
             this.btnExportAllZip.Click += async (_, __) => await this.ExportAllTracksZipAsync();
 
-            actionsFlow.Controls.AddRange([this.btnStart, this.pBar, this.lblElapsed, lblTrack, this.numericTrack, this.btnTogglePreview, this.btnHear, this.btnExport, this.btnExportAllZip]);
+            actionsFlow.Controls.AddRange([this.btnStart, this.pBar, this.lblElapsed, lblTrack, this.numericTrack, this.btnTogglePreview, this.btnExport, this.btnExportAllZip, this.btnFingerprint, this.btnHear]);
             actionsPanel.Controls.Add(actionsFlow);
 
             // ---- Settings grid (TableLayoutPanel: 8 columns -> 4 label/control pairs per row) ----
@@ -206,6 +209,8 @@ namespace LAWS.Voices.Forms
 
             toolTip.SetToolTip(this.numericTrack, "Browse separated tracks after processing. Use this to inspect each candidate bird or source individually.");
             toolTip.SetToolTip(this.btnTogglePreview, "Switch between waveform and spectrogram preview for the currently selected separated track.");
+            toolTip.SetToolTip(this.btnFingerprint, "Fingerprint the currently selected separated track and open the shared tree visualizer.");
+            toolTip.SetToolTip(this.chkAutoPlay, "Automatically stop playback and play the selected track when browsing tracks.");
             toolTip.SetToolTip(this.btnHear, "Listen to the currently selected BSS phrase or separated track.");
             toolTip.SetToolTip(this.btnExport, "Save the currently selected BSS phrase or separated track to a WAV file using a Save File dialog.");
             toolTip.SetToolTip(this.btnExportAllZip, "Export every separated track as WAV files bundled into a single ZIP archive (Save dialog starts in your Music folder).");
@@ -215,6 +220,7 @@ namespace LAWS.Voices.Forms
             this.Controls.Add(previewPanel);
             this.Controls.Add(actionsPanel);
             this.Controls.Add(settingsPanel);
+            this.Controls.Add(this.chkAutoPlay);
         }
 
         private void ApplyBssPreset(string? preset)
@@ -312,9 +318,11 @@ namespace LAWS.Voices.Forms
                 this.numericTrack.Enabled = this.currentResult.Tracks.Count > 0;
                 this.btnTogglePreview.Enabled = this.currentResult.Tracks.Count > 0;
                 this.btnHear.Enabled = this.currentResult.Tracks.Count > 0;
+                this.chkAutoPlay.Enabled = this.currentResult.Tracks.Count > 0;
                 this.btnHear.Text = "Hear";
                 this.btnExport.Enabled = this.currentResult.Tracks.Count > 0;
                 this.btnExportAllZip.Enabled = this.currentResult.Tracks.Count > 0;
+                this.PositionAutoPlayCheckbox();
                 await this.RefreshPreviewAsync();
             }
             catch (OperationCanceledException)
@@ -330,6 +338,107 @@ namespace LAWS.Voices.Forms
                 this.StopElapsedTimer();
                 this.btnStart.Enabled = true;
             }
+        }
+
+        private async Task FingerprintSelectedTrackAsync()
+        {
+            if (this.currentResult == null || this.currentResult.Tracks.Count == 0)
+            {
+                MessageBox.Show(this, "No BSS results are available yet. Run Start first before fingerprinting the separated tracks.", "Fingerprinting", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            int selectedIndex = (int) this.numericTrack.Value - 1;
+            if (selectedIndex < 0 || selectedIndex >= this.currentResult.Tracks.Count)
+            {
+                return;
+            }
+
+            var selectedTrack = this.currentResult.Tracks[selectedIndex].Audio;
+            if (selectedTrack == null)
+            {
+                return;
+            }
+
+            using var dlg = new FingerprintingSettingsForm();
+            if (dlg.ShowDialog(this) != DialogResult.OK)
+            {
+                return;
+            }
+
+            FingerprintingProcessor? processor = null;
+            try
+            {
+                this.btnFingerprint.Enabled = false;
+                this.UseWaitCursor = true;
+                var progress = new Progress<double>(p => { });
+                processor = new FingerprintingProcessor(selectedTrack.FilePath, progress);
+
+                await processor.ProcessAudioObjectAsync(
+                    selectedTrack,
+                    dlg.TrackMaxSilenceFrames,
+                    dlg.FrequencyTrackingTolerance,
+                    dlg.StereoDeviationTolerance,
+                    dlg.ProminenceOutlierHighFactor,
+                    dlg.ProminenceOutlierLowFactor,
+                    dlg.MinSampleDensity,
+                    dlg.MinDurationSeconds,
+                    dlg.TrimThresholdMultiplier);
+
+                var fingerprints = processor.CapturedFingerprints;
+                if (fingerprints.Count == 0)
+                {
+                    MessageBox.Show(this, "No fingerprints were generated for the selected track.", "Fingerprinting", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    return;
+                }
+
+                var rv = new ResultVisualizerForm(null, selectedTrack.Name, null, fingerprints, selectedTrack, null);
+                rv.Show(this);
+            }
+            catch (Exception ex)
+            {
+                StaticLogger.Log("BSS fingerprinting failed: " + ex.Message);
+                MessageBox.Show(this, "Fingerprinting failed: " + ex.Message, "Fingerprinting", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+            finally
+            {
+                this.UseWaitCursor = false;
+                this.btnFingerprint.Visible = true;
+                this.btnFingerprint.Enabled = true;
+            }
+        }
+
+        protected override void OnShown(EventArgs e)
+        {
+            base.OnShown(e);
+            this.btnFingerprint.Visible = true;
+            this.btnFingerprint.Enabled = true;
+        }
+
+        private async Task HandleTrackSelectionChangedAsync()
+        {
+            this.StopPlayback();
+            await this.RefreshPreviewAsync();
+
+            if (this.chkAutoPlay.Enabled && this.chkAutoPlay.Checked && this.currentResult != null && this.currentResult.Tracks.Count > 0)
+            {
+                await this.HearCurrentTrackAsync();
+            }
+        }
+
+        private void PositionAutoPlayCheckbox()
+        {
+            try
+            {
+                if (this.chkAutoPlay.IsDisposed || this.btnHear.IsDisposed) return;
+                var buttonScreen = this.btnHear.PointToScreen(Point.Empty);
+                var formPoint = this.PointToClient(buttonScreen);
+                int x = Math.Max(8, formPoint.X + 2);
+                int y = Math.Max(0, formPoint.Y - this.chkAutoPlay.Height - 2);
+                this.chkAutoPlay.Location = new Point(x, y);
+                this.chkAutoPlay.BringToFront();
+            }
+            catch { }
         }
 
         private void StartElapsedTimer()

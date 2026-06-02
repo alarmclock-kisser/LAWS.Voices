@@ -24,6 +24,7 @@ namespace LAWS.Voices.Forms
         private Button btnStart = new();
         private ComboBox comboView = new();
         private Button btnOpenVisualizer = new();
+        private CheckBox chkAutoPlay = new();
         private Button btnHear = new();
         private ComboBox comboPreset = new();
         private NumericUpDown numericStream = new();
@@ -86,12 +87,18 @@ namespace LAWS.Voices.Forms
             this.comboView.SelectedIndexChanged += (_, __) => this.UpdatePreviewImage();
             var lblStream = new Label { Text = "Stream", AutoSize = true, Margin = new Padding(0, 8, 4, 2) };
             this.numericStream = new NumericUpDown { Width = 58, Minimum = 1, Maximum = 1, Value = 1, Enabled = false, Margin = new Padding(0, 4, 8, 2) };
+            this.numericStream.ValueChanged += async (_, __) => await this.HandleStreamSelectionChangedAsync();
+            this.chkAutoPlay = new CheckBox { Text = "Auto-Play", AutoSize = true, Enabled = false, Margin = new Padding(0, 0, 0, 0) };
             this.btnHear = new Button { Text = "Hear", Width = 80, Height = 28, Enabled = false, Margin = new Padding(0, 2, 8, 2) };
             this.btnHear.Click += async (_, __) => await this.HearCurrentStreamAsync();
             this.btnOpenVisualizer = new Button { Text = "Open Visualizer", Width = 120, Height = 28, Enabled = false, Margin = new Padding(0, 2, 8, 2) };
             this.btnOpenVisualizer.Click += (_, __) => this.OpenResultVisualizer();
 
-            actionsFlow.Controls.AddRange([this.btnStart, this.pBar, this.lblElapsed, lblView, this.comboView, lblStream, this.numericStream, this.btnHear, this.btnOpenVisualizer]);
+            var hearPanel = new FlowLayoutPanel { FlowDirection = FlowDirection.TopDown, WrapContents = false, AutoSize = true, Margin = new Padding(0, 0, 8, 2) };
+            hearPanel.Controls.Add(this.chkAutoPlay);
+            hearPanel.Controls.Add(this.btnHear);
+
+            actionsFlow.Controls.AddRange([this.btnStart, this.pBar, this.lblElapsed, lblView, this.comboView, lblStream, this.numericStream, hearPanel, this.btnOpenVisualizer]);
             actionsPanel.Controls.Add(actionsFlow);
 
             // ---- Settings grid ----
@@ -153,6 +160,7 @@ namespace LAWS.Voices.Forms
             toolTip.SetToolTip(this.btnStart, "Start the CASA analysis in the background using the current psychoacoustic grouping weights.");
             toolTip.SetToolTip(this.comboView, "Switch the preview between cochleagram, grouping, onset, harmonicity and energy visualizations.");
             toolTip.SetToolTip(this.numericStream, "Choose which detected CASA stream to inspect or listen to.");
+            toolTip.SetToolTip(this.chkAutoPlay, "Automatically stop playback and play the selected stream when browsing streams.");
             toolTip.SetToolTip(this.btnHear, "Render and play a stream-focused audible preview around the selected CASA stream pitch range.");
             toolTip.SetToolTip(this.btnOpenVisualizer, "Open the current CASA bitmap and summary in the shared result visualizer window.");
 
@@ -223,6 +231,7 @@ namespace LAWS.Voices.Forms
                 this.numericStream.Maximum = Math.Max(1, this.currentResult.Streams.Count);
                 this.numericStream.Value = 1;
                 this.numericStream.Enabled = this.currentResult.Streams.Count > 0;
+                this.chkAutoPlay.Enabled = this.currentResult.Streams.Count > 0;
                 this.btnHear.Enabled = this.currentResult.Streams.Count > 0;
                 this.btnOpenVisualizer.Enabled = true;
             }
@@ -283,6 +292,21 @@ namespace LAWS.Voices.Forms
             if (selected != null)
             {
                 this.pBox.Image = selected;
+            }
+        }
+
+        private async Task HandleStreamSelectionChangedAsync()
+        {
+            this.StopPlayback();
+
+            if (this.currentResult != null)
+            {
+                this.UpdatePreviewImage();
+            }
+
+            if (this.chkAutoPlay.Enabled && this.chkAutoPlay.Checked && this.currentResult != null && this.currentResult.Streams.Count > 0)
+            {
+                await this.HearCurrentStreamAsync();
             }
         }
 
