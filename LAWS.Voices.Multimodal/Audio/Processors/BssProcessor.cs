@@ -699,6 +699,10 @@ namespace LAWS.Voices.Multimodal.Audio.Processors
             // the exact phrase time window (interaural level difference). This avoids every
             // phrase inheriting the same parent azimuth and reflects where each bird sits.
             double phraseAzimuth = EstimatePhraseAzimuth(originalLeft, originalRight, startSample, endSample, fullTrack.AzimuthDegrees);
+            double phraseConfidence = EstimatePhraseConfidence(clip);
+            double phraseCenterHz = EstimatePhraseCenterFrequency(clip, sampleRate);
+            double phraseSpreadHz = EstimatePhraseFrequencySpread(clip, sampleRate, phraseCenterHz);
+            double phraseDensity = EstimatePhraseDensity(clip);
 
             phrases.Add(new SourceTrack
             {
@@ -706,14 +710,111 @@ namespace LAWS.Voices.Multimodal.Audio.Processors
                 ParentTrackIndex = fullTrack.ParentTrackIndex,
                 PhraseIndex = phraseIndex,
                 AzimuthDegrees = phraseAzimuth,
-                Confidence = fullTrack.Confidence,
-                FrequencyCenterHz = fullTrack.FrequencyCenterHz,
-                FrequencySpreadHz = fullTrack.FrequencySpreadHz,
-                AverageDensity = fullTrack.AverageDensity,
+                Confidence = phraseConfidence,
+                FrequencyCenterHz = phraseCenterHz,
+                FrequencySpreadHz = phraseSpreadHz,
+                AverageDensity = phraseDensity,
                 StartOffset = TimeSpan.FromSeconds(startSample / (double) sampleRate),
                 EndOffset = TimeSpan.FromSeconds((endSample + 1) / (double) sampleRate),
                 Audio = new AudioObj(clip, sampleRate, 1, fullTrack.Audio.BitDepth, $"{fullTrack.Audio.Name}_Phrase_{phraseIndex:D2}")
             });
+        }
+
+        private static double EstimatePhraseConfidence(float[] clip)
+        {
+            if (clip == null || clip.Length == 0)
+            {
+                return 0.0;
+            }
+
+            double rms = Math.Sqrt(clip.Select(sample => (double) sample * sample).DefaultIfEmpty(0.0).Average());
+            return Math.Clamp(rms * 3.0, 0.0, 1.0);
+        }
+
+        private static double EstimatePhraseDensity(float[] clip)
+        {
+            if (clip == null || clip.Length == 0)
+            {
+                return 0.0;
+            }
+
+            int active = clip.Count(sample => Math.Abs(sample) >= 0.02f);
+            return active / (double) clip.Length;
+        }
+
+        private static double EstimatePhraseCenterFrequency(float[] clip, int sampleRate)
+        {
+            var magnitude = ComputePhraseMagnitudeSpectrum(clip);
+            if (magnitude.Length == 0)
+            {
+                return 0.0;
+            }
+
+            double binHz = sampleRate / (double) (magnitude.Length * 2);
+            double weighted = 0.0;
+            double weightSum = 0.0;
+            for (int i = 1; i < magnitude.Length; i++)
+            {
+                double energy = magnitude[i];
+                weighted += i * binHz * energy;
+                weightSum += energy;
+            }
+
+            return weightSum > 0.0 ? weighted / weightSum : 0.0;
+        }
+
+        private static double EstimatePhraseFrequencySpread(float[] clip, int sampleRate, double centerFrequencyHz)
+        {
+            var magnitude = ComputePhraseMagnitudeSpectrum(clip);
+            if (magnitude.Length == 0)
+            {
+                return 0.0;
+            }
+
+            double binHz = sampleRate / (double) (magnitude.Length * 2);
+            double weightSum = 0.0;
+            double variance = 0.0;
+            for (int i = 1; i < magnitude.Length; i++)
+            {
+                double energy = magnitude[i];
+                double delta = (i * binHz) - centerFrequencyHz;
+                variance += delta * delta * energy;
+                weightSum += energy;
+            }
+
+            return weightSum > 0.0 ? Math.Sqrt(variance / weightSum) : 0.0;
+        }
+
+        private static double[] ComputePhraseMagnitudeSpectrum(float[] clip)
+        {
+            if (clip == null || clip.Length == 0)
+            {
+                return [];
+            }
+
+            int fftSize = 1;
+            while ((fftSize << 1) <= clip.Length && (fftSize << 1) <= 8192)
+            {
+                fftSize <<= 1;
+            }
+
+            if (fftSize < 64)
+            {
+                return [];
+            }
+
+            var window = AudioSceneDsp.CreateHannWindow(fftSize);
+            var frame = new float[fftSize];
+            Array.Copy(clip, frame, fftSize);
+            var fft = AudioSceneDsp.ForwardRealFft(frame, window);
+            int bins = fftSize / 2;
+            var magnitude = new double[bins];
+            for (int i = 0; i < bins; i++)
+            {
+                magnitude[i] = fft[i].Magnitude;
+            }
+
+            return magnitude;
         }
 
         /// <summary>

@@ -4,6 +4,7 @@ using NAudio.Wave;
 using System;
 using System.Drawing;
 using System.IO;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
@@ -72,6 +73,11 @@ namespace LAWS.Voices.Forms
                 Font = new Font("Consolas", 9f),
                 Text = "Ready for CASA analysis."
             };
+            var summaryMenu = new ContextMenuStrip();
+            var miSaveCsv = new ToolStripMenuItem("Save Results as CSV...");
+            miSaveCsv.Click += (_, __) => this.SaveResultsAsCsv();
+            summaryMenu.Items.Add(miSaveCsv);
+            this.txtSummary.ContextMenuStrip = summaryMenu;
 
             // ---- Actions row ----
             var actionsFlow = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.LeftToRight, WrapContents = false };
@@ -439,6 +445,87 @@ namespace LAWS.Voices.Forms
             this.analysisCts = null;
             this.currentResult?.Dispose();
             this.currentResult = null;
+        }
+
+        private void SaveResultsAsCsv()
+        {
+            if (this.currentResult == null || this.currentResult.Streams.Count == 0)
+            {
+                MessageBox.Show(this, "No CASA results are available to export.", "Save Results as CSV", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            try
+            {
+                using var sfd = new SaveFileDialog();
+                sfd.Filter = "CSV files (*.csv)|*.csv";
+                sfd.DefaultExt = "csv";
+                sfd.FileName = $"{SanitizeFileToken(this.sourceAudio.Name)}_casa_results_{this.GetSelectedPresetFileToken()}.csv";
+                if (sfd.ShowDialog(this) != DialogResult.OK)
+                {
+                    return;
+                }
+
+                File.WriteAllText(sfd.FileName, this.BuildCasaResultsCsv(), Encoding.UTF8);
+                MessageBox.Show(this, $"CASA results saved to: {sfd.FileName}", "Save Results as CSV", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(this, "Saving CSV failed: " + ex.Message, "Save Results as CSV", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        private string BuildCasaResultsCsv()
+        {
+            var sb = new StringBuilder();
+            sb.AppendLine("Index,PitchCenterHz,Strength,StartTime,EndTime,Duration,Description");
+            if (this.currentResult == null)
+            {
+                return sb.ToString();
+            }
+
+            foreach (var stream in this.currentResult.Streams)
+            {
+                sb.Append(stream.Index).Append(',')
+                  .Append(stream.PitchCenterHz.ToString("F3", System.Globalization.CultureInfo.InvariantCulture)).Append(',')
+                  .Append(stream.Strength.ToString("F6", System.Globalization.CultureInfo.InvariantCulture)).Append(',')
+                  .Append(stream.StartTime.ToString()).Append(',')
+                  .Append(stream.EndTime.ToString()).Append(',')
+                  .Append((stream.EndTime - stream.StartTime).ToString()).Append(',')
+                  .Append('"').Append((stream.Description ?? string.Empty).Replace("\"", "\"\"")).Append('"')
+                  .AppendLine();
+            }
+
+            return sb.ToString();
+        }
+
+        private string GetSelectedPresetFileToken()
+        {
+            return SanitizeFileToken(this.comboPreset.SelectedItem?.ToString(), "custom");
+        }
+
+        private static string SanitizeFileToken(string? value, string fallback = "export")
+        {
+            if (string.IsNullOrWhiteSpace(value))
+            {
+                return fallback;
+            }
+
+            var chars = value.Trim()
+                .Select(ch => char.IsLetterOrDigit(ch) ? ch : '_')
+                .ToArray();
+            var token = new string(chars).Trim('_');
+            while (token.Contains("__", StringComparison.Ordinal))
+            {
+                token = token.Replace("__", "_", StringComparison.Ordinal);
+            }
+
+            foreach (var invalid in Path.GetInvalidFileNameChars())
+            {
+                token = token.Replace(invalid, '_');
+            }
+
+            return string.IsNullOrWhiteSpace(token) ? fallback : token;
         }
     }
 }

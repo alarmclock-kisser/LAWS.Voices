@@ -34,6 +34,7 @@ namespace LAWS.Voices.Forms
         private Vector3D? gazeVector = null;
         private List<FingerprintingProcessor.Fingerprint>? fingerprints = null;
         private AudioObj? sourceAudio = null;
+        private readonly Dictionary<Guid, AudioObj> segmentedSourceAudioByTrackId = new();
         private List<LAWS.Voices.OpenVino.Processors.Wav2Vec2Processor.BirdSongBlock>? songBlocks = null;
         private PictureBox pictureBox = new();
         private Panel picturePanel = new NoWheelScrollPanel();
@@ -77,7 +78,7 @@ namespace LAWS.Voices.Forms
 
         public string ReportText { get; private set; } = string.Empty;
 
-        public ResultVisualizerForm(Bitmap? bitmap = null, string? reportText = null, Vector3D? gaze = null, List<FingerprintingProcessor.Fingerprint>? fingerprints = null, AudioObj? sourceAudio = null, List<LAWS.Voices.OpenVino.Processors.Wav2Vec2Processor.BirdSongBlock>? songBlocks = null)
+        public ResultVisualizerForm(Bitmap? bitmap = null, string? reportText = null, Vector3D? gaze = null, List<FingerprintingProcessor.Fingerprint>? fingerprints = null, AudioObj? sourceAudio = null, List<LAWS.Voices.OpenVino.Processors.Wav2Vec2Processor.BirdSongBlock>? songBlocks = null, Dictionary<Guid, AudioObj>? segmentedSourceAudioByTrackId = null)
         {
             this.bmp = bitmap;
             this.gazeVector = gaze;
@@ -85,6 +86,18 @@ namespace LAWS.Voices.Forms
             this.fingerprints = fingerprints;
             this.sourceAudio = sourceAudio;
             this.songBlocks = songBlocks;
+            if (segmentedSourceAudioByTrackId != null)
+            {
+                foreach (var kv in segmentedSourceAudioByTrackId)
+                {
+                    if (kv.Value == null || kv.Value.Data == null || kv.Value.Data.Length == 0)
+                    {
+                        continue;
+                    }
+
+                    this.segmentedSourceAudioByTrackId[kv.Key] = this.CloneAudioObj(kv.Value);
+                }
+            }
             this.InitializeComponent();
 
             // If fingerprints were provided, auto-render the tree visualization
@@ -197,7 +210,7 @@ namespace LAWS.Voices.Forms
         {
             try
             {
-                if (this.sourceAudio == null)
+                if (this.sourceAudio == null && (this.segmentedSourceAudioByTrackId == null || this.segmentedSourceAudioByTrackId.Count == 0))
                 {
                     MessageBox.Show(this, "No source audio available for export.", "Export Songs", MessageBoxButtons.OK, MessageBoxIcon.Information);
                     return;
@@ -206,20 +219,38 @@ namespace LAWS.Voices.Forms
                 // Build the list of (start, end) blocks to export.
                 // Prefer explicit song blocks; otherwise fall back to fingerprint node blocks (grouped per track/segment).
                 var blocks = new List<(TimeSpan start, TimeSpan end, string label)>();
-                if (this.songBlocks != null && this.songBlocks.Count > 0)
+                if (this.sourceAudio == null && this.segmentedSourceAudioByTrackId != null && this.segmentedSourceAudioByTrackId.Count > 0)
+                {
+                    List<FingerprintingProcessor.Fingerprint> orderedFingerprints = this.fingerprints == null
+                        ? new List<FingerprintingProcessor.Fingerprint>()
+                        : this.fingerprints.OrderBy(f => f.Timestamp).ToList();
+
+                    foreach (var fp in orderedFingerprints)
+                    {
+                        if (this.segmentedSourceAudioByTrackId.TryGetValue(fp.TrackId, out var clip) && clip?.Data != null && clip.Data.Length > 0)
+                        {
+                            blocks.Add((TimeSpan.Zero, clip.Duration, string.IsNullOrWhiteSpace(clip.Name) ? "segment" : clip.Name));
+                        }
+                    }
+                }
+                else if (this.songBlocks != null && this.songBlocks.Count > 0)
                 {
                     foreach (var sb in this.songBlocks.OrderBy(s => s.StartTime))
                     {
                         blocks.Add((sb.StartTime, sb.EndTime, "song"));
                     }
                 }
-                else if (this.fingerprints != null && this.fingerprints.Count > 0)
+                else if (this.fingerprints != null && this.fingerprints.Count > 0 && this.sourceAudio != null)
                 {
                     var seen = new HashSet<(long, long)>();
                     for (int i = 0; i < this.fingerprints.Count; i++)
                     {
                         var seg = this.GetAuthoritativeSegmentAroundIndex(i, mergeGapMs: 220, maxSegmentMs: 12000);
                         if (seg.start == DateTime.MinValue || seg.end <= seg.start) continue;
+                        if (this.sourceAudio == null)
+                        {
+                            continue;
+                        }
                         var startTs = seg.start - this.sourceAudio.CreatedAt;
                         var endTs = seg.end - this.sourceAudio.CreatedAt;
                         if (startTs < TimeSpan.Zero) startTs = TimeSpan.Zero;
@@ -241,7 +272,10 @@ namespace LAWS.Voices.Forms
                 sfd.Filter = "ZIP archive (*.zip)|*.zip";
                 sfd.DefaultExt = "zip";
                 sfd.InitialDirectory = Environment.GetFolderPath(Environment.SpecialFolder.MyMusic);
-                sfd.FileName = $"songs_{DateTime.Now:yyyyMMdd_HHmmss}.zip";
+                string baseName = !string.IsNullOrWhiteSpace(this.sourceAudio?.Name)
+                    ? SanitizeFileToken(this.sourceAudio!.Name, "songs")
+                    : "songs";
+                sfd.FileName = $"{baseName}_fingerprint_blocks.zip";
                 if (sfd.ShowDialog(this) != DialogResult.OK) return;
                 string zipPath = sfd.FileName;
 
@@ -250,37 +284,75 @@ namespace LAWS.Voices.Forms
                 string tempDir = Path.Combine(Path.GetTempPath(), "LAWS_Voices_SongExport_" + Guid.NewGuid().ToString("N"));
                 Directory.CreateDirectory(tempDir);
 
-                int sr = this.sourceAudio.SampleRate > 0 ? this.sourceAudio.SampleRate : 44100;
-                int ch = this.sourceAudio.Channels > 0 ? this.sourceAudio.Channels : 1;
                 int exported = 0;
                 int idx = 1;
-                foreach (var blk in blocks.OrderBy(b => b.start))
+                if (this.sourceAudio != null)
                 {
-                    long startSample = (long) Math.Max(0, Math.Floor(blk.start.TotalSeconds * sr) * ch);
-                    long endSample = (long) Math.Min(this.sourceAudio.Data.Length, Math.Ceiling(blk.end.TotalSeconds * sr) * ch);
-                    if (endSample <= startSample) { idx++; continue; }
-
-                    int len = (int) (endSample - startSample);
-                    var segment = new float[len];
-                    Array.Copy(this.sourceAudio.Data, startSample, segment, 0, len);
-
-                    var tmpAudio = new AudioObj(segment, sr, ch, this.sourceAudio.BitDepth > 0 ? this.sourceAudio.BitDepth : 16, this.sourceAudio.Name + $"_{blk.label}{idx:D3}");
-                    string wavFile = Path.Combine(tempDir, tmpAudio.Name + ".wav");
-                    try
+                    int sr = this.sourceAudio.SampleRate > 0 ? this.sourceAudio.SampleRate : 44100;
+                    int ch = this.sourceAudio.Channels > 0 ? this.sourceAudio.Channels : 1;
+                    foreach (var blk in blocks.OrderBy(b => b.start))
                     {
-                        WaveFormat format = tmpAudio.BitDepth == 32 ? WaveFormat.CreateIeeeFloatWaveFormat(tmpAudio.SampleRate, tmpAudio.Channels) : new WaveFormat(tmpAudio.SampleRate, tmpAudio.BitDepth, tmpAudio.Channels);
-                        using (var writer = new WaveFileWriter(wavFile, format))
+                        long startSample = (long) Math.Max(0, Math.Floor(blk.start.TotalSeconds * sr) * ch);
+                        long endSample = (long) Math.Min(this.sourceAudio.Data.Length, Math.Ceiling(blk.end.TotalSeconds * sr) * ch);
+                        if (endSample <= startSample) { idx++; continue; }
+
+                        int len = (int) (endSample - startSample);
+                        var segment = new float[len];
+                        Array.Copy(this.sourceAudio.Data, startSample, segment, 0, len);
+
+                        var tmpAudio = new AudioObj(segment, sr, ch, this.sourceAudio.BitDepth > 0 ? this.sourceAudio.BitDepth : 16, this.sourceAudio.Name + $"_{blk.label}{idx:D3}");
+                        string wavFile = Path.Combine(tempDir, tmpAudio.Name + ".wav");
+                        try
                         {
-                            writer.WriteSamples(tmpAudio.Data, 0, tmpAudio.Data.Length);
+                            WaveFormat format = tmpAudio.BitDepth == 32 ? WaveFormat.CreateIeeeFloatWaveFormat(tmpAudio.SampleRate, tmpAudio.Channels) : new WaveFormat(tmpAudio.SampleRate, tmpAudio.BitDepth, tmpAudio.Channels);
+                            using (var writer = new WaveFileWriter(wavFile, format))
+                            {
+                                writer.WriteSamples(tmpAudio.Data, 0, tmpAudio.Data.Length);
+                            }
+                            exported++;
                         }
-                        exported++;
-                    }
-                    catch (Exception ex)
-                    {
-                        StaticLogger.Log("Failed to write WAV segment: " + ex.Message);
-                    }
+                        catch (Exception ex)
+                        {
+                            StaticLogger.Log("Failed to write WAV segment: " + ex.Message);
+                        }
 
-                    idx++;
+                        idx++;
+                    }
+                }
+                else if (this.segmentedSourceAudioByTrackId != null && this.fingerprints != null)
+                {
+                    var exportedTrackIds = new HashSet<Guid>();
+                    foreach (var fp in this.fingerprints.OrderBy(f => f.Timestamp))
+                    {
+                        if (!exportedTrackIds.Add(fp.TrackId))
+                        {
+                            continue;
+                        }
+
+                        if (!this.segmentedSourceAudioByTrackId.TryGetValue(fp.TrackId, out var clip) || clip?.Data == null || clip.Data.Length == 0)
+                        {
+                            continue;
+                        }
+
+                        string clipBaseName = string.IsNullOrWhiteSpace(clip.Name) ? $"segment_{idx:D3}" : clip.Name;
+                        foreach (var inv in Path.GetInvalidFileNameChars()) clipBaseName = clipBaseName.Replace(inv, '_');
+                        string wavFile = Path.Combine(tempDir, clipBaseName + ".wav");
+                        try
+                        {
+                            WaveFormat format = clip.BitDepth == 32 ? WaveFormat.CreateIeeeFloatWaveFormat(clip.SampleRate > 0 ? clip.SampleRate : 44100, Math.Max(1, clip.Channels)) : new WaveFormat(clip.SampleRate > 0 ? clip.SampleRate : 44100, clip.BitDepth > 0 ? clip.BitDepth : 16, Math.Max(1, clip.Channels));
+                            using (var writer = new WaveFileWriter(wavFile, format))
+                            {
+                                writer.WriteSamples(clip.Data, 0, clip.Data.Length);
+                            }
+                            exported++;
+                        }
+                        catch (Exception ex)
+                        {
+                            StaticLogger.Log("Failed to write segmented WAV clip: " + ex.Message);
+                        }
+
+                        idx++;
+                    }
                 }
 
                 if (File.Exists(zipPath)) { try { File.Delete(zipPath); } catch { } }
@@ -300,6 +372,38 @@ namespace LAWS.Voices.Forms
             {
                 this.UseWaitCursor = false;
             }
+        }
+
+        private static string SanitizeFileToken(string? value, string fallback = "export")
+        {
+            if (string.IsNullOrWhiteSpace(value))
+            {
+                return fallback;
+            }
+
+            var chars = value.Trim()
+                .Select(ch => char.IsLetterOrDigit(ch) ? ch : '_')
+                .ToArray();
+            var token = new string(chars).Trim('_');
+            while (token.Contains("__", StringComparison.Ordinal))
+            {
+                token = token.Replace("__", "_", StringComparison.Ordinal);
+            }
+
+            foreach (var invalid in Path.GetInvalidFileNameChars())
+            {
+                token = token.Replace(invalid, '_');
+            }
+
+            return string.IsNullOrWhiteSpace(token) ? fallback : token;
+        }
+
+        private AudioObj CloneAudioObj(AudioObj audio)
+        {
+            return new AudioObj(audio.Data.ToArray(), audio.SampleRate, audio.Channels, audio.BitDepth, audio.Name)
+            {
+                FilePath = audio.FilePath
+            };
         }
 
         private void InitializeComponent()
@@ -488,7 +592,7 @@ namespace LAWS.Voices.Forms
             this.btnNodePlay.Left = this.btnCopyRandom.Right + 8;
             this.btnNodePlay.Top = 6;
             this.btnNodePlay.Anchor = AnchorStyles.Left | AnchorStyles.Bottom;
-            this.btnNodePlay.Enabled = false;
+            this.btnNodePlay.Enabled = this.sourceAudio != null || (this.segmentedSourceAudioByTrackId != null && this.segmentedSourceAudioByTrackId.Count > 0);
             this.btnNodePlay.Click += async (_, __) =>
             {
                 if (this.selectedNodeIndex.HasValue)
@@ -505,6 +609,12 @@ namespace LAWS.Voices.Forms
                     }
                     else
                     {
+                        if (this.sourceAudio == null)
+                        {
+                            MessageBox.Show(this, "Node playback is unavailable for segmented batch fingerprints without a shared source audio clip.", "Play Node", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                            return;
+                        }
+
                         await this.PlayNodeAudioAsync(this.selectedNodeIndex.Value);
                     }
                 }
@@ -1044,7 +1154,7 @@ namespace LAWS.Voices.Forms
                         this.ShowNodeDetails(best);
                         // when left-click, enable node play button
                         this.selectedNodeIndex = best;
-                        this.btnNodePlay.Enabled = true;
+                        this.btnNodePlay.Enabled = this.sourceAudio != null || (this.segmentedSourceAudioByTrackId != null && this.segmentedSourceAudioByTrackId.Count > 0);
                         this.btnNodePlay.Text = "Play";
                     }
                 }
@@ -1062,7 +1172,7 @@ namespace LAWS.Voices.Forms
                 var seg = this.GetAuthoritativeSegmentAroundIndex(nodeIndex, mergeGapMs: 220, maxSegmentMs: 12000);
                 // Ensure only one node details window exists at a time
                 try { if (this.openNodeDetailsForm != null && !this.openNodeDetailsForm.IsDisposed) this.openNodeDetailsForm.Close(); } catch { }
-                this.openNodeDetailsForm = new NodeDetailsForm(nodeIndex, node, this.sourceAudio, seg.start, seg.end, this.fingerprints, idx => this.GetAuthoritativeSegmentAroundIndex(idx, mergeGapMs: 220, maxSegmentMs: 12000));
+                this.openNodeDetailsForm = new NodeDetailsForm(nodeIndex, node, this.ResolveAudioForNode(node), seg.start, seg.end, this.fingerprints, idx => this.GetAuthoritativeSegmentAroundIndex(idx, mergeGapMs: 220, maxSegmentMs: 12000), idx => this.ResolveAudioForNode(this.fingerprints![idx]));
                 this.openNodeDetailsForm.FormClosed += (_, __) => { try { this.openNodeDetailsForm = null; } catch { } };
                 this.openNodeDetailsForm.Show(this);
             }
@@ -1113,35 +1223,43 @@ namespace LAWS.Voices.Forms
         {
             try
             {
-                if (this.sourceAudio == null) { MessageBox.Show(this, "No source audio available to play.", "Play Node", MessageBoxButtons.OK, MessageBoxIcon.Warning); return; }
-
                 this.selectedNodeIndex = nodeIndex;
                 var node = this.fingerprints?[nodeIndex];
                 if (node == null) { MessageBox.Show(this, "Node not found.", "Play Node", MessageBoxButtons.OK, MessageBoxIcon.Warning); return; }
+                var playbackSource = this.ResolveAudioForNode(node);
+                if (playbackSource == null) { MessageBox.Show(this, "No source audio available to play.", "Play Node", MessageBoxButtons.OK, MessageBoxIcon.Warning); return; }
 
                 // stop existing playback
                 try { this.playbackDevice?.Stop(); } catch { }
                 try { this.playbackReader?.Dispose(); } catch { }
                 try { if (this.playbackTempFile != null && File.Exists(this.playbackTempFile)) File.Delete(this.playbackTempFile); } catch { }
 
-                int sr = this.sourceAudio.SampleRate > 0 ? this.sourceAudio.SampleRate : 44100;
-                int ch = this.sourceAudio.Channels > 0 ? this.sourceAudio.Channels : 1;
-                var seg = this.GetAuthoritativeSegmentAroundIndex(nodeIndex, mergeGapMs: 220, maxSegmentMs: 12000);
-                DateTime sdt = seg.start == DateTime.MinValue ? node.Timestamp : seg.start;
-                DateTime edt = seg.end <= sdt ? node.Timestamp.AddMilliseconds(Math.Max(1, node.DurationMs)) : seg.end;
-                if (!FingerprintSegmentMath.TryGetSampleRange(sdt, edt, this.sourceAudio.CreatedAt, sr, ch, this.sourceAudio.Data.Length, paddingMs: 40, out long startSample, out long endSample))
+                int sr = playbackSource.SampleRate > 0 ? playbackSource.SampleRate : 44100;
+                int ch = playbackSource.Channels > 0 ? playbackSource.Channels : 1;
+                float[] buf;
+                if (ReferenceEquals(playbackSource, this.sourceAudio))
                 {
-                    MessageBox.Show(this, "Node audio segment is empty.", "Play Node", MessageBoxButtons.OK, MessageBoxIcon.Information); return;
-                }
+                    var seg = this.GetAuthoritativeSegmentAroundIndex(nodeIndex, mergeGapMs: 220, maxSegmentMs: 12000);
+                    DateTime sdt = seg.start == DateTime.MinValue ? node.Timestamp : seg.start;
+                    DateTime edt = seg.end <= sdt ? node.Timestamp.AddMilliseconds(Math.Max(1, node.DurationMs)) : seg.end;
+                    if (!FingerprintSegmentMath.TryGetSampleRange(sdt, edt, playbackSource.CreatedAt, sr, ch, playbackSource.Data.Length, paddingMs: 40, out long startSample, out long endSample))
+                    {
+                        MessageBox.Show(this, "Node audio segment is empty.", "Play Node", MessageBoxButtons.OK, MessageBoxIcon.Information); return;
+                    }
 
-                int len = (int)(endSample - startSample);
-                var buf = new float[len];
-                Array.Copy(this.sourceAudio.Data, startSample, buf, 0, len);
+                    int len = (int)(endSample - startSample);
+                    buf = new float[len];
+                    Array.Copy(playbackSource.Data, startSample, buf, 0, len);
+                }
+                else
+                {
+                    buf = playbackSource.Data.ToArray();
+                }
 
                 // write to temp wav
                 string tmp = Path.Combine(Path.GetTempPath(), "LAWS_NodePlay_" + Guid.NewGuid().ToString("N") + ".wav");
                 this.playbackTempFile = tmp;
-                WaveFormat format = this.sourceAudio.BitDepth == 32 ? WaveFormat.CreateIeeeFloatWaveFormat(sr, ch) : new WaveFormat(sr, this.sourceAudio.BitDepth > 0 ? this.sourceAudio.BitDepth : 16, ch);
+                WaveFormat format = playbackSource.BitDepth == 32 ? WaveFormat.CreateIeeeFloatWaveFormat(sr, ch) : new WaveFormat(sr, playbackSource.BitDepth > 0 ? playbackSource.BitDepth : 16, ch);
                 using (var w = new WaveFileWriter(tmp, format))
                 {
                     w.WriteSamples(buf, 0, buf.Length);
@@ -1168,6 +1286,21 @@ namespace LAWS.Voices.Forms
                 StaticLogger.Log("PlayNodeAudioAsync failed: " + ex.Message);
                 MessageBox.Show(this, "Play failed: " + ex.Message, "Play Node", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
+        }
+
+        private AudioObj? ResolveAudioForNode(FingerprintingProcessor.Fingerprint node)
+        {
+            if (node == null)
+            {
+                return null;
+            }
+
+            if (this.segmentedSourceAudioByTrackId != null && this.segmentedSourceAudioByTrackId.TryGetValue(node.TrackId, out var segmentedAudio))
+            {
+                return segmentedAudio;
+            }
+
+            return this.sourceAudio;
         }
 
         private void PictureBox_MouseDown(object? sender, MouseEventArgs e)

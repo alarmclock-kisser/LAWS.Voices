@@ -17,6 +17,7 @@ namespace LAWS.Voices.Forms
         private readonly AudioObj? sourceAudio;
         private readonly IReadOnlyList<FingerprintingProcessor.Fingerprint>? allNodes;
         private readonly Func<int, (DateTime start, DateTime end)>? segmentResolver;
+        private readonly Func<int, AudioObj?>? audioResolver;
 
         private Button btnPlay = new();
         private Button btnPause = new();
@@ -32,7 +33,7 @@ namespace LAWS.Voices.Forms
         private DateTime? segmentStart;
         private DateTime? segmentEnd;
 
-        public NodeDetailsForm(int index, FingerprintingProcessor.Fingerprint node, AudioObj? sourceAudio, DateTime? segmentStart = null, DateTime? segmentEnd = null, IReadOnlyList<FingerprintingProcessor.Fingerprint>? allNodes = null, Func<int, (DateTime start, DateTime end)>? segmentResolver = null)
+        public NodeDetailsForm(int index, FingerprintingProcessor.Fingerprint node, AudioObj? sourceAudio, DateTime? segmentStart = null, DateTime? segmentEnd = null, IReadOnlyList<FingerprintingProcessor.Fingerprint>? allNodes = null, Func<int, (DateTime start, DateTime end)>? segmentResolver = null, Func<int, AudioObj?>? audioResolver = null)
         {
             this.nodeIndex = index;
             this.node = node;
@@ -41,6 +42,7 @@ namespace LAWS.Voices.Forms
             this.segmentEnd = segmentEnd;
             this.allNodes = allNodes;
             this.segmentResolver = segmentResolver;
+            this.audioResolver = audioResolver;
             this.InitializeComponent();
             this.Load += this.NodeDetailsForm_Load;
         }
@@ -173,19 +175,25 @@ namespace LAWS.Voices.Forms
         {
             try
             {
-                if (this.sourceAudio == null) return null;
-                int sr = this.sourceAudio.SampleRate > 0 ? this.sourceAudio.SampleRate : 44100;
-                int ch = this.sourceAudio.Channels > 0 ? this.sourceAudio.Channels : 1;
+                var audio = this.ResolveAudio();
+                if (audio == null) return null;
+                int sr = audio.SampleRate > 0 ? audio.SampleRate : 44100;
+                int ch = audio.Channels > 0 ? audio.Channels : 1;
+                if (!ReferenceEquals(audio, this.sourceAudio))
+                {
+                    return this.BuildWholeClipWavBytes(audio);
+                }
+
                 DateTime sdt = this.segmentStart ?? this.node.Timestamp;
                 DateTime edt = this.segmentEnd ?? this.node.Timestamp.AddMilliseconds(Math.Max(1, this.node.DurationMs));
                 sdt = sdt.AddMilliseconds(-40);
                 edt = edt.AddMilliseconds(40);
-                long startSample = (long)Math.Max(0, Math.Floor((sdt - this.sourceAudio.CreatedAt).TotalSeconds * sr) * ch);
-                long endSample = (long)Math.Min(this.sourceAudio.Data.Length, Math.Ceiling((edt - this.sourceAudio.CreatedAt).TotalSeconds * sr) * ch);
+                long startSample = (long)Math.Max(0, Math.Floor((sdt - audio.CreatedAt).TotalSeconds * sr) * ch);
+                long endSample = (long)Math.Min(audio.Data.Length, Math.Ceiling((edt - audio.CreatedAt).TotalSeconds * sr) * ch);
                 if (endSample <= startSample) return null;
                 int len = (int)(endSample - startSample);
                 var buf = new float[len];
-                Array.Copy(this.sourceAudio.Data, startSample, buf, 0, len);
+                Array.Copy(audio.Data, startSample, buf, 0, len);
 
                 var ms = new MemoryStream();
                 var waveFormat = new WaveFormat(sr, 16, ch);
@@ -196,6 +204,34 @@ namespace LAWS.Voices.Forms
                     for (int i = 0; i < len; i++)
                     {
                         short s = (short)Math.Max(short.MinValue, Math.Min(short.MaxValue, (int)(buf[i] * 32767.0f)));
+                        buffer[bi++] = (byte)(s & 0xFF);
+                        buffer[bi++] = (byte)((s >> 8) & 0xFF);
+                    }
+                    writer.Write(buffer, 0, buffer.Length);
+                    writer.Flush();
+                }
+                var bytes = ms.ToArray();
+                try { ms.Dispose(); } catch { }
+                return bytes;
+            }
+            catch { return null; }
+        }
+
+        private byte[]? BuildWholeClipWavBytes(AudioObj audio)
+        {
+            try
+            {
+                int sr = audio.SampleRate > 0 ? audio.SampleRate : 44100;
+                int ch = audio.Channels > 0 ? audio.Channels : 1;
+                var ms = new MemoryStream();
+                var waveFormat = new WaveFormat(sr, 16, ch);
+                using (var writer = new WaveFileWriter(ms, waveFormat))
+                {
+                    var buffer = new byte[audio.Data.Length * 2];
+                    int bi = 0;
+                    for (int i = 0; i < audio.Data.Length; i++)
+                    {
+                        short s = (short)Math.Max(short.MinValue, Math.Min(short.MaxValue, (int)(audio.Data[i] * 32767.0f)));
                         buffer[bi++] = (byte)(s & 0xFF);
                         buffer[bi++] = (byte)((s >> 8) & 0xFF);
                     }
@@ -236,11 +272,18 @@ namespace LAWS.Voices.Forms
         {
             try
             {
-                if (this.sourceAudio == null) { MessageBox.Show(this, "No source audio available.", "Play", MessageBoxButtons.OK, MessageBoxIcon.Warning); return; }
+                var audio = this.ResolveAudio();
+                if (audio == null) { MessageBox.Show(this, "No source audio available.", "Play", MessageBoxButtons.OK, MessageBoxIcon.Warning); return; }
                 this.Stop();
 
-                int sr = this.sourceAudio.SampleRate > 0 ? this.sourceAudio.SampleRate : 44100;
-                int ch = this.sourceAudio.Channels > 0 ? this.sourceAudio.Channels : 1;
+                int sr = audio.SampleRate > 0 ? audio.SampleRate : 44100;
+                int ch = audio.Channels > 0 ? audio.Channels : 1;
+                if (!ReferenceEquals(audio, this.sourceAudio))
+                {
+                    await this.PlayWholeClipAsync(audio, sr, ch);
+                    return;
+                }
+
                 // prefer segment bounds if provided, otherwise use node timestamp/duration
                 DateTime sdt = this.segmentStart ?? this.node.Timestamp;
                 DateTime edt = this.segmentEnd ?? this.node.Timestamp.AddMilliseconds(Math.Max(1, this.node.DurationMs));
@@ -248,15 +291,15 @@ namespace LAWS.Voices.Forms
                 sdt = sdt.AddMilliseconds(-40);
                 edt = edt.AddMilliseconds(40);
                 // compute frame positions with rounding to avoid zero-length due to floor/ceil on very short segments
-                double startFrame = (sdt - this.sourceAudio.CreatedAt).TotalSeconds * sr;
-                double endFrame = (edt - this.sourceAudio.CreatedAt).TotalSeconds * sr;
+                double startFrame = (sdt - audio.CreatedAt).TotalSeconds * sr;
+                double endFrame = (edt - audio.CreatedAt).TotalSeconds * sr;
                 long startSample = (long)Math.Max(0, Math.Round(startFrame)) * ch;
-                long endSample = (long)Math.Min(this.sourceAudio.Data.Length, Math.Max(startSample + 1, (long)Math.Round(endFrame) * ch));
+                long endSample = (long)Math.Min(audio.Data.Length, Math.Max(startSample + 1, (long)Math.Round(endFrame) * ch));
                 if (endSample <= startSample) { MessageBox.Show(this, "Node audio segment is empty.", "Play", MessageBoxButtons.OK, MessageBoxIcon.Information); return; }
 
                 int len = (int)(endSample - startSample);
                 var buf = new float[len];
-                Array.Copy(this.sourceAudio.Data, startSample, buf, 0, len);
+                Array.Copy(audio.Data, startSample, buf, 0, len);
 
                 // Convert floats to bytes (16-bit PCM) in-memory and play via BufferedWaveProvider
                 // Write WAV bytes to a temporary memory buffer using WaveFileWriter, then create a separate playback stream
@@ -298,6 +341,34 @@ namespace LAWS.Voices.Forms
             {
                 MessageBox.Show(this, "Playback error: " + ex.Message, "Play", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
+        }
+
+        private async Task PlayWholeClipAsync(AudioObj audio, int sr, int ch)
+        {
+            var bytes = this.BuildWholeClipWavBytes(audio);
+            if (bytes == null || bytes.Length == 0)
+            {
+                MessageBox.Show(this, "Node audio segment is empty.", "Play", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            await Task.Yield();
+            this.playbackStream = new MemoryStream(bytes, false);
+            var raw = new RawSourceWaveStream(this.playbackStream, new WaveFormat(sr, 16, ch));
+
+            this.playbackDevice = new WaveOutEvent();
+            this.playbackDevice.Init(raw);
+            this.playbackDevice.PlaybackStopped += (s, e) =>
+            {
+                try { this.playbackStream?.Dispose(); } catch { }
+                this.playbackStream = null;
+            };
+            this.playbackDevice.Play();
+        }
+
+        private AudioObj? ResolveAudio()
+        {
+            return this.audioResolver?.Invoke(this.nodeIndex) ?? this.sourceAudio;
         }
 
         private void Pause()

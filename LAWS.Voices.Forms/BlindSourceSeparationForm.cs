@@ -6,6 +6,7 @@ using System.Collections.Generic;
 using System.Drawing;
 using System.IO;
 using System.Linq;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
@@ -91,6 +92,11 @@ namespace LAWS.Voices.Forms
                 Font = new Font("Consolas", 9f),
                 Text = "Ready for blind source separation."
             };
+            var summaryMenu = new ContextMenuStrip();
+            var miSaveCsv = new ToolStripMenuItem("Save Results as CSV...");
+            miSaveCsv.Click += (_, __) => this.SaveResultsAsCsv();
+            summaryMenu.Items.Add(miSaveCsv);
+            this.txtSummary.ContextMenuStrip = summaryMenu;
 
             // ---- Actions row (flow layout for even spacing) ----
             var actionsFlow = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.LeftToRight, WrapContents = false, AutoSize = false };
@@ -348,18 +354,6 @@ namespace LAWS.Voices.Forms
                 return;
             }
 
-            int selectedIndex = (int) this.numericTrack.Value - 1;
-            if (selectedIndex < 0 || selectedIndex >= this.currentResult.Tracks.Count)
-            {
-                return;
-            }
-
-            var selectedTrack = this.currentResult.Tracks[selectedIndex].Audio;
-            if (selectedTrack == null)
-            {
-                return;
-            }
-
             using var dlg = new FingerprintingSettingsForm();
             if (dlg.ShowDialog(this) != DialogResult.OK)
             {
@@ -372,27 +366,31 @@ namespace LAWS.Voices.Forms
                 this.btnFingerprint.Enabled = false;
                 this.UseWaitCursor = true;
                 var progress = new Progress<double>(p => { });
-                processor = new FingerprintingProcessor(selectedTrack.FilePath, progress);
+                var segmentedTracks = this.currentResult.Tracks
+                    .Select(track => track.Audio)
+                    .Where(audio => audio != null && audio.Data != null && audio.Data.Length > 0)
+                    .ToList();
+                if (segmentedTracks.Count == 0)
+                {
+                    MessageBox.Show(this, "The current BSS result does not contain any segmented tracks that can be fingerprinted.", "Fingerprinting", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    return;
+                }
 
-                await processor.ProcessAudioObjectAsync(
-                    selectedTrack,
-                    dlg.TrackMaxSilenceFrames,
-                    dlg.FrequencyTrackingTolerance,
-                    dlg.StereoDeviationTolerance,
-                    dlg.ProminenceOutlierHighFactor,
-                    dlg.ProminenceOutlierLowFactor,
-                    dlg.MinSampleDensity,
-                    dlg.MinDurationSeconds,
-                    dlg.TrimThresholdMultiplier);
+                processor = new FingerprintingProcessor(null, progress);
+                await processor.ProcessPreSegmentedAudioObjectsAsync(segmentedTracks, CancellationToken.None);
 
                 var fingerprints = processor.CapturedFingerprints;
                 if (fingerprints.Count == 0)
                 {
-                    MessageBox.Show(this, "No fingerprints were generated for the selected track.", "Fingerprinting", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    MessageBox.Show(this, "No fingerprints were generated for the current BSS tracks.", "Fingerprinting", MessageBoxButtons.OK, MessageBoxIcon.Information);
                     return;
                 }
 
-                var rv = new ResultVisualizerForm(null, selectedTrack.Name, null, fingerprints, selectedTrack, null);
+                var audioByTrackId = this.currentResult.Tracks
+                    .Select(track => new { track.Audio.Id, track.Audio })
+                    .ToDictionary(item => item.Id, item => item.Audio);
+                var report = $"BSS segmented fingerprinting completed for {segmentedTracks.Count} separated tracks.";
+                var rv = new ResultVisualizerForm(null, report, null, fingerprints, null, null, audioByTrackId);
                 rv.Show(this);
             }
             catch (Exception ex)
@@ -531,7 +529,7 @@ namespace LAWS.Voices.Forms
             sfd.Filter = "ZIP archive (*.zip)|*.zip";
             sfd.DefaultExt = "zip";
             sfd.InitialDirectory = Environment.GetFolderPath(Environment.SpecialFolder.MyMusic);
-            sfd.FileName = $"{this.sourceAudio.Name}_bss_tracks_{DateTime.Now:yyyyMMdd_HHmmss}.zip";
+            sfd.FileName = $"{SanitizeFileToken(this.sourceAudio.Name)}_bss_tracks_{this.GetSelectedPresetFileToken()}.zip";
             if (sfd.ShowDialog(this) != DialogResult.OK)
             {
                 return;
@@ -675,6 +673,92 @@ namespace LAWS.Voices.Forms
                 audio.Dispose();
             }
             this.exportedTracks.Clear();
+        }
+
+        private void SaveResultsAsCsv()
+        {
+            if (this.currentResult == null || this.currentResult.Tracks.Count == 0)
+            {
+                MessageBox.Show(this, "No BSS results are available to export.", "Save Results as CSV", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            try
+            {
+                using var sfd = new SaveFileDialog();
+                sfd.Filter = "CSV files (*.csv)|*.csv";
+                sfd.DefaultExt = "csv";
+                sfd.FileName = $"{SanitizeFileToken(this.sourceAudio.Name)}_bss_results_{this.GetSelectedPresetFileToken()}.csv";
+                if (sfd.ShowDialog(this) != DialogResult.OK)
+                {
+                    return;
+                }
+
+                File.WriteAllText(sfd.FileName, this.BuildBssResultsCsv(), Encoding.UTF8);
+                MessageBox.Show(this, $"BSS results saved to: {sfd.FileName}", "Save Results as CSV", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(this, "Saving CSV failed: " + ex.Message, "Save Results as CSV", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        private string BuildBssResultsCsv()
+        {
+            var sb = new StringBuilder();
+            sb.AppendLine("Index,ParentTrackIndex,PhraseIndex,AzimuthDegrees,Confidence,FrequencyCenterHz,FrequencySpreadHz,AverageDensity,StartOffset,EndOffset,Duration,AudioName");
+            if (this.currentResult == null)
+            {
+                return sb.ToString();
+            }
+
+            foreach (var track in this.currentResult.Tracks)
+            {
+                sb.Append(track.Index).Append(',')
+                  .Append(track.ParentTrackIndex).Append(',')
+                  .Append(track.PhraseIndex).Append(',')
+                  .Append(track.AzimuthDegrees.ToString("F3", System.Globalization.CultureInfo.InvariantCulture)).Append(',')
+                  .Append(track.Confidence.ToString("F6", System.Globalization.CultureInfo.InvariantCulture)).Append(',')
+                  .Append(track.FrequencyCenterHz.ToString("F3", System.Globalization.CultureInfo.InvariantCulture)).Append(',')
+                  .Append(track.FrequencySpreadHz.ToString("F3", System.Globalization.CultureInfo.InvariantCulture)).Append(',')
+                  .Append(track.AverageDensity.ToString("F6", System.Globalization.CultureInfo.InvariantCulture)).Append(',')
+                  .Append(track.StartOffset.ToString()).Append(',')
+                  .Append(track.EndOffset.ToString()).Append(',')
+                  .Append(track.Audio.Duration.ToString()).Append(',')
+                  .Append('"').Append((track.Audio.Name ?? string.Empty).Replace("\"", "\"\"")).Append('"')
+                  .AppendLine();
+            }
+
+            return sb.ToString();
+        }
+
+        private string GetSelectedPresetFileToken()
+        {
+            return SanitizeFileToken(this.comboPreset.SelectedItem?.ToString(), "custom");
+        }
+
+        private static string SanitizeFileToken(string? value, string fallback = "export")
+        {
+            if (string.IsNullOrWhiteSpace(value))
+            {
+                return fallback;
+            }
+
+            var chars = value.Trim()
+                .Select(ch => char.IsLetterOrDigit(ch) ? ch : '_')
+                .ToArray();
+            var token = new string(chars).Trim('_');
+            while (token.Contains("__", StringComparison.Ordinal))
+            {
+                token = token.Replace("__", "_", StringComparison.Ordinal);
+            }
+
+            foreach (var invalid in Path.GetInvalidFileNameChars())
+            {
+                token = token.Replace(invalid, '_');
+            }
+
+            return string.IsNullOrWhiteSpace(token) ? fallback : token;
         }
     }
 }

@@ -414,6 +414,41 @@ namespace LAWS.Voices.Multimodal.Audio.Processors
             StaticLogger.Log($"[CASA BSS Engine] Complete. Extracted {IsolatedBirdSamples.Count} samples.");
         }
 
+        public async Task ProcessPreSegmentedAudioObjectsAsync(IEnumerable<AudioObj> audioSegments, CancellationToken cancellationToken = default)
+        {
+            ArgumentNullException.ThrowIfNull(audioSegments);
+
+            var segments = audioSegments.Where(segment => segment?.Data != null && segment.Data.Length > 0).ToList();
+            if (segments.Count == 0)
+            {
+                return;
+            }
+
+            while (this._memoryPool.TryTake(out _)) { }
+
+            await Task.Run(() =>
+            {
+                int total = segments.Count;
+                int completed = 0;
+
+                foreach (var segment in segments)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+
+                    var fingerprint = this.CreateFingerprintFromSegment(segment);
+                    if (fingerprint != null)
+                    {
+                        this._memoryPool.Add(fingerprint);
+                    }
+
+                    completed++;
+                    this._progress?.Report(total <= 1 ? 1.0 : completed / (double) total);
+                }
+
+                this.DeriveHistoricalCrossReferences();
+            }, cancellationToken);
+        }
+
         // --- Hilfsfunktionen ---
 
         private void InitializeDynamicParameters(float[][] magnitudes, float hzPerBin, float[] noiseFloor)
@@ -454,6 +489,235 @@ namespace LAWS.Voices.Multimodal.Audio.Processors
             this._minProminenceThreshold = Math.Max(1.5f, Math.Min(5.0f, 1.5f * (contextAvg / Math.Max(contextNoise, 0.0001f))));
 
             StaticLogger.Log($"[AutoParam Update] Frame {currentFrame}: NF Mult: {this._noiseFloorMultiplier:F2}, Freq Tol: {this._frequencyTrackingTolerance:F0}, Min Prom: {this._minProminenceThreshold:F2}");
+        }
+
+        private Fingerprint? CreateFingerprintFromSegment(AudioObj segment)
+        {
+            if (segment.Data == null || segment.Data.Length == 0)
+            {
+                return null;
+            }
+
+            int sampleRate = segment.SampleRate > 0 ? segment.SampleRate : 44100;
+            int channels = Math.Max(1, segment.Channels);
+            float[] mono = channels > 1 ? this.ConvertToMono(segment.Data, channels) : segment.Data.ToArray();
+            if (mono.Length == 0)
+            {
+                return null;
+            }
+
+            int fftSize = AudioSceneDsp.EnsurePowerOfTwo(Math.Min(Math.Max(256, mono.Length), this._windowSize));
+            if (fftSize > mono.Length)
+            {
+                fftSize = AudioSceneDsp.EnsurePowerOfTwo(Math.Max(1, mono.Length));
+            }
+
+            if (fftSize < 2)
+            {
+                return null;
+            }
+
+            var windowed = new float[fftSize];
+            Array.Copy(mono, windowed, Math.Min(mono.Length, fftSize));
+            for (int i = 0; i < windowed.Length; i++)
+            {
+                double hann = 0.5 - (0.5 * Math.Cos((2.0 * Math.PI * i) / Math.Max(1, windowed.Length - 1)));
+                windowed[i] *= (float) hann;
+            }
+
+            Complex[] fft = this.ExecuteForwardFFT(windowed);
+            float[] magnitudeSpectrum = this.CalculateMagnitudeSpectrum(fft);
+            float hzPerBin = sampleRate / (float) fftSize;
+            var peaks = this.ExtractTopSegmentPeaks(magnitudeSpectrum, hzPerBin, this._maxPeakCount);
+            var advanced = this.ExtractSegmentAdvancedFeatures(magnitudeSpectrum, mono, sampleRate, hzPerBin);
+            var fingerprint = new Fingerprint
+            {
+                Timestamp = segment.CreatedAt,
+                DurationMs = (long) Math.Max(1, Math.Round(segment.Duration.TotalMilliseconds)),
+                ToneCount = peaks.Count,
+                TrackId = segment.Id
+            };
+
+            float spectralEnergy = mono.Select(sample => sample * sample).DefaultIfEmpty(0f).Average();
+            float peakAmplitude = mono.Select(Math.Abs).DefaultIfEmpty(0f).Max();
+            float dominantFrequency = peaks.Count > 0 ? peaks.Average(peak => peak.Frequency) : 0f;
+            float dominantProminence = peaks.Count > 0 ? peaks.Average(peak => peak.Prominence) : peakAmplitude;
+            float centroid = peaks.Count > 0
+                ? peaks.Average(peak => peak.Centroid)
+                : advanced.TryGetValue("SpectralCentroid", out float advCentroid) ? advCentroid : 0f;
+
+            fingerprint.Features["VoiceBandA_Freq"] = dominantFrequency;
+            fingerprint.Features["VoiceBandA_Amp"] = peakAmplitude;
+            fingerprint.Features["Prominence"] = dominantProminence;
+            fingerprint.Features["SpectralCentroid"] = centroid;
+            fingerprint.Features["SpectralEnergy"] = spectralEnergy;
+
+            if (channels > 1)
+            {
+                float leftEnergy = 0f;
+                float rightEnergy = 0f;
+                for (int i = 0; i + 1 < segment.Data.Length; i += channels)
+                {
+                    leftEnergy += Math.Abs(segment.Data[i]);
+                    rightEnergy += Math.Abs(segment.Data[i + 1]);
+                }
+
+                float totalEnergy = leftEnergy + rightEnergy;
+                fingerprint.Features["StereoDirectionDeg"] = totalEnergy > 0.0001f ? ((rightEnergy / totalEnergy) - 0.5f) * 180f : 0f;
+            }
+
+            foreach (var kv in advanced)
+            {
+                fingerprint.AdvancedFeatures[kv.Key] = kv.Value;
+            }
+
+            return fingerprint;
+        }
+
+        private List<PeakNode> ExtractTopSegmentPeaks(float[] spectrum, float hzPerBin, int peakCount)
+        {
+            var peaks = new List<PeakNode>();
+            if (spectrum == null || spectrum.Length == 0)
+            {
+                return peaks;
+            }
+
+            float[] working = spectrum.ToArray();
+            int binCount = working.Length;
+            int minBin = Math.Clamp((int) (500 / Math.Max(1e-6f, hzPerBin)), 0, Math.Max(0, binCount - 1));
+            int maxBin = Math.Clamp((int) (9000 / Math.Max(1e-6f, hzPerBin)), minBin, Math.Max(minBin, binCount - 1));
+
+            for (int p = 0; p < peakCount; p++)
+            {
+                float maxVal = 0f;
+                int maxIdx = -1;
+                for (int i = minBin; i <= maxBin; i++)
+                {
+                    if (working[i] > maxVal)
+                    {
+                        maxVal = working[i];
+                        maxIdx = i;
+                    }
+                }
+
+                if (maxIdx < 0 || maxVal <= 0f)
+                {
+                    break;
+                }
+
+                int neighborhood = Math.Max(1, (int) (200 / Math.Max(1e-6f, hzPerBin)));
+                float localAvg = 0f;
+                int count = 0;
+                for (int j = Math.Max(0, maxIdx - neighborhood); j <= Math.Min(binCount - 1, maxIdx + neighborhood); j++)
+                {
+                    if (j == maxIdx) continue;
+                    localAvg += working[j];
+                    count++;
+                }
+
+                localAvg /= Math.Max(1, count);
+                float prominence = maxVal / Math.Max(0.001f, localAvg);
+
+                float centroidNumerator = 0f;
+                float centroidDenominator = 0f;
+                for (int j = Math.Max(0, maxIdx - 5); j <= Math.Min(binCount - 1, maxIdx + 5); j++)
+                {
+                    centroidNumerator += j * hzPerBin * working[j];
+                    centroidDenominator += working[j];
+                }
+
+                peaks.Add(new PeakNode
+                {
+                    Frequency = maxIdx * hzPerBin,
+                    Amplitude = maxVal,
+                    Prominence = prominence,
+                    Centroid = centroidDenominator > 0 ? centroidNumerator / centroidDenominator : maxIdx * hzPerBin
+                });
+
+                int exclusionRadius = Math.Max(1, (int) (400f / Math.Max(1e-6f, hzPerBin)));
+                for (int j = Math.Max(0, maxIdx - exclusionRadius); j <= Math.Min(binCount - 1, maxIdx + exclusionRadius); j++)
+                {
+                    working[j] = 0f;
+                }
+            }
+
+            return peaks;
+        }
+
+        private Dictionary<string, float> ExtractSegmentAdvancedFeatures(float[] magnitudeSpectrum, float[] monoAudio, int sampleRate, float hzPerBin)
+        {
+            var features = new Dictionary<string, float>();
+            if (magnitudeSpectrum == null || magnitudeSpectrum.Length == 0 || monoAudio == null || monoAudio.Length == 0)
+            {
+                return features;
+            }
+
+            int analysisWindowSize = Math.Max(2, Math.Min(this._windowSize, monoAudio.Length));
+            int binCount = magnitudeSpectrum.Length;
+
+            float specCentNum = 0f;
+            float specCentDen = 0f;
+            for (int i = 0; i < binCount; i++)
+            {
+                float freq = i * hzPerBin;
+                specCentNum += freq * magnitudeSpectrum[i];
+                specCentDen += magnitudeSpectrum[i];
+            }
+
+            features["SpectralCentroid"] = specCentDen > 0 ? specCentNum / specCentDen : 0f;
+
+            float totalEnergy = magnitudeSpectrum.Sum();
+            float cumulativeEnergy = 0f;
+            int rolloffBin = 0;
+            for (int i = 0; i < binCount; i++)
+            {
+                cumulativeEnergy += magnitudeSpectrum[i];
+                if (cumulativeEnergy >= 0.95f * totalEnergy)
+                {
+                    rolloffBin = i;
+                    break;
+                }
+            }
+
+            features["SpectralRolloff"] = rolloffBin * hzPerBin;
+
+            int zcrCount = 0;
+            for (int i = 1; i < analysisWindowSize; i++)
+            {
+                if (monoAudio[i] * monoAudio[i - 1] < 0)
+                {
+                    zcrCount++;
+                }
+            }
+
+            features["ZeroCrossingRate"] = analysisWindowSize > 1 ? (float) zcrCount / (analysisWindowSize - 1) : 0f;
+
+            int numFilters = 26;
+            var melFilterBank = this.CreateMelFilterBank(numFilters, binCount, sampleRate);
+            var filterBankEnergies = new float[numFilters];
+            for (int i = 0; i < numFilters; i++)
+            {
+                for (int j = 0; j < binCount; j++)
+                {
+                    filterBankEnergies[i] += magnitudeSpectrum[j] * melFilterBank[i][j];
+                }
+
+                filterBankEnergies[i] = Math.Max(0.000001f, filterBankEnergies[i]);
+                filterBankEnergies[i] = (float) Math.Log(filterBankEnergies[i]);
+            }
+
+            for (int i = 0; i < 13; i++)
+            {
+                float sum = 0f;
+                for (int j = 0; j < numFilters; j++)
+                {
+                    sum += filterBankEnergies[j] * (float) Math.Cos(Math.PI * i * (j + 0.5f) / numFilters);
+                }
+
+                features[$"MFCC_{i:D2}"] = sum;
+            }
+
+            return features;
         }
 
         private Dictionary<string, float> ExtractAdvancedFeatures(float[] magnitudeSpectrum, float[] fullAudioData, int frameStartSample, int sampleRate, float hzPerBin)
